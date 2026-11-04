@@ -16,13 +16,38 @@ pub(all) enum Query {
 } derive(Eq, Debug)
 
 ///|
+pub extend Query with Eq::{equal, not_equal}
+
+///|
+pub extend Query with @debug.Debug::{to_repr}
+
+///|
 /// Query syntax errors.
 pub(all) suberror QueryError {
   EmptyQuery
   UnterminatedPhrase
   UnexpectedToken(String)
   UnknownField(String)
-} derive(Eq, Debug, Show)
+} derive(Eq, Debug)
+
+///|
+pub extend QueryError with Eq::{equal, not_equal}
+
+///|
+pub extend QueryError with @debug.Debug::{to_repr}
+
+///|
+pub extend QueryError with Show::{to_string, output}
+
+///|
+pub impl Show for QueryError with fn output(self : QueryError, logger) {
+  match self {
+    EmptyQuery => logger.write_string("empty query")
+    UnterminatedPhrase => logger.write_string("unterminated phrase")
+    UnexpectedToken(msg) => logger.write_string("unexpected token: " + msg)
+    UnknownField(name) => logger.write_string("unknown field: " + name)
+  }
+}
 
 ///|
 /// One search hit.
@@ -30,6 +55,12 @@ pub(all) struct Hit {
   id : String
   score : Double
 } derive(Eq, Debug)
+
+///|
+pub extend Hit with Eq::{equal, not_equal}
+
+///|
+pub extend Hit with @debug.Debug::{to_repr}
 
 ///|
 /// Tokenize a query string into raw pieces: words, quoted phrases,
@@ -43,6 +74,12 @@ enum QToken {
   OrOp
   NotOp
 } derive(Eq, Debug)
+
+///|
+pub extend QToken with Eq::{equal, not_equal}
+
+///|
+pub extend QToken with @debug.Debug::{to_repr}
 
 ///|
 fn lex_query(input : String) -> Array[QToken] raise QueryError {
@@ -104,7 +141,7 @@ fn lex_query(input : String) -> Array[QToken] raise QueryError {
 ///          and_expr := not_expr ((AND)? not_expr)*   (implicit AND)
 ///          not_expr := primary (NOT primary)*
 ///          primary := '(' or_expr ')' | phrase | term
-struct Parser {
+priv struct Parser {
   tokens : Array[QToken]
   mut pos : Int32
   analyzer : Analyzer
