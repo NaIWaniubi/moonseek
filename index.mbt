@@ -258,7 +258,13 @@ pub fn Index::schema(self : Index) -> Array[FieldSchema] {
 ///|
 /// Document frequency of a term in a field (0 if absent).
 pub fn Index::doc_freq(self : Index, field : String, term : String) -> Int32 {
-  self.postings_of(field, term).length()
+  let mut count = 0
+  for p in self.postings_of(field, term) {
+    if !self.deleted.contains(p.doc) {
+      count += 1
+    }
+  }
+  count
 }
 
 ///|
@@ -310,7 +316,15 @@ fn Index::bm25_score(
   posting : Posting,
 ) -> Double {
   let n = self.doc_count()
-  let df = self.postings[field].get_or_default(term, []).length()
+  // Count only live documents: tombstoned postings stay in the list for
+  // snapshot stability, but must not inflate df (which would skew IDF
+  // after deletes/updates).
+  let mut df = 0
+  for p in self.postings[field].get_or_default(term, []) {
+    if !self.deleted.contains(p.doc) {
+      df += 1
+    }
+  }
   if df == 0 || n == 0 {
     return 0.0
   }
