@@ -82,6 +82,8 @@ pub struct Index {
   stats : @hashmap.HashMap[String, FieldStats]
   /// internal doc numbers of deleted documents
   deleted : @hashmap.HashMap[Int32, Unit]
+  /// stored original field texts: internal doc number -> (field, text)
+  stored : @hashmap.HashMap[Int32, Array[(String, String)]]
 }
 
 ///|
@@ -114,6 +116,7 @@ pub fn Index::new(
     doc_nums: @hashmap.HashMap([]),
     stats,
     deleted: @hashmap.HashMap([]),
+    stored: @hashmap.HashMap([]),
   }
 }
 
@@ -155,6 +158,7 @@ pub fn Index::add(self : Index, doc : Document) -> Unit {
   let num = self.doc_ids.length()
   self.doc_ids.push(doc.id)
   self.doc_nums.set(doc.id, num)
+  self.stored.set(num, doc.fields)
   for (field_name, text) in doc.fields {
     let field_map = match self.postings.get(field_name) {
       Some(m) => m
@@ -182,6 +186,7 @@ fn Index::delete_by_num(self : Index, num : Int32) -> Unit {
     return
   }
   self.deleted.set(num, ())
+  self.stored.remove(num)
   for (_, stats) in self.stats.iter() {
     match stats.lengths.remove_and_get(num) {
       Some(len) => stats.total_length -= len
@@ -206,6 +211,54 @@ pub fn Index::delete(self : Index, id : String) -> Bool {
 /// Look up the external id of an internal doc number.
 pub fn Index::doc_id(self : Index, num : Int32) -> String? {
   self.doc_ids.get(num)
+}
+
+///|
+/// Retrieve the stored original document by external id.
+/// Returns None if the id is unknown or the document was deleted.
+pub fn Index::get_document(self : Index, id : String) -> Document? {
+  match self.doc_nums.get(id) {
+    Some(num) if !self.deleted.contains(num) =>
+      match self.stored.get(num) {
+        Some(fields) => Some({ id, fields, })
+        None => None
+      }
+    _ => None
+  }
+}
+
+///|
+/// Retrieve one stored field's original text.
+pub fn Index::get_field(self : Index, id : String, field : String) -> String? {
+  match self.get_document(id) {
+    Some(doc) => {
+      for (name, text) in doc.fields {
+        if name == field {
+          return Some(text)
+        }
+      }
+      None
+    }
+    None => None
+  }
+}
+
+///|
+/// The analyzer this index was created with.
+pub fn Index::analyzer(self : Index) -> Analyzer {
+  self.analyzer
+}
+
+///|
+/// The field schema (names and weights), in declaration order.
+pub fn Index::schema(self : Index) -> Array[FieldSchema] {
+  self.schema
+}
+
+///|
+/// Document frequency of a term in a field (0 if absent).
+pub fn Index::doc_freq(self : Index, field : String, term : String) -> Int32 {
+  self.postings_of(field, term).length()
 }
 
 ///|

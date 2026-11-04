@@ -397,9 +397,25 @@ fn Index::eval_phrase(
     None => self.field_names()
   }
   for f in fields {
-    // Candidate docs: intersection of all term posting lists.
-    let first = self.postings_of(f, terms[0])
-    for posting in first {
+    // Fetch each term's posting list once and index by doc number,
+    // so phrase verification is O(positions) instead of O(docs*positions).
+    let lists : Array[@hashmap.HashMap[Int32, Posting]] = []
+    let mut missing = false
+    for term in terms {
+      let by_doc : @hashmap.HashMap[Int32, Posting] = @hashmap.HashMap([])
+      for p in self.postings_of(f, term) {
+        by_doc.set(p.doc, p)
+      }
+      if by_doc.is_empty() {
+        missing = true
+        break
+      }
+      lists.push(by_doc)
+    }
+    if missing {
+      continue
+    }
+    for posting in self.postings_of(f, terms[0]) {
       if self.deleted.contains(posting.doc) {
         continue
       }
@@ -407,19 +423,16 @@ fn Index::eval_phrase(
       for start_pos in posting.positions {
         let mut matched = true
         for k in 1..<terms.length() {
-          let next = self.postings_of(f, terms[k])
-          let mut found = false
-          for p in next {
-            if p.doc == posting.doc {
-              if p.positions.contains(start_pos + k) {
-                found = true
+          match lists[k].get(posting.doc) {
+            Some(p) =>
+              if !p.positions.contains(start_pos + k) {
+                matched = false
+                break
               }
+            None => {
+              matched = false
               break
             }
-          }
-          if !found {
-            matched = false
-            break
           }
         }
         if matched {
