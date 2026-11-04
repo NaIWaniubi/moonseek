@@ -1,13 +1,13 @@
 // moonseek — embedded full-text search engine in pure MoonBit.
 // Docs: https://docs.moonbitlang.com/en/latest/toolchain/moon/module.html
 
-name = "cs6210501-lab/moonseek"
+name = "NaIWaniubi/moonseek"
 
 version = "0.1.0"
 
 readme = "README.md"
 
-repository = "https://github.com/cs6210501-lab/moonseek"
+repository = "https://github.com/NaIWaniubi/moonseek"
 
 license = "Apache-2.0"
 

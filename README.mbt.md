@@ -4,7 +4,7 @@
 
 纯 MoonBit 实现的嵌入式全文搜索引擎：倒排索引、BM25 排序、免词典中文分词、崩溃安全快照，支持 native / WASM / JS 三端。
 
-[![CI](https://github.com/cs6210501-lab/moonseek/actions/workflows/ci.yml/badge.svg)](https://github.com/cs6210501-lab/moonseek/actions/workflows/ci.yml)
+[![CI](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml/badge.svg)](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 ## Why moonseek
