@@ -134,10 +134,7 @@ pub fn ms_snapshot_size() -> Int32 {
 #export_name("ms_highlight")
 pub fn ms_highlight(id : String, field : String, query : String) -> String {
   match engine.val {
-    Some(index) =>
-      index.highlight(id, field, query) catch {
-        _ => ""
-      }
+    Some(index) => index.highlight(id, field, query) catch { _ => "" }
     None => ""
   }
 }
@@ -145,12 +142,14 @@ pub fn ms_highlight(id : String, field : String, query : String) -> String {
 ///|
 /// Server-side snippet: densest-highlight window with ellipsis.
 #export_name("ms_snippet")
-pub fn ms_snippet(id : String, field : String, query : String, max_chars : Int32) -> String {
+pub fn ms_snippet(
+  id : String,
+  field : String,
+  query : String,
+  max_chars : Int32,
+) -> String {
   match engine.val {
-    Some(index) =>
-      index.snippet(id, field, query, max_chars~) catch {
-        _ => ""
-      }
+    Some(index) => index.snippet(id, field, query, max_chars~) catch { _ => "" }
     None => ""
   }
 }
