@@ -1,5 +1,5 @@
 import {
-  "cs6210501-lab/moonseek",
+  "NaIWaniubi/moonseek",
   "moonbitlang/core/argparse",
   "moonbitlang/core/string",
   "moonbitlang/async/fs",
