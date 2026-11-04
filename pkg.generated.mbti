@@ -9,6 +9,10 @@ import {
 // Values
 pub fn crc32(Bytes) -> UInt32
 
+pub fn damerau_levenshtein(String, String) -> Int32
+
+pub fn levenshtein(String, String) -> Int32
+
 pub fn parse_query(String, analyzer? : Analyzer, fields? : Array[String]) -> Query raise QueryError
 
 pub fn query_terms(Query) -> Array[String]
@@ -103,9 +107,17 @@ pub fn FieldSchema::to_repr(Self) -> @debug.Repr
 
 type FieldStats
 
+pub(all) struct FuzzyMatch {
+  term : String
+  distance : Int32
+} derive(Eq, @debug.Debug)
+pub fn FuzzyMatch::equal(Self, Self) -> Bool
+pub fn FuzzyMatch::not_equal(Self, Self) -> Bool
+pub fn FuzzyMatch::to_repr(Self) -> @debug.Repr
+
 pub(all) struct HighlightSpan {
   start : Int32
-  end : Int32
+  mut end : Int32
 } derive(Eq, @debug.Debug)
 pub fn HighlightSpan::equal(Self, Self) -> Bool
 pub fn HighlightSpan::not_equal(Self, Self) -> Bool
@@ -137,6 +149,8 @@ pub fn Index::doc_count(Self) -> Int32
 pub fn Index::doc_freq(Self, String, String) -> Int32
 pub fn Index::doc_id(Self, Int32) -> String?
 pub fn Index::from_bytes(Bytes) -> Self raise CodecError
+pub fn Index::fuzzy_search(Self, String, max_distance? : Int32, limit? : Int32) -> Array[Hit] raise QueryError
+pub fn Index::fuzzy_terms(Self, String, max_distance? : Int32, field? : String?) -> Array[FuzzyMatch]
 pub fn Index::get_document(Self, String) -> Document?
 pub fn Index::get_field(Self, String, String) -> String?
 pub fn Index::highlight(Self, String, String, String, pre_tag? : String, post_tag? : String) -> String raise QueryError
@@ -149,6 +163,7 @@ pub async fn Index::save(Self, String) -> Unit raise StoreError
 pub fn Index::schema(Self) -> Array[FieldSchema]
 pub fn Index::search(Self, String, limit? : Int32) -> Array[Hit] raise QueryError
 pub fn Index::snippet(Self, String, String, String, max_chars? : Int32, pre_tag? : String, post_tag? : String) -> String raise QueryError
+pub fn Index::suggest(Self, String, max_distance? : Int32) -> String?
 pub fn Index::term_count(Self) -> Int32
 pub fn Index::terms_of(Self, String) -> Array[String]
 pub fn Index::to_bytes(Self) -> Bytes
@@ -201,13 +216,17 @@ pub struct SegmentedIndex {
   segment_max_docs : Int32
 }
 pub fn SegmentedIndex::add(Self, Document) -> Unit
+pub async fn SegmentedIndex::add_durable(Self, String, Document) -> Unit raise StoreError
+pub async fn SegmentedIndex::checkpoint(Self, String) -> Unit raise StoreError
 pub fn SegmentedIndex::delete(Self, String) -> Bool
+pub async fn SegmentedIndex::delete_durable(Self, String, String) -> Bool raise StoreError
 pub fn SegmentedIndex::doc_count(Self) -> Int32
 pub fn SegmentedIndex::flush(Self) -> Unit
 pub fn SegmentedIndex::from_bytes(Bytes) -> Self raise CodecError
 pub fn SegmentedIndex::get_document(Self, String) -> Document?
 pub fn SegmentedIndex::merge(Self, max_segments? : Int32) -> Unit
 pub fn SegmentedIndex::new(Array[FieldSchema], segment_max_docs? : Int32) -> Self
+pub async fn SegmentedIndex::open_or_create(String, Array[FieldSchema]) -> Self raise StoreError
 pub fn SegmentedIndex::search(Self, String, limit? : Int32) -> Array[Hit] raise QueryError
 pub fn SegmentedIndex::segment_count(Self) -> Int32
 pub fn SegmentedIndex::to_bytes(Self) -> Bytes

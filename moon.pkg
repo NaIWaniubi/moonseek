@@ -13,5 +13,10 @@ import {
 } for "test"
 
 options(
-  targets: { "store.mbt": [ "native" ], "store_test.mbt": [ "native" ] },
+  targets: {
+    "store.mbt": [ "native" ],
+    "store_test.mbt": [ "native" ],
+    "wal_native.mbt": [ "native" ],
+    "wal_native_test.mbt": [ "native" ],
+  },
 )
