@@ -67,8 +67,8 @@ pub fn ms_search(query : String, limit : Int32) -> String {
       let items : Array[Json] = []
       for hit in hits {
         let fields : Map[String, Json] = Map::new()
-        fields["id"] = hit.id.to_json()
-        fields["score"] = hit.score.to_json()
+        fields["id"] = @json.to_json(hit.id)
+        fields["score"] = @json.to_json(hit.score)
         items.push(Json::object(fields))
       }
       Json::array(items).stringify()
