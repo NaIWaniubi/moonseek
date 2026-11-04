@@ -2,4 +2,11 @@ import {
   "moonbitlang/core/hashmap",
   "moonbitlang/core/math",
   "moonbitlang/core/encoding/utf8",
+  "moonbitlang/core/debug",
+  "moonbitlang/async/fs",
+  "moonbitlang/async",
 }
+
+options(
+  targets: { "store.mbt": [ "native" ], "store_test.mbt": [ "native" ] },
+)

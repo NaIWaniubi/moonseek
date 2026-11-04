@@ -1,5 +1,11 @@
-// import {
-//   "cs6210501-lab/moonseek" @lib,
-// }
+import {
+  "cs6210501-lab/moonseek",
+  "moonbitlang/core/argparse",
+  "moonbitlang/core/string",
+  "moonbitlang/async/fs",
+  "moonbitlang/async",
+}
+
+supported_targets = "+native"
 
 pkgtype(kind: "executable")

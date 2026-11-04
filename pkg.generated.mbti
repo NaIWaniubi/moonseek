@@ -38,6 +38,11 @@ pub(all) suberror QueryError {
   UnknownField(String)
 } derive(Eq, Show, @debug.Debug)
 
+pub(all) suberror StoreError {
+  IoError(String)
+  CorruptIndex(String)
+} derive(Eq, Show, @debug.Debug)
+
 // Types and methods
 pub(all) struct Analyzer {
   lowercase : Bool
@@ -85,8 +90,11 @@ pub fn Index::delete(Self, String) -> Bool
 pub fn Index::doc_count(Self) -> Int32
 pub fn Index::doc_id(Self, Int32) -> String?
 pub fn Index::from_bytes(Bytes) -> Self raise CodecError
+pub async fn Index::load(String) -> Self raise StoreError
+pub async fn Index::load_or_create(String, Array[FieldSchema]) -> Self raise StoreError
 pub fn Index::new(Array[FieldSchema], analyzer? : Analyzer, bm25? : Bm25Params) -> Self
 pub fn Index::postings_of(Self, String, String) -> Array[Posting]
+pub async fn Index::save(Self, String) -> Unit raise StoreError
 pub fn Index::search(Self, String, limit? : Int32) -> Array[Hit] raise QueryError
 pub fn Index::term_count(Self) -> Int32
 pub fn Index::terms_of(Self, String) -> Array[String]
