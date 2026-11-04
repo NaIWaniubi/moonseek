@@ -10,7 +10,24 @@
 pub(all) suberror StoreError {
   IoError(String)
   CorruptIndex(String)
-} derive(Eq, Debug, Show)
+} derive(Eq, Debug)
+
+///|
+pub extend StoreError with Eq::{equal, not_equal}
+
+///|
+pub extend StoreError with @debug.Debug::{to_repr}
+
+///|
+pub extend StoreError with Show::{to_string, output}
+
+///|
+pub impl Show for StoreError with fn output(self : StoreError, logger) {
+  match self {
+    IoError(msg) => logger.write_string("io error: " + msg)
+    CorruptIndex(msg) => logger.write_string("corrupt index: " + msg)
+  }
+}
 
 ///|
 /// Save the index to `path` atomically (write temp + fsync + rename).

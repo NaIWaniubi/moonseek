@@ -8,11 +8,23 @@ pub(all) struct Document {
 } derive(Eq, Debug)
 
 ///|
+pub extend Document with Eq::{equal, not_equal}
+
+///|
+pub extend Document with @debug.Debug::{to_repr}
+
+///|
 /// Field schema: name + scoring weight (e.g. title=3.0, body=1.0).
 pub(all) struct FieldSchema {
   name : String
   weight : Double
 } derive(Eq, Debug)
+
+///|
+pub extend FieldSchema with Eq::{equal, not_equal}
+
+///|
+pub extend FieldSchema with @debug.Debug::{to_repr}
 
 ///|
 /// One posting: which document, how many times, and where.
@@ -21,6 +33,12 @@ pub(all) struct Posting {
   freq : Int32
   positions : Array[Int32]
 } derive(Eq, Debug)
+
+///|
+pub extend Posting with Eq::{equal, not_equal}
+
+///|
+pub extend Posting with @debug.Debug::{to_repr}
 
 ///|
 /// Per-field statistics needed by BM25.
@@ -36,6 +54,12 @@ pub(all) struct Bm25Params {
   k1 : Double
   b : Double
 } derive(Eq, Debug)
+
+///|
+pub extend Bm25Params with Eq::{equal, not_equal}
+
+///|
+pub extend Bm25Params with @debug.Debug::{to_repr}
 
 ///|
 pub fn Bm25Params::default() -> Bm25Params {

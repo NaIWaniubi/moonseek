@@ -1,6 +1,6 @@
 ///|
 test "latin tokenization lowercases and drops stop words" {
-  let tokens = tokenize("The Quick BROWN fox jumps!")
+  let tokens = @moonseek.tokenize("The Quick BROWN fox jumps!")
   assert_eq(tokens.length(), 4)
   assert_eq(tokens[0].term, "quick")
   assert_eq(tokens[1].term, "brown")
@@ -11,7 +11,7 @@ test "latin tokenization lowercases and drops stop words" {
 
 ///|
 test "cjk bigram tokenization" {
-  let tokens = tokenize("全文搜索")
+  let tokens = @moonseek.tokenize("全文搜索")
   assert_eq(tokens.length(), 3)
   assert_eq(tokens[0].term, "全文")
   assert_eq(tokens[1].term, "文搜")
@@ -21,14 +21,14 @@ test "cjk bigram tokenization" {
 
 ///|
 test "single cjk char emits unigram" {
-  let tokens = tokenize("猫")
+  let tokens = @moonseek.tokenize("猫")
   assert_eq(tokens.length(), 1)
   assert_eq(tokens[0].term, "猫")
 }
 
 ///|
 test "mixed chinese english" {
-  let tokens = tokenize("MoonBit 搜索引擎 rocks")
+  let tokens = @moonseek.tokenize("MoonBit 搜索引擎 rocks")
   let terms : Array[String] = []
   for t in tokens {
     terms.push(t.term)
@@ -38,7 +38,7 @@ test "mixed chinese english" {
 
 ///|
 test "punctuation splits words" {
-  let tokens = tokenize("hello,world;foo-bar")
+  let tokens = @moonseek.tokenize("hello,world;foo-bar")
   let terms : Array[String] = []
   for t in tokens {
     terms.push(t.term)
@@ -48,7 +48,7 @@ test "punctuation splits words" {
 
 ///|
 test "positions are contiguous across scripts" {
-  let tokens = tokenize("hello 世界 world")
+  let tokens = @moonseek.tokenize("hello 世界 world")
   assert_eq(tokens.length(), 3)
   assert_eq(tokens[0], { term: "hello", position: 0, })
   assert_eq(tokens[1], { term: "世界", position: 1, })
@@ -57,7 +57,7 @@ test "positions are contiguous across scripts" {
 
 ///|
 test "analyzer options disable stop words and lowercasing" {
-  let analyzer : Analyzer = {
+  let analyzer : @moonseek.Analyzer = {
     lowercase: false,
     remove_stop_words: false,
     cjk_bigram: true,
@@ -70,7 +70,7 @@ test "analyzer options disable stop words and lowercasing" {
 
 ///|
 test "empty and whitespace-only input" {
-  assert_eq(tokenize("").length(), 0)
-  assert_eq(tokenize("   \t\n  ").length(), 0)
-  assert_eq(tokenize("，。！").length(), 0)
+  assert_eq(@moonseek.tokenize("").length(), 0)
+  assert_eq(@moonseek.tokenize("   \t\n  ").length(), 0)
+  assert_eq(@moonseek.tokenize("，。！").length(), 0)
 }

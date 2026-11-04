@@ -11,7 +11,7 @@ pub fn write_varint(buf : Array[Byte], value : Int32) -> Unit {
   let mut v = value
   while v >= 0x80 {
     buf.push(((v & 0x7F) | 0x80).to_byte())
-    v = v.lsr(7)
+    v = v >> 7
   }
   buf.push(v.to_byte())
 }
@@ -43,6 +43,12 @@ pub(all) suberror CodecError {
   BadVersion(Int32)
   CrcMismatch(UInt32, UInt32)
 } derive(Eq, Debug)
+
+///|
+pub extend CodecError with Eq::{equal, not_equal}
+
+///|
+pub extend CodecError with @debug.Debug::{to_repr}
 
 ///|
 pub fn Reader::read_byte(self : Reader) -> Byte raise CodecError {
@@ -121,9 +127,9 @@ pub fn Reader::read_double(self : Reader) -> Double raise CodecError {
 let crc32_table : FixedArray[UInt32] = {
   let table = FixedArray::make(256, 0U)
   for i in 0..<256 {
-    let mut c = i.to_uint()
+    let mut c = i.reinterpret_as_uint()
     for _ in 0..<8 {
-      c = if (c & 1U) == 1U { 0xEDB88320U ^ c.lsr(1) } else { c.lsr(1) }
+      c = if (c & 1U) == 1U { 0xEDB88320U ^ (c >> 1) } else { c >> 1 }
     }
     table[i] = c
   }
@@ -135,8 +141,8 @@ let crc32_table : FixedArray[UInt32] = {
 pub fn crc32(data : Bytes) -> UInt32 {
   let mut crc = 0xFFFFFFFFU
   for b in data.iter() {
-    let idx = ((crc ^ b.to_int().to_uint()) & 0xFFU).to_int()
-    crc = crc32_table[idx] ^ crc.lsr(8)
+    let idx = ((crc ^ b.to_int().reinterpret_as_uint()) & 0xFFU).reinterpret_as_int()
+    crc = crc32_table[idx] ^ (crc >> 8)
   }
   crc ^ 0xFFFFFFFFU
 }
@@ -153,7 +159,7 @@ pub fn write_u32_le(buf : Array[Byte], value : UInt32) -> Unit {
 pub fn Reader::read_u32_le(self : Reader) -> UInt32 raise CodecError {
   let mut result = 0U
   for i in 0..<4 {
-    let b = self.read_byte().to_int().to_uint()
+    let b = self.read_byte().to_int().reinterpret_as_uint()
     result = result | (b << (i * 8))
   }
   result

@@ -30,18 +30,33 @@ pub(all) suberror CodecError {
   BadVersion(Int32)
   CrcMismatch(UInt32, UInt32)
 } derive(Eq, @debug.Debug)
+pub fn CodecError::equal(Self, Self) -> Bool
+pub fn CodecError::not_equal(Self, Self) -> Bool
+pub fn CodecError::to_repr(Self) -> @debug.Repr
 
 pub(all) suberror QueryError {
   EmptyQuery
   UnterminatedPhrase
   UnexpectedToken(String)
   UnknownField(String)
-} derive(Eq, Show, @debug.Debug)
+} derive(Eq, @debug.Debug)
+pub fn QueryError::equal(Self, Self) -> Bool
+pub fn QueryError::not_equal(Self, Self) -> Bool
+pub fn QueryError::output(Self, &Logger) -> Unit
+pub fn QueryError::to_repr(Self) -> @debug.Repr
+pub fn QueryError::to_string(Self) -> String
+pub impl Show for QueryError
 
 pub(all) suberror StoreError {
   IoError(String)
   CorruptIndex(String)
-} derive(Eq, Show, @debug.Debug)
+} derive(Eq, @debug.Debug)
+pub fn StoreError::equal(Self, Self) -> Bool
+pub fn StoreError::not_equal(Self, Self) -> Bool
+pub fn StoreError::output(Self, &Logger) -> Unit
+pub fn StoreError::to_repr(Self) -> @debug.Repr
+pub fn StoreError::to_string(Self) -> String
+pub impl Show for StoreError
 
 // Types and methods
 pub(all) struct Analyzer {
@@ -51,22 +66,34 @@ pub(all) struct Analyzer {
 } derive(Eq, @debug.Debug)
 pub fn Analyzer::analyze(Self, String) -> Array[Token]
 pub fn Analyzer::default() -> Self
+pub fn Analyzer::equal(Self, Self) -> Bool
+pub fn Analyzer::not_equal(Self, Self) -> Bool
+pub fn Analyzer::to_repr(Self) -> @debug.Repr
 
 pub(all) struct Bm25Params {
   k1 : Double
   b : Double
 } derive(Eq, @debug.Debug)
 pub fn Bm25Params::default() -> Self
+pub fn Bm25Params::equal(Self, Self) -> Bool
+pub fn Bm25Params::not_equal(Self, Self) -> Bool
+pub fn Bm25Params::to_repr(Self) -> @debug.Repr
 
 pub(all) struct Document {
   id : String
   fields : Array[(String, String)]
 } derive(Eq, @debug.Debug)
+pub fn Document::equal(Self, Self) -> Bool
+pub fn Document::not_equal(Self, Self) -> Bool
+pub fn Document::to_repr(Self) -> @debug.Repr
 
 pub(all) struct FieldSchema {
   name : String
   weight : Double
 } derive(Eq, @debug.Debug)
+pub fn FieldSchema::equal(Self, Self) -> Bool
+pub fn FieldSchema::not_equal(Self, Self) -> Bool
+pub fn FieldSchema::to_repr(Self) -> @debug.Repr
 
 type FieldStats
 
@@ -74,6 +101,9 @@ pub(all) struct Hit {
   id : String
   score : Double
 } derive(Eq, @debug.Debug)
+pub fn Hit::equal(Self, Self) -> Bool
+pub fn Hit::not_equal(Self, Self) -> Bool
+pub fn Hit::to_repr(Self) -> @debug.Repr
 
 pub struct Index {
   schema : Array[FieldSchema]
@@ -100,15 +130,19 @@ pub fn Index::term_count(Self) -> Int32
 pub fn Index::terms_of(Self, String) -> Array[String]
 pub fn Index::to_bytes(Self) -> Bytes
 
-type Parser
-
 pub(all) struct Posting {
   doc : Int32
   freq : Int32
   positions : Array[Int32]
 } derive(Eq, @debug.Debug)
+pub fn Posting::equal(Self, Self) -> Bool
+pub fn Posting::not_equal(Self, Self) -> Bool
+pub fn Posting::to_repr(Self) -> @debug.Repr
 
 type QToken derive(Eq, @debug.Debug)
+pub fn QToken::equal(Self, Self) -> Bool
+pub fn QToken::not_equal(Self, Self) -> Bool
+pub fn QToken::to_repr(Self) -> @debug.Repr
 
 pub(all) enum Query {
   Term(String, String?)
@@ -119,6 +153,9 @@ pub(all) enum Query {
   Not(Query, Query)
   MatchAll
 } derive(Eq, @debug.Debug)
+pub fn Query::equal(Self, Self) -> Bool
+pub fn Query::not_equal(Self, Self) -> Bool
+pub fn Query::to_repr(Self) -> @debug.Repr
 
 pub struct Reader {
   data : Bytes
@@ -135,7 +172,10 @@ pub fn Reader::remaining(Self) -> Int32
 pub(all) struct Token {
   term : String
   position : Int32
-} derive(Eq, Show, @debug.Debug)
+} derive(Eq, @debug.Debug)
+pub fn Token::equal(Self, Self) -> Bool
+pub fn Token::not_equal(Self, Self) -> Bool
+pub fn Token::to_repr(Self) -> @debug.Repr
 
 // Type aliases
 

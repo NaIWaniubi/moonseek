@@ -4,7 +4,15 @@
 pub(all) struct Token {
   term : String
   position : Int32
-} derive(Eq, Debug, Show)
+} derive(Eq, Debug)
+
+///|
+pub extend Token with Eq::{equal, not_equal}
+
+///|
+pub extend Token with @debug.Debug::{to_repr}
+
+///|
 
 ///|
 /// Default English stop words (Lucene's classic set).
@@ -25,6 +33,12 @@ pub(all) struct Analyzer {
   /// so Chinese text is searchable without a dictionary.
   cjk_bigram : Bool
 } derive(Eq, Debug)
+
+///|
+pub extend Analyzer with Eq::{equal, not_equal}
+
+///|
+pub extend Analyzer with @debug.Debug::{to_repr}
 
 ///|
 pub fn Analyzer::default() -> Analyzer {
