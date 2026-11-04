@@ -224,6 +224,7 @@ pub fn SegmentedIndex::doc_count(Self) -> Int32
 pub fn SegmentedIndex::flush(Self) -> Unit
 pub fn SegmentedIndex::from_bytes(Bytes) -> Self raise CodecError
 pub fn SegmentedIndex::get_document(Self, String) -> Document?
+pub fn SegmentedIndex::get_field(Self, String, String) -> String?
 pub fn SegmentedIndex::merge(Self, max_segments? : Int32) -> Unit
 pub fn SegmentedIndex::new(Array[FieldSchema], segment_max_docs? : Int32) -> Self
 pub async fn SegmentedIndex::open_or_create(String, Array[FieldSchema]) -> Self raise StoreError

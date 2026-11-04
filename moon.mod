@@ -11,7 +11,17 @@ repository = "https://github.com/NaIWaniubi/moonseek"
 
 license = "Apache-2.0"
 
-keywords = [ "search", "full-text", "index", "bm25", "chinese", "wasm", "fuzzy", "highlight", "wal" ]
+keywords = [
+  "search",
+  "full-text",
+  "index",
+  "bm25",
+  "chinese",
+  "wasm",
+  "fuzzy",
+  "highlight",
+  "wal",
+]
 
 preferred_target = "native"
 

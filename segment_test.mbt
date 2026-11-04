@@ -197,6 +197,37 @@ test "segment: tiered merge keeps sizes balanced" {
 }
 
 ///|
+test "segment: merge preserves newest-wins across untouched segments" {
+  // Regression: a rebuilt segment must not shadow a newer version of
+  // the same id living in an UNTOUCHED segment. Layout (max_docs=100 so
+  // nothing auto-freezes; explicit flushes make the tiers exact):
+  //   s0 (2 docs, class 1): a_OLD + f        — chosen, contains stale "a"
+  //   s1 (2 docs, class 1): b, c             — chosen
+  //   s2 (4 docs, class 2): a_NEW + fillers  — untouched, newest "a"
+  // merge(max_segments=2) collapses the fullest tier (class 1: s0+s1).
+  // Without tombstoning ids that also live in untouched newer segments,
+  // the rebuild's a_OLD would shadow s2's a_NEW.
+  let seg = @moonseek.SegmentedIndex::new(seg_schema(), segment_max_docs=100)
+  seg.add(seg_doc("a", "version one zebra"))
+  seg.add(seg_doc("f", "filler f"))
+  seg.flush()
+  seg.add(seg_doc("b", "filler b"))
+  seg.add(seg_doc("c", "filler c"))
+  seg.flush()
+  seg.add(seg_doc("a", "version two walrus"))
+  seg.add(seg_doc("x1", "filler"))
+  seg.add(seg_doc("x2", "filler"))
+  seg.add(seg_doc("x3", "filler"))
+  seg.flush()
+  seg.merge(max_segments=2)
+  assert_eq(seg.segment_count(), 2)
+  assert_eq(seg.doc_count(), 7)
+  assert_eq(seg.get_document("a"), Some(seg_doc("a", "version two walrus")))
+  assert_eq(seg.search("zebra").length(), 0)
+  assert_eq(sorted_ids(seg.search("walrus")), ["a"])
+}
+
+///|
 test "segment: snapshot roundtrip preserves everything" {
   let seg = @moonseek.SegmentedIndex::new(seg_schema(), segment_max_docs=2)
   seg.add(seg_doc("a", "moonbit language"))
@@ -351,4 +382,17 @@ test "segment: get_document returns newest live version" {
   assert_true(seg.delete("a"))
   assert_eq(seg.get_document("a"), None)
   assert_eq(seg.get_document("missing"), None)
+}
+
+///|
+test "segment: get_field reads newest live version" {
+  let seg = @moonseek.SegmentedIndex::new(seg_schema(), segment_max_docs=2)
+  seg.add(seg_doc("a", "old text"))
+  seg.add(seg_doc("b", "filler"))
+  seg.add(seg_doc("a", "new text"))
+  assert_eq(seg.get_field("a", "title"), Some("new text"))
+  assert_eq(seg.get_field("a", "nonexistent"), None)
+  assert_eq(seg.get_field("missing", "title"), None)
+  assert_true(seg.delete("a"))
+  assert_eq(seg.get_field("a", "title"), None)
 }

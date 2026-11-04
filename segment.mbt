@@ -58,7 +58,13 @@ fn SegmentedIndex::new_active(self : SegmentedIndex) -> Index {
 ///|
 /// Add or replace a document in the active segment. Freezes the active
 /// segment once it reaches `segment_max_docs` live documents.
+/// Re-adding an id tombstones its older versions in frozen segments so
+/// that position-based readers (get_document) agree with search's
+/// newest-wins resolution even before a merge compacts the stack.
 pub fn SegmentedIndex::add(self : SegmentedIndex, doc : Document) -> Unit {
+  for segment in self.segments {
+    ignore(segment.delete(doc.id))
+  }
   self.active.add(doc)
   if self.active.doc_count() >= self.segment_max_docs {
     self.flush()
@@ -156,6 +162,26 @@ pub fn SegmentedIndex::get_document(
     }
   }
   None
+}
+
+///|
+/// Retrieve one stored field's text from the newest live version.
+pub fn SegmentedIndex::get_field(
+  self : SegmentedIndex,
+  id : String,
+  field : String,
+) -> String? {
+  match self.get_document(id) {
+    Some(doc) => {
+      for (name, text) in doc.fields {
+        if name == field {
+          return Some(text)
+        }
+      }
+      None
+    }
+    None => None
+  }
 }
 
 ///|
@@ -360,21 +386,49 @@ fn SegmentedIndex::collapse(
   for id in ids {
     rebuilt.add(latest[id])
   }
-  // Rebuild the stack: untouched segments keep their relative order,
-  // the merged segment is appended at the end (it contains the newest
-  // versions of the chosen segments, so it must sort after any segment
-  // that was not chosen). If the active segment was chosen it is folded
-  // into the rebuild and a fresh empty active segment replaces it.
-  let new_segments : Array[Index] = []
+  // Rebuild the stack. The merged segment is inserted at the position
+  // of the newest chosen segment. Any id it carries whose newest live
+  // version lives in an UNTOUCHED segment (older OR newer — tier
+  // selection is size-based, not recency-based) is tombstoned inside
+  // the rebuild, so the untouched version keeps winning no matter where
+  // the rebuild lands (regression-tested). If the active segment was
+  // chosen it is folded into the rebuild and a fresh empty active
+  // segment replaces it.
+  let mut insert_at = 0
+  for i in 0..<all.length() {
+    if picked.contains(i) {
+      insert_at = i
+    }
+  }
   let active_included = self.active.doc_ids.length() > 0
   for i in 0..<all.length() {
-    let is_active = active_included && i == all.length() - 1
-    if picked.contains(i) || is_active {
+    if picked.contains(i) {
       continue
     }
-    new_segments.push(all[i])
+    let untouched = all[i]
+    for num in 0..<untouched.doc_ids.length() {
+      if untouched.deleted.contains(num) {
+        continue
+      }
+      let id = untouched.doc_ids[num]
+      if latest.contains(id) {
+        ignore(rebuilt.delete(id))
+      }
+    }
   }
-  new_segments.push(rebuilt)
+  let new_segments : Array[Index] = []
+  for i in 0..<all.length() {
+    let is_active = active_included && i == all.length() - 1
+    if picked.contains(i) {
+      if i == insert_at {
+        new_segments.push(rebuilt)
+      }
+      continue
+    }
+    if !is_active {
+      new_segments.push(all[i])
+    }
+  }
   self.segments = new_segments
   if active_included && picked.contains(all.length() - 1) {
     self.active = self.new_active()
