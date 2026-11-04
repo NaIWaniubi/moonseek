@@ -16,3 +16,7 @@ keywords = [ "search", "full-text", "index", "bm25", "chinese", "wasm" ]
 preferred_target = "native"
 
 description = "Embedded full-text search engine: inverted index, BM25 ranking, Chinese/English tokenization, crash-safe segments, runs on native/WASM/JS."
+
+import {
+  "moonbitlang/async@0.22.4",
+}
