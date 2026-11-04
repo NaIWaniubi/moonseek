@@ -96,3 +96,51 @@ pub fn ms_terms() -> Int32 {
     None => 0
   }
 }
+
+///|
+/// Retrieve a stored field's original text ("" if absent).
+#export_name("ms_get")
+pub fn ms_get(id : String, field : String) -> String {
+  match engine.val {
+    Some(index) => index.get_field(id, field).unwrap_or("")
+    None => ""
+  }
+}
+
+///|
+/// Delete a document by id. Returns 1 if deleted, 0 if not found.
+#export_name("ms_delete")
+pub fn ms_delete(id : String) -> Int32 {
+  match engine.val {
+    Some(index) => if index.delete(id) { 1 } else { 0 }
+    None => 0
+  }
+}
+
+///|
+/// List all terms in a field as a JSON array of [term, doc_freq] pairs,
+/// sorted by descending doc frequency (for the index inspector).
+#export_name("ms_term_stats")
+pub fn ms_term_stats(field : String, limit : Int32) -> String {
+  match engine.val {
+    Some(index) => {
+      let terms = index.terms_of(field)
+      let stats : Array[(String, Int32)] = []
+      for term in terms {
+        stats.push((term, index.doc_freq(field, term)))
+      }
+      stats.sort_by(fn(a, b) { b.1.compare(a.1) })
+      let items : Array[Json] = []
+      let mut count = 0
+      for (term, freq) in stats {
+        if limit > 0 && count >= limit {
+          break
+        }
+        items.push(Json::array([@json.to_json(term), @json.to_json(freq)]))
+        count += 1
+      }
+      Json::array(items).stringify()
+    }
+    None => "[]"
+  }
+}
