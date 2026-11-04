@@ -93,8 +93,6 @@ pub fn BkTree::len(Self) -> Int32
 pub fn BkTree::new() -> Self
 pub fn BkTree::search(Self, String, max_distance? : Int32) -> Array[FuzzyMatch]
 
-type Bm25Context
-
 pub(all) struct Bm25Params {
   k1 : Double
   b : Double

@@ -347,7 +347,7 @@ fn Index::avg_field_length(self : Index, field : String) -> Double {
 /// Per-(field, term) BM25 constants, computed once and reused for every
 /// posting of the term. Computing df inside the posting loop made term
 /// queries O(df²) — a 5k-posting term took ~50 ms per query.
-struct Bm25Context {
+priv struct Bm25Context {
   k1 : Double
   b : Double
   idf : Double
@@ -400,16 +400,4 @@ fn Bm25Context::score(self : Bm25Context, posting : Posting) -> Double {
   }
   let tf = posting.freq.to_double()
   self.idf * (tf * (self.k1 + 1.0)) / (tf + self.k1 * norm) * self.weight
-}
-
-///|
-/// BM25 score of one term in one field for one document (convenience
-/// wrapper; hot paths use `bm25_context` to avoid recomputing df).
-fn Index::bm25_score(
-  self : Index,
-  field : String,
-  term : String,
-  posting : Posting,
-) -> Double {
-  self.bm25_context(field, term).score(posting)
 }

@@ -71,7 +71,6 @@ pub fn Index::explain(
   // would list contributions that are not in the total.
   let details : Array[ScoreDetail] = []
   let terms = explain_terms(self, parsed)
-  let n = self.doc_count()
   for term in terms {
     for field in self.field_names() {
       let postings = self.postings_of(field, term)
@@ -96,7 +95,6 @@ pub fn Index::explain(
         Some(posting) => {
           let ctx = self.bm25_context(field, term)
           if ctx.valid {
-            let tf = posting.freq.to_double()
             let dl = self.stats[field].lengths
               .get_or_default(doc_num, 0)
               .to_double()
