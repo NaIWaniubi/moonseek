@@ -5,6 +5,7 @@ import {
   "moonbitlang/core/debug",
   "moonbitlang/async/fs",
   "moonbitlang/async",
+  "moonbitlang/core/bench",
 }
 
 options(
