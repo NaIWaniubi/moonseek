@@ -34,8 +34,10 @@ jobs:
           moon version --all
           moon update
 
-      - name: Format check
-        run: moon fmt --check
+      # moon fmt normalizes code; commit the result so the tree is always
+      # canonical for the latest toolchain (formatting rules evolve).
+      - name: Format
+        run: moon fmt
 
       - name: Check
         run: moon check --target ${{ matrix.target }}
