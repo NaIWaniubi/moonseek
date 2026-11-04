@@ -1,15 +1,20 @@
 ///|
 /// Snapshot format: a self-contained, checksummed byte image of an index.
-/// Layout: magic "MSK1" | payload | crc32(payload) as u32le.
+/// Layout: magic "MSK2" | payload | crc32(payload) as u32le.
 /// The payload is versioned; readers reject unknown versions and any
 /// checksum mismatch, so a torn write is detected rather than loaded.
+/// Version 2 adds stored original field texts (version 1 images are still
+/// readable; they simply have no stored fields).
 /// Pure functions over bytes — usable on native, wasm-gc and js alike.
 
 ///|
-const SNAPSHOT_MAGIC : Bytes = b"MSK1"
+const SNAPSHOT_MAGIC : Bytes = b"MSK2"
 
 ///|
-const SNAPSHOT_VERSION : Int32 = 1
+const SNAPSHOT_LEGACY_MAGIC : Bytes = b"MSK1"
+
+///|
+const SNAPSHOT_VERSION : Int32 = 2
 
 ///|
 /// Serialize the index to a portable byte image.
@@ -33,10 +38,30 @@ pub fn Index::to_bytes(self : Index) -> Bytes {
   for id in self.doc_ids {
     write_string(payload, id)
   }
-  // Deleted internal doc numbers
-  write_varint(payload, self.deleted.length())
+  // Deleted internal doc numbers (sorted for determinism)
+  let deleted_nums : Array[Int32] = []
   for (num, _) in self.deleted.iter() {
+    deleted_nums.push(num)
+  }
+  deleted_nums.sort()
+  write_varint(payload, deleted_nums.length())
+  for num in deleted_nums {
     write_varint(payload, num)
+  }
+  // Stored original field texts (live documents only, in doc order)
+  write_varint(payload, self.stored.length())
+  for num in 0..<self.doc_ids.length() {
+    match self.stored.get(num) {
+      Some(fields) => {
+        write_varint(payload, num)
+        write_varint(payload, fields.length())
+        for (name, text) in fields {
+          write_string(payload, name)
+          write_string(payload, text)
+        }
+      }
+      None => ()
+    }
   }
   // Per-field stats: doc -> length
   for field in self.schema {
@@ -95,8 +120,9 @@ pub fn Index::from_bytes(data : Bytes) -> Index raise CodecError {
     raise CodecError::UnexpectedEof
   }
   let magic = data.get_view(end=4)
-  match magic {
-    Some(m) if m == SNAPSHOT_MAGIC => ()
+  let legacy = match magic {
+    Some(m) if m == SNAPSHOT_MAGIC => false
+    Some(m) if m == SNAPSHOT_LEGACY_MAGIC => true
     _ => raise CodecError::BadMagic
   }
   let payload_len = data.length() - 8
@@ -113,7 +139,8 @@ pub fn Index::from_bytes(data : Bytes) -> Index raise CodecError {
   }
   let reader = Reader::new(payload.to_owned())
   let version = reader.read_varint()
-  if version != SNAPSHOT_VERSION {
+  let expected_version = if legacy { 1 } else { SNAPSHOT_VERSION }
+  if version != expected_version {
     raise CodecError::BadVersion(version)
   }
   // Schema
@@ -146,6 +173,21 @@ pub fn Index::from_bytes(data : Bytes) -> Index raise CodecError {
   let deleted_count = reader.read_varint()
   for _ in 0..<deleted_count {
     index.deleted.set(reader.read_varint(), ())
+  }
+  // Stored fields (version 2+)
+  if version >= 2 {
+    let stored_count = reader.read_varint()
+    for _ in 0..<stored_count {
+      let num = reader.read_varint()
+      let field_count = reader.read_varint()
+      let fields : Array[(String, String)] = []
+      for _ in 0..<field_count {
+        let name = reader.read_string()
+        let text = reader.read_string()
+        fields.push((name, text))
+      }
+      index.stored.set(num, fields)
+    }
   }
   // Stats
   for field in schema {
