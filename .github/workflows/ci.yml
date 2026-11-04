@@ -42,5 +42,21 @@ jobs:
       - name: Check
         run: moon check --target ${{ matrix.target }}
 
-      - name: Test
+      - name: Test (debug)
         run: moon test --target ${{ matrix.target }}
+
+      - name: Test (release)
+        run: moon test --target ${{ matrix.target }} --release
+
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up MoonBit
+        run: |
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
+          echo "$HOME/.moon/bin" >> $GITHUB_PATH
+      - name: Benchmarks
+        run: |
+          moon update
+          moon bench --target native --release
