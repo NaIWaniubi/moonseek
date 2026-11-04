@@ -1,0 +1,101 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "cs6210501-lab/moonseek"
+
+import {
+  "moonbitlang/core/debug",
+  "moonbitlang/core/hashmap",
+}
+
+// Values
+pub fn parse_query(String, analyzer? : Analyzer, fields? : Array[String]) -> Query raise QueryError
+
+pub fn tokenize(String) -> Array[Token]
+
+// Errors
+pub(all) suberror QueryError {
+  EmptyQuery
+  UnterminatedPhrase
+  UnexpectedToken(String)
+  UnknownField(String)
+} derive(Eq, Show, @debug.Debug)
+
+// Types and methods
+pub(all) struct Analyzer {
+  lowercase : Bool
+  remove_stop_words : Bool
+  cjk_bigram : Bool
+} derive(Eq, @debug.Debug)
+pub fn Analyzer::analyze(Self, String) -> Array[Token]
+pub fn Analyzer::default() -> Self
+
+pub(all) struct Bm25Params {
+  k1 : Double
+  b : Double
+} derive(Eq, @debug.Debug)
+pub fn Bm25Params::default() -> Self
+
+pub(all) struct Document {
+  id : String
+  fields : Array[(String, String)]
+} derive(Eq, @debug.Debug)
+
+pub(all) struct FieldSchema {
+  name : String
+  weight : Double
+} derive(Eq, @debug.Debug)
+
+type FieldStats
+
+pub(all) struct Hit {
+  id : String
+  score : Double
+} derive(Eq, @debug.Debug)
+
+pub struct Index {
+  schema : Array[FieldSchema]
+  analyzer : Analyzer
+  bm25 : Bm25Params
+  postings : @hashmap.HashMap[String, @hashmap.HashMap[String, Array[Posting]]]
+  doc_ids : Array[String]
+  doc_nums : @hashmap.HashMap[String, Int32]
+  stats : @hashmap.HashMap[String, FieldStats]
+  deleted : @hashmap.HashMap[Int32, Unit]
+}
+pub fn Index::add(Self, Document) -> Unit
+pub fn Index::delete(Self, String) -> Bool
+pub fn Index::doc_count(Self) -> Int32
+pub fn Index::doc_id(Self, Int32) -> String?
+pub fn Index::new(Array[FieldSchema], analyzer? : Analyzer, bm25? : Bm25Params) -> Self
+pub fn Index::postings_of(Self, String, String) -> Array[Posting]
+pub fn Index::search(Self, String, limit? : Int32) -> Array[Hit] raise QueryError
+pub fn Index::term_count(Self) -> Int32
+pub fn Index::terms_of(Self, String) -> Array[String]
+
+type Parser
+
+pub(all) struct Posting {
+  doc : Int32
+  freq : Int32
+  positions : Array[Int32]
+} derive(Eq, @debug.Debug)
+
+type QToken derive(Eq, @debug.Debug)
+
+pub(all) enum Query {
+  Term(String, String?)
+  Phrase(Array[String], String?)
+  Prefix(String, String?)
+  And(Query, Query)
+  Or(Query, Query)
+  Not(Query, Query)
+  MatchAll
+} derive(Eq, @debug.Debug)
+
+pub(all) struct Token {
+  term : String
+  position : Int32
+} derive(Eq, Show, @debug.Debug)
+
+// Type aliases
+
+// Traits
