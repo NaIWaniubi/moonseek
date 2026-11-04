@@ -8,13 +8,16 @@
 /// Pure functions over bytes — usable on native, wasm-gc and js alike.
 
 ///|
-const SNAPSHOT_MAGIC : Bytes = b"MSK2"
+const SNAPSHOT_MAGIC : Bytes = b"MSK3"
 
 ///|
 const SNAPSHOT_LEGACY_MAGIC : Bytes = b"MSK1"
 
 ///|
-const SNAPSHOT_VERSION : Int32 = 2
+const SNAPSHOT_V2_MAGIC : Bytes = b"MSK2"
+
+///|
+const SNAPSHOT_VERSION : Int32 = 3
 
 ///|
 /// Serialize the index to a portable byte image.
@@ -58,6 +61,24 @@ pub fn Index::to_bytes(self : Index) -> Bytes {
         for (name, text) in fields {
           write_string(payload, name)
           write_string(payload, text)
+        }
+      }
+      None => ()
+    }
+  }
+  // Facet values (live documents only, in doc order)
+  write_varint(payload, self.facets.length())
+  for num in 0..<self.doc_ids.length() {
+    match self.facets.get(num) {
+      Some(facets) => {
+        write_varint(payload, num)
+        write_varint(payload, facets.length())
+        for (name, values) in facets {
+          write_string(payload, name)
+          write_varint(payload, values.length())
+          for v in values {
+            write_string(payload, v)
+          }
         }
       }
       None => ()
@@ -120,9 +141,10 @@ pub fn Index::from_bytes(data : Bytes) -> Index raise CodecError {
     raise CodecError::UnexpectedEof
   }
   let magic = data.get_view(end=4)
-  let legacy = match magic {
-    Some(m) if m == SNAPSHOT_MAGIC => false
-    Some(m) if m == SNAPSHOT_LEGACY_MAGIC => true
+  let format_version = match magic {
+    Some(m) if m == SNAPSHOT_MAGIC => 3
+    Some(m) if m == SNAPSHOT_V2_MAGIC => 2
+    Some(m) if m == SNAPSHOT_LEGACY_MAGIC => 1
     _ => raise CodecError::BadMagic
   }
   let payload_len = data.length() - 8
@@ -139,8 +161,7 @@ pub fn Index::from_bytes(data : Bytes) -> Index raise CodecError {
   }
   let reader = Reader::new(payload.to_owned())
   let version = reader.read_varint()
-  let expected_version = if legacy { 1 } else { SNAPSHOT_VERSION }
-  if version != expected_version {
+  if version != format_version {
     raise CodecError::BadVersion(version)
   }
   // Schema
@@ -187,6 +208,25 @@ pub fn Index::from_bytes(data : Bytes) -> Index raise CodecError {
         fields.push((name, text))
       }
       index.stored.set(num, fields)
+    }
+  }
+  // Facets (version 3+)
+  if version >= 3 {
+    let facet_count = reader.read_varint()
+    for _ in 0..<facet_count {
+      let num = reader.read_varint()
+      let field_count = reader.read_varint()
+      let facets : Array[(String, Array[String])] = []
+      for _ in 0..<field_count {
+        let name = reader.read_string()
+        let value_count = reader.read_varint()
+        let values : Array[String] = []
+        for _ in 0..<value_count {
+          values.push(reader.read_string())
+        }
+        facets.push((name, values))
+      }
+      index.facets.set(num, facets)
     }
   }
   // Stats

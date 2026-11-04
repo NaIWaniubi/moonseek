@@ -187,6 +187,158 @@ pub fn ms_fuzzy(term : String, max_distance : Int32, limit : Int32) -> String {
 }
 
 ///|
+/// Set facet values for a document: `json` is [["lang",["en"]],["topic",["db"]]].
+/// Returns "" on success or an error message.
+#export_name("ms_set_facets")
+pub fn ms_set_facets(id : String, json : String) -> String {
+  match engine.val {
+    Some(index) => {
+      let parsed = @json.parse(json) catch {
+        e => return "bad facet json: " + @debug.to_string(e)
+      }
+      let facets : Array[(String, Array[String])] = []
+      match parsed.as_array() {
+        Some(items) =>
+          for item in items {
+            match item.as_array() {
+              Some(pair) if pair.length() == 2 =>
+                match (pair[0].as_string(), pair[1].as_array()) {
+                  (Some(name), Some(values)) => {
+                    let vals : Array[String] = []
+                    for v in values {
+                      match v.as_string() {
+                        Some(s) => vals.push(s)
+                        None => ()
+                      }
+                    }
+                    facets.push((name, vals))
+                  }
+                  _ => ()
+                }
+              _ => ()
+            }
+          }
+        None => ()
+      }
+      index.set_facets(id, facets)
+      ""
+    }
+    None => "index not initialized"
+  }
+}
+
+///|
+/// Faceted search with the demo's fixed facet fields (lang, topic).
+/// `filters_json` is [["lang","zh"],["topic","db"]] or "" for no filter.
+/// Returns {hits:[{id,score,title,snippet}], total, facets:{lang:[[v,n]]}}.
+#export_name("ms_search_faceted")
+pub fn ms_search_faceted(
+  query : String,
+  filters_json : String,
+  limit : Int32,
+  offset : Int32,
+) -> String {
+  match engine.val {
+    Some(index) => {
+      let filters : Array[@moonseek.FacetFilter] = []
+      if filters_json != "" {
+        let parsed = @json.parse(filters_json) catch {
+          _ => return "{\"error\":\"bad filters json\"}"
+        }
+        match parsed.as_array() {
+          Some(items) =>
+            for item in items {
+              match item.as_array() {
+                Some(pair) if pair.length() == 2 =>
+                  match (pair[0].as_string(), pair[1].as_string()) {
+                    (Some(field), Some(value)) =>
+                      filters.push({ field, values: [value], })
+                    _ => ()
+                  }
+                _ => ()
+              }
+            }
+          None => ()
+        }
+      }
+      let options : @moonseek.SearchOptions = {
+        limit,
+        offset,
+        filters,
+        facet_fields: ["cat", "lang"],
+      }
+      let result = index.search_faceted(query, options~) catch {
+        e => return "{\"error\":\"" + @debug.to_string(e) + "\"}"
+      }
+      let hits : Array[Json] = []
+      for hit in result.hits {
+        let fields : Map[String, Json] = Map([])
+        fields["id"] = @json.to_json(hit.id)
+        fields["score"] = @json.to_json(hit.score)
+        fields["title"] = @json.to_json(
+          index.get_field(hit.id, "title").unwrap_or(""),
+        )
+        fields["snippet"] = @json.to_json(
+          index.snippet(hit.id, "body", query, max_chars=160) catch {
+            _ => ""
+          },
+        )
+        hits.push(Json::object(fields))
+      }
+      let facet_obj : Map[String, Json] = Map([])
+      for (field, counts) in result.facets {
+        let arr : Array[Json] = []
+        for c in counts {
+          arr.push(
+            Json::array([@json.to_json(c.value), @json.to_json(c.count)]),
+          )
+        }
+        facet_obj[field] = Json::array(arr)
+      }
+      let out : Map[String, Json] = Map([])
+      out["hits"] = Json::array(hits)
+      out["total"] = @json.to_json(result.total)
+      out["facets"] = Json::object(facet_obj)
+      Json::object(out).stringify()
+    }
+    None => "{\"error\":\"index not initialized\"}"
+  }
+}
+
+///|
+/// Explain a hit's score: JSON {id, total, details:[{field,term,tf,df,idf,score}]}.
+#export_name("ms_explain")
+pub fn ms_explain(id : String, query : String) -> String {
+  match engine.val {
+    Some(index) => {
+      let exp = index.explain(query, id) catch { _ => None }
+      match exp {
+        None => "null"
+        Some(e) => {
+          let details : Array[Json] = []
+          for d in e.details {
+            let fields : Map[String, Json] = Map([])
+            fields["field"] = @json.to_json(d.field)
+            fields["term"] = @json.to_json(d.term)
+            fields["tf"] = @json.to_json(d.tf)
+            fields["df"] = @json.to_json(d.df)
+            fields["idf"] = @json.to_json(d.idf)
+            fields["score"] = @json.to_json(d.score)
+            details.push(Json::object(fields))
+          }
+          let out : Map[String, Json] = Map([])
+          out["id"] = @json.to_json(e.id)
+          out["total"] = @json.to_json(e.total_score)
+          out["details"] = Json::array(details)
+          Json::object(out).stringify()
+        }
+      }
+    }
+    None => "null"
+  }
+}
+
+///|
 /// List all terms in a field as a JSON array of [term, doc_freq] pairs,
 /// sorted by descending doc frequency (for the index inspector).
 #export_name("ms_term_stats")

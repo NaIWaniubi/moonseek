@@ -11,6 +11,10 @@ pub fn crc32(Bytes) -> UInt32
 
 pub fn damerau_levenshtein(String, String) -> Int32
 
+pub fn damerau_levenshtein_bounded(String, String, Int32) -> Int32
+
+pub fn explain_terms(Index, Query) -> Array[String]
+
 pub fn levenshtein(String, String) -> Int32
 
 pub fn parse_query(String, analyzer? : Analyzer, fields? : Array[String]) -> Query raise QueryError
@@ -80,6 +84,17 @@ pub fn Analyzer::equal(Self, Self) -> Bool
 pub fn Analyzer::not_equal(Self, Self) -> Bool
 pub fn Analyzer::to_repr(Self) -> @debug.Repr
 
+pub struct BkTree {
+  // private fields
+}
+pub fn BkTree::from_terms(Array[String]) -> Self
+pub fn BkTree::insert(Self, String) -> Unit
+pub fn BkTree::len(Self) -> Int32
+pub fn BkTree::new() -> Self
+pub fn BkTree::search(Self, String, max_distance? : Int32) -> Array[FuzzyMatch]
+
+type Bm25Context
+
 pub(all) struct Bm25Params {
   k1 : Double
   b : Double
@@ -96,6 +111,40 @@ pub(all) struct Document {
 pub fn Document::equal(Self, Self) -> Bool
 pub fn Document::not_equal(Self, Self) -> Bool
 pub fn Document::to_repr(Self) -> @debug.Repr
+
+pub(all) struct Explanation {
+  id : String
+  total_score : Double
+  details : Array[ScoreDetail]
+} derive(Eq, @debug.Debug)
+pub fn Explanation::equal(Self, Self) -> Bool
+pub fn Explanation::not_equal(Self, Self) -> Bool
+pub fn Explanation::to_repr(Self) -> @debug.Repr
+
+pub(all) struct FacetCount {
+  value : String
+  count : Int32
+} derive(Eq, @debug.Debug)
+pub fn FacetCount::equal(Self, Self) -> Bool
+pub fn FacetCount::not_equal(Self, Self) -> Bool
+pub fn FacetCount::to_repr(Self) -> @debug.Repr
+
+pub(all) struct FacetFilter {
+  field : String
+  values : Array[String]
+} derive(Eq, @debug.Debug)
+pub fn FacetFilter::equal(Self, Self) -> Bool
+pub fn FacetFilter::not_equal(Self, Self) -> Bool
+pub fn FacetFilter::to_repr(Self) -> @debug.Repr
+
+pub(all) struct FacetedResult {
+  hits : Array[Hit]
+  total : Int32
+  facets : Array[(String, Array[FacetCount])]
+} derive(Eq, @debug.Debug)
+pub fn FacetedResult::equal(Self, Self) -> Bool
+pub fn FacetedResult::not_equal(Self, Self) -> Bool
+pub fn FacetedResult::to_repr(Self) -> @debug.Repr
 
 pub(all) struct FieldSchema {
   name : String
@@ -141,17 +190,24 @@ pub struct Index {
   stats : @hashmap.HashMap[String, FieldStats]
   deleted : @hashmap.HashMap[Int32, Unit]
   stored : @hashmap.HashMap[Int32, Array[(String, String)]]
+  facets : @hashmap.HashMap[Int32, Array[(String, Array[String])]]
+  terms_sorted : @hashmap.HashMap[String, Array[String]]
+  bk_trees : @hashmap.HashMap[String, BkTree]
 }
 pub fn Index::add(Self, Document) -> Unit
 pub fn Index::analyzer(Self) -> Analyzer
+pub fn Index::bk_tree(Self, field? : String?) -> BkTree
 pub fn Index::delete(Self, String) -> Bool
 pub fn Index::doc_count(Self) -> Int32
 pub fn Index::doc_freq(Self, String, String) -> Int32
 pub fn Index::doc_id(Self, Int32) -> String?
+pub fn Index::explain(Self, String, String) -> Explanation? raise QueryError
 pub fn Index::from_bytes(Bytes) -> Self raise CodecError
 pub fn Index::fuzzy_search(Self, String, max_distance? : Int32, limit? : Int32) -> Array[Hit] raise QueryError
 pub fn Index::fuzzy_terms(Self, String, max_distance? : Int32, field? : String?) -> Array[FuzzyMatch]
+pub fn Index::fuzzy_terms_fast(Self, String, max_distance? : Int32, field? : String?) -> Array[FuzzyMatch]
 pub fn Index::get_document(Self, String) -> Document?
+pub fn Index::get_facets(Self, String) -> Array[(String, Array[String])]
 pub fn Index::get_field(Self, String, String) -> String?
 pub fn Index::highlight(Self, String, String, String, pre_tag? : String, post_tag? : String) -> String raise QueryError
 pub fn Index::highlight_spans(Self, String, String, String) -> Array[HighlightSpan] raise QueryError
@@ -162,6 +218,10 @@ pub fn Index::postings_of(Self, String, String) -> Array[Posting]
 pub async fn Index::save(Self, String) -> Unit raise StoreError
 pub fn Index::schema(Self) -> Array[FieldSchema]
 pub fn Index::search(Self, String, limit? : Int32) -> Array[Hit] raise QueryError
+pub fn Index::search_after(Self, String, after_score~ : Double, after_id~ : String, limit? : Int32) -> Array[Hit] raise QueryError
+pub fn Index::search_faceted(Self, String, options? : SearchOptions) -> FacetedResult raise QueryError
+pub fn Index::search_sorted(Self, String, limit? : Int32, sort? : SortOrder) -> Array[Hit] raise QueryError
+pub fn Index::set_facets(Self, String, Array[(String, Array[String])]) -> Unit
 pub fn Index::snippet(Self, String, String, String, max_chars? : Int32, pre_tag? : String, post_tag? : String) -> String raise QueryError
 pub fn Index::suggest(Self, String, max_distance? : Int32) -> String?
 pub fn Index::term_count(Self) -> Int32
@@ -207,6 +267,30 @@ pub fn Reader::read_u32_le(Self) -> UInt32 raise CodecError
 pub fn Reader::read_varint(Self) -> Int32 raise CodecError
 pub fn Reader::remaining(Self) -> Int32
 
+pub(all) struct ScoreDetail {
+  field : String
+  term : String
+  tf : Int32
+  df : Int32
+  idf : Double
+  norm : Double
+  score : Double
+} derive(Eq, @debug.Debug)
+pub fn ScoreDetail::equal(Self, Self) -> Bool
+pub fn ScoreDetail::not_equal(Self, Self) -> Bool
+pub fn ScoreDetail::to_repr(Self) -> @debug.Repr
+
+pub(all) struct SearchOptions {
+  limit : Int32
+  offset : Int32
+  filters : Array[FacetFilter]
+  facet_fields : Array[String]
+} derive(Eq, @debug.Debug)
+pub fn SearchOptions::default() -> Self
+pub fn SearchOptions::equal(Self, Self) -> Bool
+pub fn SearchOptions::not_equal(Self, Self) -> Bool
+pub fn SearchOptions::to_repr(Self) -> @debug.Repr
+
 pub struct SegmentedIndex {
   schema : Array[FieldSchema]
   analyzer : Analyzer
@@ -231,6 +315,16 @@ pub async fn SegmentedIndex::open_or_create(String, Array[FieldSchema]) -> Self 
 pub fn SegmentedIndex::search(Self, String, limit? : Int32) -> Array[Hit] raise QueryError
 pub fn SegmentedIndex::segment_count(Self) -> Int32
 pub fn SegmentedIndex::to_bytes(Self) -> Bytes
+
+pub(all) enum SortOrder {
+  ScoreDesc
+  ScoreAsc
+  IdAsc
+  IdDesc
+} derive(Eq, @debug.Debug)
+pub fn SortOrder::equal(Self, Self) -> Bool
+pub fn SortOrder::not_equal(Self, Self) -> Bool
+pub fn SortOrder::to_repr(Self) -> @debug.Repr
 
 pub(all) struct Token {
   term : String

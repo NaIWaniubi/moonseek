@@ -48,6 +48,17 @@
   .tabs { display: flex; gap: 4px; margin-bottom: 12px; }
   .tabs button { background: var(--bg); border: 1px solid var(--border); color: var(--dim); font-size: 12px; padding: 6px 12px; border-radius: 6px; }
   .tabs button.active { color: var(--accent); border-color: var(--accent); }
+  .facets { margin-bottom: 16px; display: flex; flex-direction: column; gap: 6px; }
+  .facet-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 12px; }
+  .facet-label { color: var(--dim); width: 32px; }
+  .chip { display: inline-block; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 2px 10px; cursor: pointer; color: var(--text); }
+  .chip em { color: var(--dim); font-style: normal; margin-left: 2px; }
+  .chip.active { border-color: var(--accent); color: var(--accent); }
+  .chip:hover { border-color: var(--accent); }
+  .explain { margin-top: 8px; font-size: 12px; color: var(--dim); }
+  .explain summary { cursor: pointer; color: var(--purple); }
+  .exp-row { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; font-family: monospace; }
+  .exp-row span:last-child { color: var(--green); }
 </style>
 </head>
 <body>
@@ -73,6 +84,7 @@
     <a data-q="serch engin">serch engin (拼错)</a>
   </div>
   <div class="stats" id="stats"></div>
+  <div class="facets" id="facets"></div>
   <div class="layout">
     <div id="results"><div class="empty">正在加载 WASM 引擎…</div></div>
     <aside>
@@ -129,11 +141,18 @@ async function boot() {
     { builtins: ["js-string"], importedStringConstants: "_" }
   );
   api = instance.exports;
+  globalThis.api = api; // exposed for debugging/tests
   api.ms_init();
   const t0 = performance.now();
-  for (const [id, title, body] of CORPUS) {
+  for (const [id, title, body, facets] of CORPUS) {
     const err = api.ms_add(id, title, body);
     if (err) throw new Error(err);
+    if (facets) {
+      const ferr = api.ms_set_facets(id, JSON.stringify([
+        ["cat", [facets.cat]], ["lang", [facets.lang]],
+      ]));
+      if (ferr) throw new Error(ferr);
+    }
   }
   const indexMs = (performance.now() - t0).toFixed(1);
   statusEl.textContent = "WASM ready";
@@ -159,25 +178,77 @@ function highlight(text, query) {
   return html;
 }
 
+let activeFilters = { cat: null, lang: null };
+let lastQuery = "";
+
+function facetChipsHTML(facets, field) {
+  const counts = facets[field] || [];
+  return counts.map(([value, count]) => {
+    const active = activeFilters[field] === value;
+    return `<span class="chip${active ? " active" : ""}" data-field="${field}" data-value="${escapeHtml(value)}">${escapeHtml(value)} <em>${count}</em></span>`;
+  }).join("");
+}
+
+function renderFacets(facets) {
+  const rows = ["cat", "lang"].map(field => {
+    let counts = (facets[field] || []).slice();
+    // Keep an active filter visible even when it matches nothing, so the
+    // user can always clear it (a 0-result search must not trap the UI).
+    const active = activeFilters[field];
+    if (active && !counts.some(([v]) => v === active)) {
+      counts = [[active, 0], ...counts];
+    }
+    return `<div class="facet-row"><span class="facet-label">${field === "cat" ? "分类" : "语言"}</span>${facetChipsHTML({ [field]: counts }, field)}</div>`;
+  }).join("");
+  const hasFilter = activeFilters.cat || activeFilters.lang;
+  const clear = hasFilter ? `<button class="secondary clear-filters">清除筛选 ✕</button>` : "";
+  document.getElementById("facets").innerHTML = rows + (clear ? `<div class="facet-row">${clear}</div>` : "");
+  document.querySelectorAll(".chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      const field = chip.dataset.field, value = chip.dataset.value;
+      activeFilters[field] = activeFilters[field] === value ? null : value;
+      search();
+    });
+  });
+  const clearBtn = document.querySelector(".clear-filters");
+  if (clearBtn) {
+    clearBtn.addEventListener("click", () => {
+      activeFilters.cat = null;
+      activeFilters.lang = null;
+      search();
+    });
+  }
+}
+
+function filtersJSON() {
+  const out = [];
+  for (const field of ["cat", "lang"]) {
+    if (activeFilters[field]) out.push([field, activeFilters[field]]);
+  }
+  return out.length ? JSON.stringify(out) : "";
+}
+
 function search() {
   if (!api) return;
   const query = queryEl.value.trim();
   if (!query) { resultsEl.innerHTML = '<div class="empty">输入查询开始搜索</div>'; return; }
+  lastQuery = query;
   const t0 = performance.now();
-  const raw = api.ms_search(query, 10);
+  const raw = api.ms_search_faceted(query, filtersJSON(), 10, 0);
   const elapsed = (performance.now() - t0).toFixed(2);
-  const parsed = JSON.parse(raw);
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch (e) { parsed = { error: raw }; }
   if (parsed.error) {
     resultsEl.innerHTML = `<div class="error">查询错误：${escapeHtml(parsed.error)}</div>`;
     return;
   }
-  if (parsed.length === 0) {
-    // Did-you-mean + fuzzy fallback, both computed by the WASM engine.
+  renderFacets(parsed.facets || {});
+  if (parsed.hits.length === 0) {
     const suggestion = api.ms_suggest(query);
     const fuzzy = JSON.parse(api.ms_fuzzy(query, 2, 5));
     let html = `<div class="empty">无结果（${elapsed} ms）</div>`;
     if (suggestion) {
-      html += `<div class="result"><div class="title">你是不是想搜：<a href="#" id="suggest-link" style="color:var(--accent)">${escapeHtml(suggestion)}</a></div></div>`;
+      html += `<div class="result"><div class="title">你是不是想搜：<a href="#" id="suggest-link">${escapeHtml(suggestion)}</a></div></div>`;
     }
     if (fuzzy.length > 0) {
       html += `<div class="stats" style="text-align:left">模糊匹配（容忍拼写错误）：</div>` + fuzzy.map(hit => {
@@ -194,17 +265,24 @@ function search() {
     if (link) link.addEventListener("click", e => { e.preventDefault(); queryEl.value = suggestion; search(); });
     return;
   }
-  // Server-side highlighting: the WASM engine produces escaped HTML with
-  // <mark> tags and CJK-aware spans — no client-side regex guessing.
-  resultsEl.innerHTML = parsed.map(hit => {
-    const titleHtml = api.ms_highlight(hit.id, "title", query) || escapeHtml(hit.id);
-    const bodyHtml = api.ms_snippet(hit.id, "body", query, 160);
+  resultsEl.innerHTML = parsed.hits.map(hit => {
+    const explain = api.ms_explain(hit.id, query);
+    let explainHtml = "";
+    try {
+      const ex = JSON.parse(explain);
+      if (ex && ex.details && ex.details.length) {
+        explainHtml = `<details class="explain"><summary>为什么是这个结果 · BM25 ${ex.total.toFixed(4)}</summary>` +
+          ex.details.map(d => `<div class="exp-row"><span>${escapeHtml(d.field)}:${escapeHtml(d.term)}</span><span>tf=${d.tf} df=${d.df} idf=${d.idf.toFixed(3)}</span><span>+${d.score.toFixed(4)}</span></div>`).join("") +
+          `</details>`;
+      }
+    } catch (e) {}
     return `<div class="result">
       <span class="score">${hit.score.toFixed(4)}</span>
-      <div class="title">${titleHtml}</div>
-      <div class="body">${bodyHtml}</div>
+      <div class="title">${hit.title || escapeHtml(hit.id)}</div>
+      <div class="body">${hit.snippet}</div>
+      ${explainHtml}
     </div>`;
-  }).join("") + `<div class="stats" style="text-align:left">${parsed.length} hits in ${elapsed} ms</div>`;
+  }).join("") + `<div class="stats" style="text-align:left">${parsed.hits.length} / ${parsed.total} 命中 · ${elapsed} ms</div>`;
 }
 
 function renderTermStats(field) {

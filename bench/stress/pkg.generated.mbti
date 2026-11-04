@@ -1,0 +1,13 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "NaIWaniubi/moonseek/bench/stress"
+
+// Values
+
+// Errors
+
+// Types and methods
+type Rng
+
+// Type aliases
+
+// Traits

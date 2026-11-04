@@ -30,43 +30,71 @@ pub fn levenshtein(a : String, b : String) -> Int32 {
 ///|
 /// Damerau-Levenshtein distance (optimal string alignment variant):
 /// like Levenshtein, but an adjacent transposition costs one edit.
-/// Full DP matrix: O(m*n) time and space. The OSA restriction (no substring
-/// edited more than once) matches the common "typo distance" use case.
+/// Rolling 3-row DP: O(m*n) time, O(min(m,n)) space. The OSA restriction
+/// (no substring edited more than once) matches the common "typo distance"
+/// use case.
 pub fn damerau_levenshtein(a : String, b : String) -> Int32 {
+  bounded_damerau(a, b, 0x7FFFFFFF)
+}
+
+///|
+/// Damerau-Levenshtein distance with an early exit: returns `bound + 1` as
+/// soon as no cell in the current row can lead to a distance <= bound.
+/// This is what makes fuzzy matching over large vocabularies fast — the
+/// full-matrix version allocated m*n cells per candidate.
+pub fn damerau_levenshtein_bounded(
+  a : String,
+  b : String,
+  bound : Int32,
+) -> Int32 {
+  bounded_damerau(a, b, bound)
+}
+
+///|
+/// Shared implementation: rolling rows prev2/prev/cur, early exit when the
+/// row minimum exceeds `bound` (the true distance can only grow).
+fn bounded_damerau(a : String, b : String, bound : Int32) -> Int32 {
   let ac = a.to_array()
   let bc = b.to_array()
-  let m = ac.length()
-  let n = bc.length()
+  // Keep the shorter string as the DP row (columns) to bound memory.
+  let (s, t) = if ac.length() <= bc.length() { (ac, bc) } else { (bc, ac) }
+  let m = s.length()
+  let n = t.length()
   if m == 0 {
     return n
   }
-  if n == 0 {
-    return m
+  if n - m > bound {
+    return bound + 1
   }
-  let d : Array[Array[Int32]] = Array::makei(m + 1, fn(i) {
-    Array::makei(n + 1, fn(j) {
-      if i == 0 {
-        j
-      } else if j == 0 {
-        i
-      } else {
-        0
+  let width = m + 1
+  let prev2 = Array::make(width, 0)
+  let prev = Array::makei(width, fn(j) { j })
+  let cur = Array::make(width, 0)
+  let mut row_min = 0
+  for i in 1..<(n + 1) {
+    cur[0] = i
+    row_min = i
+    for j in 1..<(m + 1) {
+      let cost = if s[j - 1] == t[i - 1] { 0 } else { 1 }
+      let mut best = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost)
+      if i > 1 && j > 1 && s[j - 1] == t[i - 2] && s[j - 2] == t[i - 1] {
+        best = best.min(prev2[j - 2] + 1)
       }
-    })
-  })
-  for i in 1..<(m + 1) {
-    for j in 1..<(n + 1) {
-      let cost = if ac[i - 1] == bc[j - 1] { 0 } else { 1 }
-      let mut best = (d[i - 1][j] + 1)
-        .min(d[i][j - 1] + 1)
-        .min(d[i - 1][j - 1] + cost)
-      if i > 1 && j > 1 && ac[i - 1] == bc[j - 2] && ac[i - 2] == bc[j - 1] {
-        best = best.min(d[i - 2][j - 2] + 1)
+      cur[j] = best
+      if best < row_min {
+        row_min = best
       }
-      d[i][j] = best
+    }
+    if row_min > bound {
+      return bound + 1
+    }
+    // Rotate rows: prev2 <- prev, prev <- cur, cur <- prev2 (reused buffer).
+    for j in 0..<width {
+      prev2[j] = prev[j]
+      prev[j] = cur[j]
     }
   }
-  d[m][n]
+  prev[m]
 }
 
 ///|
@@ -127,15 +155,15 @@ pub fn Index::fuzzy_terms(
   let query = term.to_array()
   let matches : Array[FuzzyMatch] = []
   for candidate in self.fuzzy_vocabulary(field) {
-    let chars = candidate.to_array()
     // Length filter: edit distance is at least the length difference.
-    if (chars.length() - query.length()).abs() > bound {
+    if (candidate.to_array().length() - query.length()).abs() > bound {
       continue
     }
+    // Bounded DP with early exit: most candidates stop after one row.
     let distance = if candidate == term {
       0
     } else {
-      damerau_levenshtein(term, candidate)
+      damerau_levenshtein_bounded(term, candidate, bound)
     }
     if distance <= bound {
       matches.push({ term: candidate, distance, })
