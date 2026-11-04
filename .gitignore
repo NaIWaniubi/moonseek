@@ -4,3 +4,6 @@ target/
 target
 .mooncakes/
 .moonagent/demo/web.wasm
+
+# internal dev artifacts
+.team/
