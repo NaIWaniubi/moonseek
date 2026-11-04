@@ -70,6 +70,7 @@
     <a data-q="wasm*">wasm*</a>
     <a data-q="共识算法">共识算法</a>
     <a data-q="&quot;垃圾回收&quot;">"垃圾回收"</a>
+    <a data-q="serch engin">serch engin (拼错)</a>
   </div>
   <div class="stats" id="stats"></div>
   <div class="layout">
@@ -171,15 +172,37 @@ function search() {
     return;
   }
   if (parsed.length === 0) {
-    resultsEl.innerHTML = `<div class="empty">无结果（${elapsed} ms）</div>`;
+    // Did-you-mean + fuzzy fallback, both computed by the WASM engine.
+    const suggestion = api.ms_suggest(query);
+    const fuzzy = JSON.parse(api.ms_fuzzy(query, 2, 5));
+    let html = `<div class="empty">无结果（${elapsed} ms）</div>`;
+    if (suggestion) {
+      html += `<div class="result"><div class="title">你是不是想搜：<a href="#" id="suggest-link" style="color:var(--accent)">${escapeHtml(suggestion)}</a></div></div>`;
+    }
+    if (fuzzy.length > 0) {
+      html += `<div class="stats" style="text-align:left">模糊匹配（容忍拼写错误）：</div>` + fuzzy.map(hit => {
+        const doc = corpusById.get(hit.id) || { title: hit.id, body: "" };
+        return `<div class="result">
+          <span class="score">${hit.score.toFixed(4)}</span>
+          <div class="title">${escapeHtml(doc.title)}</div>
+          <div class="body">${api.ms_snippet(hit.id, "body", query, 120)}</div>
+        </div>`;
+      }).join("");
+    }
+    resultsEl.innerHTML = html;
+    const link = document.getElementById("suggest-link");
+    if (link) link.addEventListener("click", e => { e.preventDefault(); queryEl.value = suggestion; search(); });
     return;
   }
+  // Server-side highlighting: the WASM engine produces escaped HTML with
+  // <mark> tags and CJK-aware spans — no client-side regex guessing.
   resultsEl.innerHTML = parsed.map(hit => {
-    const doc = corpusById.get(hit.id) || { title: hit.id, body: "" };
+    const titleHtml = api.ms_highlight(hit.id, "title", query) || escapeHtml(hit.id);
+    const bodyHtml = api.ms_snippet(hit.id, "body", query, 160);
     return `<div class="result">
       <span class="score">${hit.score.toFixed(4)}</span>
-      <div class="title">${highlight(doc.title, query)}</div>
-      <div class="body">${highlight(doc.body, query)}</div>
+      <div class="title">${titleHtml}</div>
+      <div class="body">${bodyHtml}</div>
     </div>`;
   }).join("") + `<div class="stats" style="text-align:left">${parsed.length} hits in ${elapsed} ms</div>`;
 }

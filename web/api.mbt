@@ -129,6 +129,65 @@ pub fn ms_snapshot_size() -> Int32 {
 }
 
 ///|
+/// Server-side highlight: returns the field text with <mark> tags and
+/// HTML escaping applied by the engine (not by JS).
+#export_name("ms_highlight")
+pub fn ms_highlight(id : String, field : String, query : String) -> String {
+  match engine.val {
+    Some(index) =>
+      index.highlight(id, field, query) catch {
+        _ => ""
+      }
+    None => ""
+  }
+}
+
+///|
+/// Server-side snippet: densest-highlight window with ellipsis.
+#export_name("ms_snippet")
+pub fn ms_snippet(id : String, field : String, query : String, max_chars : Int32) -> String {
+  match engine.val {
+    Some(index) =>
+      index.snippet(id, field, query, max_chars~) catch {
+        _ => ""
+      }
+    None => ""
+  }
+}
+
+///|
+/// Did-you-mean: returns a corrected query string, or "" if none.
+#export_name("ms_suggest")
+pub fn ms_suggest(query : String) -> String {
+  match engine.val {
+    Some(index) => index.suggest(query).unwrap_or("")
+    None => ""
+  }
+}
+
+///|
+/// Fuzzy search: returns a JSON array of {id, score} for typo-tolerant matches.
+#export_name("ms_fuzzy")
+pub fn ms_fuzzy(term : String, max_distance : Int32, limit : Int32) -> String {
+  match engine.val {
+    Some(index) => {
+      let hits = index.fuzzy_search(term, max_distance~, limit~) catch {
+        _ => return "[]"
+      }
+      let items : Array[Json] = []
+      for hit in hits {
+        let fields : Map[String, Json] = Map([])
+        fields["id"] = @json.to_json(hit.id)
+        fields["score"] = @json.to_json(hit.score)
+        items.push(Json::object(fields))
+      }
+      Json::array(items).stringify()
+    }
+    None => "[]"
+  }
+}
+
+///|
 /// List all terms in a field as a JSON array of [term, doc_freq] pairs,
 /// sorted by descending doc frequency (for the index inspector).
 #export_name("ms_term_stats")
