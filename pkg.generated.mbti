@@ -7,11 +7,30 @@ import {
 }
 
 // Values
+pub fn crc32(Bytes) -> UInt32
+
 pub fn parse_query(String, analyzer? : Analyzer, fields? : Array[String]) -> Query raise QueryError
 
 pub fn tokenize(String) -> Array[Token]
 
+pub fn write_double(Array[Byte], Double) -> Unit
+
+pub fn write_string(Array[Byte], String) -> Unit
+
+pub fn write_u32_le(Array[Byte], UInt32) -> Unit
+
+pub fn write_varint(Array[Byte], Int32) -> Unit
+
 // Errors
+pub(all) suberror CodecError {
+  UnexpectedEof
+  VarintOverflow
+  InvalidUtf8
+  BadMagic
+  BadVersion(Int32)
+  CrcMismatch(UInt32, UInt32)
+} derive(Eq, @debug.Debug)
+
 pub(all) suberror QueryError {
   EmptyQuery
   UnterminatedPhrase
@@ -65,11 +84,13 @@ pub fn Index::add(Self, Document) -> Unit
 pub fn Index::delete(Self, String) -> Bool
 pub fn Index::doc_count(Self) -> Int32
 pub fn Index::doc_id(Self, Int32) -> String?
+pub fn Index::from_bytes(Bytes) -> Self raise CodecError
 pub fn Index::new(Array[FieldSchema], analyzer? : Analyzer, bm25? : Bm25Params) -> Self
 pub fn Index::postings_of(Self, String, String) -> Array[Posting]
 pub fn Index::search(Self, String, limit? : Int32) -> Array[Hit] raise QueryError
 pub fn Index::term_count(Self) -> Int32
 pub fn Index::terms_of(Self, String) -> Array[String]
+pub fn Index::to_bytes(Self) -> Bytes
 
 type Parser
 
@@ -90,6 +111,18 @@ pub(all) enum Query {
   Not(Query, Query)
   MatchAll
 } derive(Eq, @debug.Debug)
+
+pub struct Reader {
+  data : Bytes
+  mut pos : Int32
+}
+pub fn Reader::new(Bytes) -> Self
+pub fn Reader::read_byte(Self) -> Byte raise CodecError
+pub fn Reader::read_double(Self) -> Double raise CodecError
+pub fn Reader::read_string(Self) -> String raise CodecError
+pub fn Reader::read_u32_le(Self) -> UInt32 raise CodecError
+pub fn Reader::read_varint(Self) -> Int32 raise CodecError
+pub fn Reader::remaining(Self) -> Int32
 
 pub(all) struct Token {
   term : String
