@@ -1,8 +1,8 @@
 import {
-  "cs6210501-lab/moonseek" @moonseek,
-  "moonbitlang/core/json" @json,
-  "moonbitlang/core/ref" @ref,
-  "moonbitlang/core/debug" @debug,
+  "cs6210501-lab/moonseek",
+  "moonbitlang/core/json",
+  "moonbitlang/core/ref",
+  "moonbitlang/core/debug",
 }
 
 pkgtype(kind: "foreign_library")
@@ -11,11 +11,7 @@ supported_targets = "+wasm-gc +js"
 
 options(
   link: {
-    "wasm-gc": {
-      "use-js-builtin-string": true,
-    },
-    "js": {
-      "format": "esm",
-    },
+    "wasm-gc": { "use-js-builtin-string": true },
+    "js": { "format": "esm" },
   },
 )

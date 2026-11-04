@@ -8,7 +8,7 @@ let engine : @ref.Ref[@moonseek.Index?] = @ref.Ref(None)
 
 ///|
 fn schema() -> Array[@moonseek.FieldSchema] {
-  [{ name: "title", weight: 3.0 }, { name: "body", weight: 1.0 }]
+  [{ name: "title", weight: 3.0, }, { name: "body", weight: 1.0, }]
 }
 
 ///|
@@ -48,7 +48,7 @@ pub fn ms_save() -> Bytes {
 pub fn ms_add(id : String, title : String, body : String) -> String {
   match engine.val {
     Some(index) => {
-      index.add({ id, fields: [("title", title), ("body", body)] })
+      index.add({ id, fields: [("title", title), ("body", body)], })
       ""
     }
     None => "index not initialized"
@@ -58,7 +58,7 @@ pub fn ms_add(id : String, title : String, body : String) -> String {
 ///|
 /// Search the index. Returns a JSON array of {id, score} objects.
 #export_name("ms_search")
-pub fn ms_search(query : String, limit : Int) -> String {
+pub fn ms_search(query : String, limit : Int32) -> String {
   match engine.val {
     Some(index) => {
       let hits = index.search(query, limit~) catch {
@@ -80,7 +80,7 @@ pub fn ms_search(query : String, limit : Int) -> String {
 ///|
 /// Number of documents in the index.
 #export_name("ms_count")
-pub fn ms_count() -> Int {
+pub fn ms_count() -> Int32 {
   match engine.val {
     Some(index) => index.doc_count()
     None => 0
@@ -90,7 +90,7 @@ pub fn ms_count() -> Int {
 ///|
 /// Number of distinct terms in the index.
 #export_name("ms_terms")
-pub fn ms_terms() -> Int {
+pub fn ms_terms() -> Int32 {
   match engine.val {
     Some(index) => index.term_count()
     None => 0
