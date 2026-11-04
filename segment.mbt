@@ -225,7 +225,7 @@ pub fn SegmentedIndex::search(
   hits.sort_by(fn(a, b) {
     let cmp = b.score.compare(a.score)
     if cmp == 0 {
-      a.id.compare(b.id)
+      a.id.lexical_compare(b.id)
     } else {
       cmp
     }

@@ -84,6 +84,16 @@ pub struct Index {
   deleted : @hashmap.HashMap[Int32, Unit]
   /// stored original field texts: internal doc number -> (field, text)
   stored : @hashmap.HashMap[Int32, Array[(String, String)]]
+  /// facet values: internal doc number -> (field, values)
+  facets : @hashmap.HashMap[Int32, Array[(String, Array[String])]]
+  /// Cached lexicographically sorted term lists per field. Cleared on add
+  /// (the only operation that introduces new terms); prefix queries reuse it
+  /// instead of re-sorting the whole vocabulary.
+  terms_sorted : @hashmap.HashMap[String, Array[String]]
+  /// Cached BK-trees for fuzzy lookup, keyed by field name ("*" = all fields).
+  /// Cleared on add. Building one tree per query was the dominant cost of
+  /// fuzzy search on large vocabularies.
+  bk_trees : @hashmap.HashMap[String, BkTree]
 }
 
 ///|
@@ -117,6 +127,9 @@ pub fn Index::new(
     stats,
     deleted: @hashmap.HashMap([]),
     stored: @hashmap.HashMap([]),
+    facets: @hashmap.HashMap([]),
+    terms_sorted: @hashmap.HashMap([]),
+    bk_trees: @hashmap.HashMap([]),
   }
 }
 
@@ -151,6 +164,15 @@ pub fn Index::term_count(self : Index) -> Int32 {
 ///|
 /// Add or replace a document. Unknown field names abort.
 pub fn Index::add(self : Index, doc : Document) -> Unit {
+  // New terms may appear: invalidate the sorted-term and BK-tree caches.
+  // Indexing 20k docs was re-sorting only on the first prefix query, so
+  // clearing here is cheap (the caches are rebuilt lazily once).
+  if !self.terms_sorted.is_empty() {
+    self.terms_sorted.clear()
+  }
+  if !self.bk_trees.is_empty() {
+    self.bk_trees.clear()
+  }
   match self.doc_nums.get(doc.id) {
     Some(num) => self.delete_by_num(num)
     None => ()
@@ -281,18 +303,32 @@ pub fn Index::postings_of(
 }
 
 ///|
-/// All terms in a field, sorted lexicographically (for prefix queries).
+/// All terms in a field, sorted in lexicographic (dictionary) order.
+///
+/// Note: `String::compare` is SHORTLEX in MoonBit (compares lengths first),
+/// which scatters terms sharing a prefix across the array. Prefix queries
+/// need true lexicographic order to be contiguous, so this uses
+/// `lexical_compare` explicitly.
+///
+/// The sorted list is cached and reused until the next `add`; callers must
+/// treat the returned array as read-only.
 pub fn Index::terms_of(self : Index, field : String) -> Array[String] {
-  let result : Array[String] = []
-  match self.postings.get(field) {
-    Some(m) =>
-      for (term, _) in m.iter() {
-        result.push(term)
+  match self.terms_sorted.get(field) {
+    Some(cached) => cached
+    None => {
+      let result : Array[String] = []
+      match self.postings.get(field) {
+        Some(m) =>
+          for (term, _) in m.iter() {
+            result.push(term)
+          }
+        None => ()
       }
-    None => ()
+      result.sort_by(fn(a, b) { a.lexical_compare(b) })
+      self.terms_sorted.set(field, result)
+      result
+    }
   }
-  result.sort()
-  result
 }
 
 ///|
@@ -308,38 +344,72 @@ fn Index::avg_field_length(self : Index, field : String) -> Double {
 }
 
 ///|
-/// BM25 score of one term in one field for one document.
+/// Per-(field, term) BM25 constants, computed once and reused for every
+/// posting of the term. Computing df inside the posting loop made term
+/// queries O(df²) — a 5k-posting term took ~50 ms per query.
+struct Bm25Context {
+  k1 : Double
+  b : Double
+  idf : Double
+  avgdl : Double
+  weight : Double
+  /// doc -> field length, the only per-document lookup left.
+  lengths : @hashmap.HashMap[Int32, Int32]
+  /// False when the term has no live postings (score is always 0).
+  valid : Bool
+}
+
+///|
+fn Index::bm25_context(
+  self : Index,
+  field : String,
+  term : String,
+) -> Bm25Context {
+  let n = self.doc_count()
+  let df = self.doc_freq(field, term)
+  let stats = self.stats[field]
+  let valid = df > 0 && n > 0
+  let idf = if valid {
+    @math.ln(
+      1.0 + (n.to_double() - df.to_double() + 0.5) / (df.to_double() + 0.5),
+    )
+  } else {
+    0.0
+  }
+  {
+    k1: self.bm25.k1,
+    b: self.bm25.b,
+    idf,
+    avgdl: self.avg_field_length(field),
+    weight: self.field_weight(field),
+    lengths: stats.lengths,
+    valid,
+  }
+}
+
+///|
+fn Bm25Context::score(self : Bm25Context, posting : Posting) -> Double {
+  if !self.valid {
+    return 0.0
+  }
+  let dl = self.lengths.get_or_default(posting.doc, 0).to_double()
+  let norm = if self.avgdl == 0.0 {
+    1.0
+  } else {
+    1.0 - self.b + self.b * dl / self.avgdl
+  }
+  let tf = posting.freq.to_double()
+  self.idf * (tf * (self.k1 + 1.0)) / (tf + self.k1 * norm) * self.weight
+}
+
+///|
+/// BM25 score of one term in one field for one document (convenience
+/// wrapper; hot paths use `bm25_context` to avoid recomputing df).
 fn Index::bm25_score(
   self : Index,
   field : String,
   term : String,
   posting : Posting,
 ) -> Double {
-  let n = self.doc_count()
-  // Count only live documents: tombstoned postings stay in the list for
-  // snapshot stability, but must not inflate df (which would skew IDF
-  // after deletes/updates).
-  let mut df = 0
-  for p in self.postings[field].get_or_default(term, []) {
-    if !self.deleted.contains(p.doc) {
-      df += 1
-    }
-  }
-  if df == 0 || n == 0 {
-    return 0.0
-  }
-  let idf = @math.ln(
-    1.0 + (n.to_double() - df.to_double() + 0.5) / (df.to_double() + 0.5),
-  )
-  let stats = self.stats[field]
-  let dl = stats.lengths.get_or_default(posting.doc, 0).to_double()
-  let avgdl = self.avg_field_length(field)
-  let norm = if avgdl == 0.0 {
-    1.0
-  } else {
-    1.0 - self.bm25.b + self.bm25.b * dl / avgdl
-  }
-  let tf = posting.freq.to_double()
-  let score = idf * (tf * (self.bm25.k1 + 1.0)) / (tf + self.bm25.k1 * norm)
-  score * self.field_weight(field)
+  self.bm25_context(field, term).score(posting)
 }

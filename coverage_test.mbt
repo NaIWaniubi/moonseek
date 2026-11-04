@@ -51,10 +51,10 @@ test "codec: string length beyond buffer raises" {
 
 ///|
 test "snapshot: bad version raises" {
-  // Build a valid MSK2 frame but with version 99 in payload
+  // Build a valid MSK3 frame but with version 99 in payload
   let payload : Array[Byte] = []
   @moonseek.write_varint(payload, 99)
-  let image : Array[Byte] = [0x4D, 0x53, 0x4B, 0x32] // MSK2
+  let image : Array[Byte] = [0x4D, 0x53, 0x4B, 0x33] // MSK3
   for b in payload {
     image.push(b)
   }
@@ -80,7 +80,7 @@ test "snapshot: trailing garbage raises" {
     extended.push(b)
   }
   extended.push(0x42)
-  let frame : Array[Byte] = [0x4D, 0x53, 0x4B, 0x32]
+  let frame : Array[Byte] = [0x4D, 0x53, 0x4B, 0x33]
   for b in extended {
     frame.push(b)
   }
