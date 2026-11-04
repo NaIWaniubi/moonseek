@@ -58,13 +58,14 @@ A bare CJK word analyzes to multiple bigrams and is treated as a phrase. Evaluat
 
 ```
 ┌────────┬──────────────────────────┬──────────────┐
-│ "MSK1" │ payload                  │ crc32 (u32le)│
+│ "MSK2" │ payload                  │ crc32 (u32le)│
 └────────┴──────────────────────────┴──────────────┘
-payload := varint version=1
+payload := varint version=2
            schema[]  (name, weight:f64)
            analyzer flags, bm25 k1/b (f64)
            doc ids[]
-           deleted doc numbers[]
+           deleted doc numbers[] (sorted)
+           stored fields[] (doc num → (name, text) pairs)   [v2+]
            per-field stats (doc → length)
            per-field terms (sorted) → postings
              posting := doc, freq, positions (delta-varint)
@@ -72,21 +73,50 @@ payload := varint version=1
 
 - Integers: unsigned LEB128 varints. Strings: varint length + strict UTF-8. Doubles: IEEE-754 little-endian.
 - CRC-32 (IEEE, zlib polynomial) covers the payload; readers verify before parsing.
-- Terms are sorted for deterministic output — the same index always produces byte-identical snapshots.
+- Terms and deleted-doc lists are sorted for deterministic output — the same index always produces byte-identical snapshots.
 - Unknown versions, bad magic, truncation and checksum mismatches all raise; a corrupt snapshot is never partially loaded.
+- **Backward compatibility**: MSK1 (version 1) images are still readable; they simply have no stored fields.
 
 ## File store (`store.mbt`, native only)
 
 `save`: write `path.tmp` with `sync=Data` (fdatasync) → `rename` over `path`. A crash leaves either the old snapshot or the new one; a leftover `.tmp` is ignored on load. `load` verifies the CRC before returning an index. `load_or_create` creates a fresh index only when the file is absent — a corrupt file is an error, not a silent reset.
 
+## Fuzzy search & suggestions (`fuzzy.mbt`, `suggest.mbt`)
+
+- `levenshtein` / `damerau_levenshtein`: single-row DP over Unicode codepoints (O(min(m,n)) space); transposition counts as one edit (OSA variant).
+- `fuzzy_terms`: length-prune candidates (|Δlen| > max_distance skipped), then compute distance; max_distance clamped to [0,2] (Lucene convention).
+- `fuzzy_search`: per-document max score across variant terms (no double-counting), same sort/limit semantics as `search`.
+- `suggest`: span-based tokenizer preserves quotes/fields/operators; corrects the first bare word with no exact match; candidates ranked by (distance asc, doc_freq desc, term asc).
+
+## Highlighting (`highlight.mbt`)
+
+- `analyze_with_offsets`: re-scans stored text reusing the analyzer's private predicates, producing the same terms plus `[start,end)` **codepoint** spans (not bytes, not UTF-16 units). A whitebox drift-guard test cross-validates it against the public analyzer.
+- Query AST → highlight leaves (Term/Phrase/Prefix; Not's right branch and MatchAll contribute nothing). Phrase adjacency and prefix expansion are preserved, not flattened.
+- Spans merge only on overlap (adjacent spans stay separate); `highlight` HTML-escapes the source and inserts tags; `snippet` picks the densest window and closes tags at window edges.
+
+## Segmented index (`segment.mbt`)
+
+- `SegmentedIndex` = immutable segments + one active in-memory segment. `add` writes to active; at `segment_max_docs` it freezes into the segment list.
+- `search`: queries every segment, merges by external id with **latest-version-wins** (a re-added id in a newer segment supersedes older ones; tombstones never win). Scores are per-segment BM25 (IDF differs across segments); ties break by id for determinism.
+- `merge`: tiered policy — rebuilds a compacted Index from the newest live version of every document (via stored fields), reducing segment count.
+- Serialization: segment count + each segment's MSK2 snapshot + active segment, framed with its own CRC.
+
+## Write-ahead log (`wal.mbt`, `wal_native.mbt`)
+
+- Byte layer (portable): `"MWL1"` magic + framed entries (`type byte | payload | crc32`). `wal_decode` replays the complete prefix and stops at the first torn/corrupt tail — exactly "replay all complete entries" after a crash. Repeated headers (each append batch carries one) are skipped.
+- Native layer: `add_durable` appends one CRC-framed entry with `create_mode=OpenOrCreate, append=true, sync=Data` **then** applies in memory. `checkpoint` writes `segments.msk.tmp` → fsync → rename → truncate WAL. `open_or_create` loads the snapshot (corrupt = error) then replays the WAL; replay is idempotent (Add replaces by id, Delete is a tombstone), so a crash between rename and truncate is safe.
+
 ## Browser exports (`web/`)
 
-`pkgtype(kind: "foreign_library")` + `#export_name` exposes `ms_init / ms_add / ms_search / ms_save / ms_load / ms_count / ms_terms`. Only stable-ABI types cross the boundary (String, Int, Bytes); search results are returned as a JSON string. With `use-js-builtin-string`, MoonBit strings are JS strings — zero-copy. The host instantiates with `{ builtins: ["js-string"], importedStringConstants: "_" }`.
+`pkgtype(kind: "foreign_library")` + `#export_name` exposes `ms_init / ms_add / ms_search / ms_save / ms_load / ms_count / ms_terms / ms_get / ms_delete / ms_snapshot_size / ms_term_stats / ms_highlight / ms_snippet / ms_suggest / ms_fuzzy`. Only stable-ABI types cross the boundary (String, Int); search results and term stats are JSON strings; highlighting returns engine-escaped HTML. With `use-js-builtin-string`, MoonBit strings are JS strings — zero-copy. The host instantiates with `{ builtins: ["js-string"], importedStringConstants: "_" }`.
 
 ## Testing strategy
 
-- Unit tests per module; blackbox tests exercise the public API only.
+- Unit tests per module; blackbox tests exercise the public API; one whitebox drift-guard for the offset analyzer.
 - Golden query tests pin result ids and ordering.
-- Snapshot tests: roundtrip equality (ids + exact scores), determinism, bit-flip detection, truncation detection, bad magic.
-- Store tests: real filesystem roundtrips in temp dirs, corrupt-file rejection, no temp-file leakage.
+- Snapshot tests: roundtrip equality (ids + exact scores), determinism, bit-flip/truncation/bad-magic/bad-version detection, MSK1 backward compatibility.
+- Store/WAL tests: real filesystem roundtrips, corrupt-file rejection, torn-tail recovery, checkpoint idempotence, no temp-file leakage.
+- Segment tests: freeze threshold, cross-segment search/delete, latest-version-wins, merge preserves results.
+- Quickcheck properties: snapshot roundtrip, varint codec, contiguous token positions, delete exclusion.
 - Benchmarks (`bench_test.mbt`): 1000-doc synthetic corpus, index/term/phrase/snapshot.
+- Browser: headless Chromium smoke tests (search, server-side marks, suggestion click, HTML escaping, benchmark panel).
