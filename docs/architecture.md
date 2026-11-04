@@ -58,14 +58,15 @@ A bare CJK word analyzes to multiple bigrams and is treated as a phrase. Evaluat
 
 ```
 ┌────────┬──────────────────────────┬──────────────┐
-│ "MSK2" │ payload                  │ crc32 (u32le)│
+│ "MSK3" │ payload                  │ crc32 (u32le)│
 └────────┴──────────────────────────┴──────────────┘
-payload := varint version=2
+payload := varint version=3
            schema[]  (name, weight:f64)
            analyzer flags, bm25 k1/b (f64)
            doc ids[]
            deleted doc numbers[] (sorted)
            stored fields[] (doc num → (name, text) pairs)   [v2+]
+           facets[] (doc num → (name, values) pairs)        [v3+]
            per-field stats (doc → length)
            per-field terms (sorted) → postings
              posting := doc, freq, positions (delta-varint)
@@ -75,7 +76,7 @@ payload := varint version=2
 - CRC-32 (IEEE, zlib polynomial) covers the payload; readers verify before parsing.
 - Terms and deleted-doc lists are sorted for deterministic output — the same index always produces byte-identical snapshots.
 - Unknown versions, bad magic, truncation and checksum mismatches all raise; a corrupt snapshot is never partially loaded.
-- **Backward compatibility**: MSK1 (version 1) images are still readable; they simply have no stored fields.
+- **Backward compatibility**: MSK1 (v1, no stored fields) and MSK2 (v2, no facets) images are still readable.
 
 ## File store (`store.mbt`, native only)
 
@@ -106,9 +107,29 @@ payload := varint version=2
 - Byte layer (portable): `"MWL1"` magic + framed entries (`type byte | payload | crc32`). `wal_decode` replays the complete prefix and stops at the first torn/corrupt tail — exactly "replay all complete entries" after a crash. Repeated headers (each append batch carries one) are skipped.
 - Native layer: `add_durable` appends one CRC-framed entry with `create_mode=OpenOrCreate, append=true, sync=Data` **then** applies in memory. `checkpoint` writes `segments.msk.tmp` → fsync → rename → truncate WAL. `open_or_create` loads the snapshot (corrupt = error) then replays the WAL; replay is idempotent (Add replaces by id, Delete is a tombstone), so a crash between rename and truncate is safe.
 
+## Facets (`facet.mbt`)
+
+Facets are exact-match keyword bags attached to an existing document (`set_facets`), stored per internal doc number and serialized in MSK3. `search_faceted` evaluates the query, filters by facet values (OR within a field, AND across fields), aggregates value counts over the *filtered* result set, and paginates with offset/limit. Facet values are not analyzed — `zh`/`en` stay exact strings, unlike text fields.
+
+## BK-tree (`bktree.mbt`)
+
+A metric tree over the vocabulary: each node stores a term; children are keyed by Levenshtein distance to the parent. A range query visits only children whose edge distance lies in `[d-bound, d+bound]`. Built lazily once per index (`bk_tree`), cached, invalidated on `add`. On a 23.8k-term vocabulary it beats the linear scan by 13–1780× for typical typos.
+
+## Ranking control & explanation (`explain.mbt`)
+
+- `SortOrder` selects score/id ordering; `search_after` pages by `(score, id)` cursor, which is stable across concurrent writes unlike offset pagination.
+- `explain(query, id)` mirrors the evaluator: a phrase contributes its first term (phrase frequency folded in), a prefix expands to matching dictionary terms, `Not`'s right branch contributes nothing. df/idf are computed once per (field, term), and the document's posting is found by binary search since postings are doc-sorted.
+
+## Performance notes
+
+Three O(n²)-class issues were found by stress benchmarking and fixed:
+1. **df inside the posting loop** — BM25 constants are precomputed per (field, term) in `Bm25Context`; posting scoring is O(1).
+2. **Full sort with string tie-breaks** — `search(limit)` uses bounded top-K selection keyed on `(score, lexical id)`.
+3. **Re-sorting the vocabulary per prefix query** — `terms_of` caches the lexicographically sorted list until the next `add`; prefix evaluation binary-searches it. Note that MoonBit's `String::compare` is *shortlex* (length first), so dictionary order requires `lexical_compare`.
+
 ## Browser exports (`web/`)
 
-`pkgtype(kind: "foreign_library")` + `#export_name` exposes `ms_init / ms_add / ms_search / ms_save / ms_load / ms_count / ms_terms / ms_get / ms_delete / ms_snapshot_size / ms_term_stats / ms_highlight / ms_snippet / ms_suggest / ms_fuzzy`. Only stable-ABI types cross the boundary (String, Int); search results and term stats are JSON strings; highlighting returns engine-escaped HTML. With `use-js-builtin-string`, MoonBit strings are JS strings — zero-copy. The host instantiates with `{ builtins: ["js-string"], importedStringConstants: "_" }`.
+`pkgtype(kind: "foreign_library")` + `#export_name` exposes `ms_init / ms_add / ms_delete / ms_get / ms_search / ms_search_faceted / ms_set_facets / ms_explain / ms_highlight / ms_snippet / ms_suggest / ms_fuzzy / ms_term_stats / ms_snapshot_size / ms_save / ms_load / ms_count / ms_terms`. Only stable-ABI types cross the boundary (String, Int); search results and term stats are JSON strings; highlighting returns engine-escaped HTML. With `use-js-builtin-string`, MoonBit strings are JS strings — zero-copy. The host instantiates with `{ builtins: ["js-string"], importedStringConstants: "_" }`.
 
 ## Testing strategy
 

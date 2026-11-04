@@ -1,8 +1,8 @@
 # moonseek
 
-**Embedded full-text search engine in pure MoonBit.** Inverted index, BM25 ranking, dictionary-free Chinese tokenization, crash-safe snapshots — runs on native, WebAssembly and JavaScript.
+**Embedded full-text search engine in pure MoonBit.** Inverted index, BM25 ranking, dictionary-free Chinese tokenization, fuzzy search, faceted filtering, server-side highlighting, crash-safe WAL — runs on native, WebAssembly and JavaScript.
 
-纯 MoonBit 实现的嵌入式全文搜索引擎：倒排索引、BM25 排序、免词典中文分词、崩溃安全快照，支持 native / WASM / JS 三端。
+纯 MoonBit 实现的嵌入式全文搜索引擎：倒排索引、BM25、免词典中文分词、模糊搜索、分面过滤、服务端高亮、WAL 崩溃恢复，支持 native / WASM / JS 三端。
 
 [![CI](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml/badge.svg)](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -17,8 +17,10 @@ MoonBit's ecosystem has HTTP servers, crypto and database drivers — but no tan
 - **BM25 ranking** with configurable `k1` / `b`
 - **Chinese + English tokenization**: Latin words with stop-word removal; CJK overlapping bigrams (Lucene CJKAnalyzer strategy) — no dictionary needed
 - **Rich query syntax**: `term`, `"exact phrase"`, `AND` / `OR` / `NOT`, `field:term`, `prefix*`, parentheses, implicit AND
-- **Fuzzy search**: Levenshtein / Damerau-Levenshtein edit distance with length pruning; typo-tolerant `fuzzy_search("serch")` finds "search"
+- **Fuzzy search**: Levenshtein / Damerau-Levenshtein edit distance with early-exit bounded DP; **BK-tree** for sub-linear lookup (13–1780× faster than linear scan on a 24k-term vocabulary)
 - **Did-you-mean**: frequency-weighted spelling correction (`suggest`)
+- **Faceted search**: exact-match facet fields, AND/OR filters, per-facet value counts, offset pagination (`search_faceted`)
+- **Ranking control**: configurable sort (`search_sorted`), cursor pagination (`search_after`), per-term BM25 breakdown (`explain`)
 - **Server-side highlighting**: `highlight` / `snippet` with HTML escaping, CJK-aware codepoint spans, overlap merging, densest-window extraction
 - **Stored fields**: original texts kept in the index, retrievable via `get_document` / `get_field`, survive snapshots
 - **Segmented index**: immutable segments + tiered merge policy + cross-segment search with latest-version-wins (`SegmentedIndex`)
@@ -86,6 +88,8 @@ The demo indexes 60 bilingual documents (MoonBit docs + Chinese classics + CS to
 
 `moon bench --target native --release`, 1000 synthetic documents (~80 tokens each), AMD Ryzen 7 7435H:
 
+Small corpus (`moon bench`, 1000 synthetic docs):
+
 | Operation | Time |
 |---|---|
 | Index 1000 docs (with stored fields) | ~135 ms |
@@ -93,7 +97,20 @@ The demo indexes 60 bilingual documents (MoonBit docs + Chinese classics + CS to
 | Phrase query (top-10) | ~1.8 ms |
 | Snapshot save+load (with stored fields) | ~75 ms |
 
-Browser (WasmGC, 60 bilingual docs): index ~20 ms, average query ~250 µs, snapshot 43 KB.
+Stress test (`bench/stress`, 20,000 docs / 8.5 MB text / 23.8k terms, AMD Ryzen 7 7435H, release):
+
+| Operation | Time |
+|---|---|
+| Index build | ~6.7 s (≈3,000 docs/s) |
+| Selective term query (df ≈ 300) | **~0.02 ms** |
+| Prefix query | ~17 ms (dominated by scoring the matched terms) |
+| Saturated term (matches every doc) | ~13 ms |
+| Phrase query | ~18 ms |
+| Facet filter + aggregation (3k matches) | ~21 ms |
+| Fuzzy lookup, 24k terms | linear ~100 ms → **BK-tree 0.05–12 ms** |
+| Snapshot 17 MB: serialize / load | ~2.4 s / ~1.7 s |
+
+Browser (WasmGC, 60 bilingual docs): index ~25 ms, query 0.1–11 ms, snapshot 44 KB.
 
 ## Architecture
 
@@ -104,11 +121,14 @@ query.mbt      Lexer → recursive-descent parser → evaluator
 fuzzy.mbt      Levenshtein/Damerau distance, fuzzy search
 suggest.mbt    Frequency-weighted did-you-mean
 highlight.mbt  Server-side highlight/spans/snippet (codepoint offsets)
+facet.mbt      Facet values, filters, aggregations, pagination
+bktree.mbt     BK-tree for sub-linear fuzzy lookup
+explain.mbt    BM25 breakdown, sort orders, cursor pagination
 segment.mbt    SegmentedIndex: immutable segments + tiered merge
 wal.mbt        CRC-framed write-ahead log (portable byte layer)
 wal_native.mbt Durable add/checkpoint/crash recovery (native)
 codec.mbt      Varint / UTF-8 / double / CRC-32 primitives
-snapshot.mbt   MSK2 format: versioned payload + checksum + stored fields
+snapshot.mbt   MSK3 format: versioned payload + checksum + stored fields + facets
 store.mbt      Native atomic file persistence (async/fs)
 web/           Browser exports (#export_name, js-string builtins)
 cmd/main/      CLI: index / search / info
@@ -121,11 +141,12 @@ See [docs/architecture.md](docs/architecture.md) for design details and the snap
 ## Testing
 
 ```bash
-moon test                    # 179 tests (native), 164 (wasm-gc / js)
+moon test                    # 217 tests (native), 203 (wasm-gc / js)
 moon test --target wasm-gc
 moon test --target js
 moon bench --release         # benchmarks
 moon coverage analyze        # coverage report
+moon run bench/stress --target native --release   # 20k-doc stress benchmark
 ```
 
 Tests cover tokenization, boolean/phrase/prefix/fuzzy queries, BM25 ordering, spelling correction, highlighting spans and HTML escaping, segment merge correctness, WAL torn-tail recovery, snapshot roundtrips, corruption/truncation detection, crash-safe file persistence, and quickcheck properties (roundtrip, varint, positions, delete exclusion).
@@ -137,7 +158,10 @@ Tests cover tokenization, boolean/phrase/prefix/fuzzy queries, BM25 ordering, sp
 - [x] Fuzzy / edit-distance queries
 - [x] Did-you-mean spelling correction
 - [x] Write-ahead log with crash recovery
-- [ ] Faceted search & aggregations
+- [x] Faceted search & aggregations
+- [x] BK-tree accelerated fuzzy matching
+- [x] Score explanation, sort orders, cursor pagination
+- [ ] Postings-iterator evaluator (avoid materializing per-query score maps)
 - [ ] Distributed sharded search (OSC2027)
 
 ## License
