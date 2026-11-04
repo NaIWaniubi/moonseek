@@ -3,7 +3,7 @@
 
 name = "NaIWaniubi/moonseek"
 
-version = "0.2.0"
+version = "0.3.0"
 
 readme = "README.md"
 
@@ -25,7 +25,7 @@ keywords = [
 
 preferred_target = "native"
 
-description = "Embedded full-text search engine: inverted index, BM25, Chinese/English tokenization, fuzzy search, did-you-mean, server-side highlighting, segmented index with WAL crash recovery. Runs on native/WASM/JS."
+description = "Embedded full-text search engine: inverted index, BM25, Chinese/English tokenization, fuzzy search (BK-tree), did-you-mean, server-side highlighting, faceted filtering, score explanation, segmented index with WAL crash recovery. Runs on native/WASM/JS."
 
 import {
   "moonbitlang/async@0.22.4",
