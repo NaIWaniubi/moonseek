@@ -118,6 +118,17 @@ pub fn ms_delete(id : String) -> Int32 {
 }
 
 ///|
+/// Snapshot size in bytes (Bytes has no stable JS ABI, so expose the
+/// length as an Int for the demo's stats line).
+#export_name("ms_snapshot_size")
+pub fn ms_snapshot_size() -> Int32 {
+  match engine.val {
+    Some(index) => index.to_bytes().length()
+    None => 0
+  }
+}
+
+///|
 /// List all terms in a field as a JSON array of [term, doc_freq] pairs,
 /// sorted by descending doc frequency (for the index inspector).
 #export_name("ms_term_stats")
