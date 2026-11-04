@@ -1,0 +1,7 @@
+import {
+  "NaIWaniubi/moonseek",
+}
+
+supported_targets = "+native +wasm-gc +js"
+
+pkgtype(kind: "executable")
