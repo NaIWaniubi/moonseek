@@ -11,7 +11,13 @@ pub fn crc32(Bytes) -> UInt32
 
 pub fn parse_query(String, analyzer? : Analyzer, fields? : Array[String]) -> Query raise QueryError
 
+pub fn query_terms(Query) -> Array[String]
+
 pub fn tokenize(String) -> Array[Token]
+
+pub fn wal_decode(Bytes) -> Array[WalEntry] raise CodecError
+
+pub fn wal_encode(Array[WalEntry]) -> Bytes
 
 pub fn write_double(Array[Byte], Double) -> Unit
 
@@ -97,6 +103,14 @@ pub fn FieldSchema::to_repr(Self) -> @debug.Repr
 
 type FieldStats
 
+pub(all) struct HighlightSpan {
+  start : Int32
+  end : Int32
+} derive(Eq, @debug.Debug)
+pub fn HighlightSpan::equal(Self, Self) -> Bool
+pub fn HighlightSpan::not_equal(Self, Self) -> Bool
+pub fn HighlightSpan::to_repr(Self) -> @debug.Repr
+
 pub(all) struct Hit {
   id : String
   score : Double
@@ -125,6 +139,8 @@ pub fn Index::doc_id(Self, Int32) -> String?
 pub fn Index::from_bytes(Bytes) -> Self raise CodecError
 pub fn Index::get_document(Self, String) -> Document?
 pub fn Index::get_field(Self, String, String) -> String?
+pub fn Index::highlight(Self, String, String, String, pre_tag? : String, post_tag? : String) -> String raise QueryError
+pub fn Index::highlight_spans(Self, String, String, String) -> Array[HighlightSpan] raise QueryError
 pub async fn Index::load(String) -> Self raise StoreError
 pub async fn Index::load_or_create(String, Array[FieldSchema]) -> Self raise StoreError
 pub fn Index::new(Array[FieldSchema], analyzer? : Analyzer, bm25? : Bm25Params) -> Self
@@ -132,6 +148,7 @@ pub fn Index::postings_of(Self, String, String) -> Array[Posting]
 pub async fn Index::save(Self, String) -> Unit raise StoreError
 pub fn Index::schema(Self) -> Array[FieldSchema]
 pub fn Index::search(Self, String, limit? : Int32) -> Array[Hit] raise QueryError
+pub fn Index::snippet(Self, String, String, String, max_chars? : Int32, pre_tag? : String, post_tag? : String) -> String raise QueryError
 pub fn Index::term_count(Self) -> Int32
 pub fn Index::terms_of(Self, String) -> Array[String]
 pub fn Index::to_bytes(Self) -> Bytes
@@ -175,6 +192,26 @@ pub fn Reader::read_u32_le(Self) -> UInt32 raise CodecError
 pub fn Reader::read_varint(Self) -> Int32 raise CodecError
 pub fn Reader::remaining(Self) -> Int32
 
+pub struct SegmentedIndex {
+  schema : Array[FieldSchema]
+  analyzer : Analyzer
+  bm25 : Bm25Params
+  mut segments : Array[Index]
+  mut active : Index
+  segment_max_docs : Int32
+}
+pub fn SegmentedIndex::add(Self, Document) -> Unit
+pub fn SegmentedIndex::delete(Self, String) -> Bool
+pub fn SegmentedIndex::doc_count(Self) -> Int32
+pub fn SegmentedIndex::flush(Self) -> Unit
+pub fn SegmentedIndex::from_bytes(Bytes) -> Self raise CodecError
+pub fn SegmentedIndex::get_document(Self, String) -> Document?
+pub fn SegmentedIndex::merge(Self, max_segments? : Int32) -> Unit
+pub fn SegmentedIndex::new(Array[FieldSchema], segment_max_docs? : Int32) -> Self
+pub fn SegmentedIndex::search(Self, String, limit? : Int32) -> Array[Hit] raise QueryError
+pub fn SegmentedIndex::segment_count(Self) -> Int32
+pub fn SegmentedIndex::to_bytes(Self) -> Bytes
+
 pub(all) struct Token {
   term : String
   position : Int32
@@ -182,6 +219,14 @@ pub(all) struct Token {
 pub fn Token::equal(Self, Self) -> Bool
 pub fn Token::not_equal(Self, Self) -> Bool
 pub fn Token::to_repr(Self) -> @debug.Repr
+
+pub(all) enum WalEntry {
+  Add(Document)
+  Delete(String)
+} derive(Eq, @debug.Debug)
+pub fn WalEntry::equal(Self, Self) -> Bool
+pub fn WalEntry::not_equal(Self, Self) -> Bool
+pub fn WalEntry::to_repr(Self) -> @debug.Repr
 
 // Type aliases
 

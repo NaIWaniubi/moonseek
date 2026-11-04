@@ -5,39 +5,59 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>moonseek — 纯 MoonBit 全文搜索引擎</title>
 <style>
-  :root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff; --green: #3fb950; }
+  :root { --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff; --green: #3fb950; --purple: #bc8cff; --orange: #d29922; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 40px 20px; }
-  .container { width: 100%; max-width: 760px; }
-  h1 { font-size: 28px; margin-bottom: 4px; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; min-height: 100vh; padding: 32px 20px; }
+  .container { max-width: 1100px; margin: 0 auto; }
+  header { text-align: center; margin-bottom: 24px; }
+  h1 { font-size: 30px; margin-bottom: 6px; }
   h1 .moon { color: var(--accent); }
-  .subtitle { color: var(--dim); font-size: 14px; margin-bottom: 24px; }
+  .subtitle { color: var(--dim); font-size: 14px; }
   .badge { display: inline-block; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 2px 10px; font-size: 12px; color: var(--green); margin-left: 8px; }
-  .search-box { display: flex; gap: 8px; margin-bottom: 12px; }
+  .search-box { display: flex; gap: 8px; margin-bottom: 10px; max-width: 760px; margin-left: auto; margin-right: auto; }
   input[type="text"] { flex: 1; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; color: var(--text); font-size: 16px; outline: none; }
   input[type="text"]:focus { border-color: var(--accent); }
   button { background: var(--accent); border: none; border-radius: 8px; padding: 12px 24px; color: #fff; font-size: 16px; cursor: pointer; }
   button:hover { opacity: 0.9; }
-  .examples { color: var(--dim); font-size: 13px; margin-bottom: 20px; }
-  .examples a { color: var(--accent); cursor: pointer; text-decoration: none; margin-right: 12px; }
-  .stats { color: var(--dim); font-size: 13px; margin-bottom: 16px; font-family: monospace; }
+  button.secondary { background: var(--panel); border: 1px solid var(--border); color: var(--text); font-size: 13px; padding: 8px 14px; }
+  .examples { color: var(--dim); font-size: 13px; margin-bottom: 16px; text-align: center; }
+  .examples a { color: var(--accent); cursor: pointer; text-decoration: none; margin-right: 10px; }
+  .stats { color: var(--dim); font-size: 13px; margin-bottom: 16px; font-family: monospace; text-align: center; }
+  .layout { display: grid; grid-template-columns: 1fr 320px; gap: 20px; align-items: start; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
   .result { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
   .result .title { font-size: 16px; color: var(--accent); margin-bottom: 4px; }
   .result .score { float: right; color: var(--dim); font-size: 12px; font-family: monospace; }
-  .result .body { color: var(--dim); font-size: 14px; line-height: 1.5; }
+  .result .body { color: var(--dim); font-size: 14px; line-height: 1.6; }
   .result mark { background: rgba(88,166,255,0.25); color: var(--text); border-radius: 2px; padding: 0 1px; }
   .empty { color: var(--dim); text-align: center; padding: 40px; }
   .error { color: #f85149; padding: 12px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .panel h3 { font-size: 14px; margin-bottom: 12px; color: var(--purple); }
+  .term-bar { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 3px 0; }
+  .term-bar .term { width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: monospace; }
+  .term-bar .bar { flex: 1; height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }
+  .term-bar .bar .fill { height: 100%; background: var(--accent); }
+  .term-bar .freq { width: 30px; text-align: right; color: var(--dim); font-family: monospace; }
+  .bench-result { font-family: monospace; font-size: 12px; color: var(--dim); margin-top: 8px; line-height: 1.8; }
+  .bench-result .num { color: var(--orange); }
+  .query-help { font-size: 12px; color: var(--dim); line-height: 1.8; }
+  .query-help code { background: var(--bg); padding: 1px 5px; border-radius: 3px; color: var(--accent); font-size: 11px; }
   footer { margin-top: 32px; color: var(--dim); font-size: 12px; text-align: center; }
   footer a { color: var(--accent); text-decoration: none; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 12px; }
+  .tabs button { background: var(--bg); border: 1px solid var(--border); color: var(--dim); font-size: 12px; padding: 6px 12px; border-radius: 6px; }
+  .tabs button.active { color: var(--accent); border-color: var(--accent); }
 </style>
 </head>
 <body>
 <div class="container">
-  <h1><span class="moon">☾</span> moonseek <span class="badge" id="status">loading…</span></h1>
-  <p class="subtitle">纯 MoonBit 实现的嵌入式全文搜索引擎 · 倒排索引 + BM25 + 中文二元切分 · 你的浏览器里运行着一个 WASM 搜索引擎</p>
+  <header>
+    <h1><span class="moon">☾</span> moonseek <span class="badge" id="status">loading…</span></h1>
+    <p class="subtitle">纯 MoonBit 嵌入式全文搜索引擎 · 倒排索引 + BM25 + 中文二元切分 · 60 篇中英混合文档在你的浏览器里实时检索</p>
+  </header>
   <div class="search-box">
-    <input type="text" id="query" placeholder="输入查询：搜索引擎 / 学而时习之 / memory safety / title:rust …" autofocus>
+    <input type="text" id="query" placeholder="输入查询：搜索引擎 / 学而时习之 / memory safety / title:rust / wasm* …" autofocus>
     <button id="search-btn">搜索</button>
   </div>
   <div class="examples">
@@ -48,12 +68,45 @@
     <a data-q="memory safety">memory safety</a>
     <a data-q="title:rust">title:rust</a>
     <a data-q="wasm*">wasm*</a>
+    <a data-q="共识算法">共识算法</a>
+    <a data-q="&quot;垃圾回收&quot;">"垃圾回收"</a>
   </div>
   <div class="stats" id="stats"></div>
-  <div id="results"><div class="empty">正在加载 WASM 引擎…</div></div>
+  <div class="layout">
+    <div id="results"><div class="empty">正在加载 WASM 引擎…</div></div>
+    <aside>
+      <div class="panel">
+        <h3>⚡ 性能基准</h3>
+        <button class="secondary" id="bench-btn">运行基准测试</button>
+        <div class="bench-result" id="bench-result">点击运行：索引速度 / 查询延迟 / 快照大小</div>
+      </div>
+      <div class="panel">
+        <h3>🔍 索引检查器</h3>
+        <div class="tabs">
+          <button class="active" data-field="body">body 词频</button>
+          <button data-field="title">title 词频</button>
+        </div>
+        <div id="term-stats"></div>
+      </div>
+      <div class="panel">
+        <h3>📖 查询语法</h3>
+        <div class="query-help">
+          <code>词项</code> 全文匹配<br>
+          <code>"短语"</code> 精确短语<br>
+          <code>A AND B</code> / <code>A OR B</code><br>
+          <code>A NOT B</code> 排除<br>
+          <code>title:词</code> 字段限定<br>
+          <code>前缀*</code> 前缀匹配<br>
+          <code>(A OR B) C</code> 分组<br>
+          中文自动二元切分，无需词典
+        </div>
+      </div>
+    </aside>
+  </div>
   <footer>
     索引与查询全部在本地浏览器内完成，无网络请求 ·
     <a href="https://github.com/NaIWaniubi/moonseek">GitHub</a> ·
+    <a href="https://mooncakes.io/packages/NaIWaniubi/moonseek">mooncakes</a> ·
     Apache-2.0
   </footer>
 </div>
@@ -83,8 +136,9 @@ async function boot() {
   }
   const indexMs = (performance.now() - t0).toFixed(1);
   statusEl.textContent = "WASM ready";
-  statsEl.textContent = `${api.ms_count()} documents · ${api.ms_terms()} terms · indexed in ${indexMs} ms`;
+  statsEl.textContent = `${api.ms_count()} documents · ${api.ms_terms()} terms · indexed in ${indexMs} ms · snapshot ${api.ms_snapshot_size()} bytes`;
   resultsEl.innerHTML = '<div class="empty">输入查询开始搜索</div>';
+  renderTermStats("body");
 }
 
 function escapeHtml(s) {
@@ -93,7 +147,6 @@ function escapeHtml(s) {
 
 function highlight(text, query) {
   let html = escapeHtml(text);
-  // Highlight each query term (strip operators/field prefixes for display).
   const terms = query.replace(/["()]/g, "").split(/\s+/)
     .filter(t => t && !["AND", "OR", "NOT"].includes(t))
     .map(t => t.replace(/^\w+:/, "").replace(/\*$/, ""))
@@ -128,13 +181,65 @@ function search() {
       <div class="title">${highlight(doc.title, query)}</div>
       <div class="body">${highlight(doc.body, query)}</div>
     </div>`;
-  }).join("") + `<div class="stats">${parsed.length} hits in ${elapsed} ms</div>`;
+  }).join("") + `<div class="stats" style="text-align:left">${parsed.length} hits in ${elapsed} ms</div>`;
+}
+
+function renderTermStats(field) {
+  const raw = api.ms_term_stats(field, 12);
+  const stats = JSON.parse(raw);
+  const maxFreq = stats.length > 0 ? stats[0][1] : 1;
+  document.getElementById("term-stats").innerHTML = stats.map(([term, freq]) =>
+    `<div class="term-bar">
+      <span class="term" title="${escapeHtml(term)}">${escapeHtml(term)}</span>
+      <span class="bar"><span class="fill" style="width:${(freq / maxFreq * 100).toFixed(0)}%"></span></span>
+      <span class="freq">${freq}</span>
+    </div>`
+  ).join("");
+}
+
+function runBench() {
+  const el = document.getElementById("bench-result");
+  el.textContent = "运行中…";
+  setTimeout(() => {
+    const t0 = performance.now();
+    api.ms_init();
+    for (const [id, title, body] of CORPUS) api.ms_add(id, title, body);
+    const indexMs = (performance.now() - t0).toFixed(1);
+    const queries = ["搜索引擎", "memory", "wasm*", "学而时习之", "共识算法", "title:rust", "BM25", "数据库"];
+    const t1 = performance.now();
+    const N = 100;
+    for (let i = 0; i < N; i++) api.ms_search(queries[i % queries.length], 10);
+    const queryUs = ((performance.now() - t1) / N * 1000).toFixed(0);
+    const t2 = performance.now();
+    const snapSize = api.ms_snapshot_size();
+    const saveMs = (performance.now() - t2).toFixed(1);
+    const t3 = performance.now();
+    api.ms_init();
+    for (const [id, title, body] of CORPUS) api.ms_add(id, title, body);
+    const loadMs = (performance.now() - t3).toFixed(1);
+    el.innerHTML =
+      `索引 ${CORPUS.length} 文档: <span class="num">${indexMs} ms</span><br>` +
+      `平均查询延迟: <span class="num">${queryUs} µs</span> (${N} 次)<br>` +
+      `快照大小: <span class="num">${snapSize} bytes</span> (导出 ${saveMs} ms)<br>` +
+      `重建索引: <span class="num">${loadMs} ms</span><br>` +
+      `词项总数: <span class="num">${api.ms_terms()}</span>`;
+    statsEl.textContent = `${api.ms_count()} documents · ${api.ms_terms()} terms · benchmark complete`;
+    renderTermStats("body");
+  }, 50);
 }
 
 document.getElementById("search-btn").addEventListener("click", search);
 queryEl.addEventListener("keydown", e => { if (e.key === "Enter") search(); });
+document.getElementById("bench-btn").addEventListener("click", runBench);
 document.querySelectorAll(".examples a").forEach(a => {
   a.addEventListener("click", () => { queryEl.value = a.dataset.q; search(); });
+});
+document.querySelectorAll(".tabs button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tabs button").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    renderTermStats(btn.dataset.field);
+  });
 });
 
 boot().catch(e => {
