@@ -102,6 +102,20 @@ pub fn Bm25Params::equal(Self, Self) -> Bool
 pub fn Bm25Params::not_equal(Self, Self) -> Bool
 pub fn Bm25Params::to_repr(Self) -> @debug.Repr
 
+pub struct ByteWriter {
+  // private fields
+}
+pub fn ByteWriter::append(Self, Self) -> Unit
+pub fn ByteWriter::length(Self) -> Int32
+pub fn ByteWriter::new(capacity? : Int32) -> Self
+pub fn ByteWriter::push(Self, Byte) -> Unit
+pub fn ByteWriter::push_bytes(Self, Bytes) -> Unit
+pub fn ByteWriter::to_bytes(Self) -> Bytes
+pub fn ByteWriter::write_double(Self, Double) -> Unit
+pub fn ByteWriter::write_string(Self, String) -> Unit
+pub fn ByteWriter::write_u32_le(Self, UInt32) -> Unit
+pub fn ByteWriter::write_varint(Self, Int32) -> Unit
+
 pub(all) struct Document {
   id : String
   fields : Array[(String, String)]

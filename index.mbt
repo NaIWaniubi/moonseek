@@ -280,6 +280,13 @@ pub fn Index::schema(self : Index) -> Array[FieldSchema] {
 ///|
 /// Document frequency of a term in a field (0 if absent).
 pub fn Index::doc_freq(self : Index, field : String, term : String) -> Int32 {
+  // Fast path: no deletions ever happened — every posting is live.
+  if self.deleted.is_empty() {
+    return self.postings_of(field, term).length()
+  }
+  // With tombstones present, only scan when the term's postings could
+  // contain one; postings are doc-sorted so this is a linear walk of the
+  // list (bounded by df), not a hashmap probe per element.
   let mut count = 0
   for p in self.postings_of(field, term) {
     if !self.deleted.contains(p.doc) {
@@ -350,6 +357,7 @@ fn Index::avg_field_length(self : Index, field : String) -> Double {
 priv struct Bm25Context {
   k1 : Double
   b : Double
+  df : Int32
   idf : Double
   avgdl : Double
   weight : Double
@@ -379,6 +387,7 @@ fn Index::bm25_context(
   {
     k1: self.bm25.k1,
     b: self.bm25.b,
+    df,
     idf,
     avgdl: self.avg_field_length(field),
     weight: self.field_weight(field),

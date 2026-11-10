@@ -107,7 +107,7 @@ pub fn Index::explain(
               field,
               term,
               tf: posting.freq,
-              df: self.doc_freq(field, term),
+              df: ctx.df,
               idf: ctx.idf,
               norm,
               score: ctx.score(posting),

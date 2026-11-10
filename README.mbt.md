@@ -138,6 +138,9 @@ demo/          Single-page browser demo (60 docs, benchmarks, inspector)
 
 See [docs/architecture.md](docs/architecture.md) for design details and the snapshot format specification.
 
+- [docs/benchmark.md](docs/benchmark.md) — performance whitepaper (stress numbers, methodology, limitations)
+- [docs/comparison.md](docs/comparison.md) — feature matrix vs tantivy / Lucene / bleve
+
 ## Testing
 
 ```bash

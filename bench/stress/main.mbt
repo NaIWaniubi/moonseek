@@ -247,6 +247,25 @@ fn main {
       )
     }
   }
+  // 6. Score explanation (measured 100x before the snapshot roundtrip;
+  //    allocating the 17 MB image first polluted this number with GC pauses)
+  let t6 = @bench.monotonic_clock_start()
+  let mut detail_len = 0
+  for _ in 0..<100 {
+    let exp = idx.explain("搜索", "doc-0") catch { _ => None }
+    match exp {
+      Some(x) => detail_len = x.details.length()
+      None => ()
+    }
+  }
+  let e6 = @bench.monotonic_clock_end(t6)
+  println(
+    "=== explain x100: " +
+    us_to_ms(e6 / 100.0).to_string() +
+    " ms/query, " +
+    detail_len.to_string() +
+    " score components ===",
+  )
   // 5. Snapshot roundtrip
   println("=== snapshot ===")
   let t4 = @bench.monotonic_clock_start()
@@ -275,21 +294,6 @@ fn main {
   println(
     "  restored search parity: " +
     (before.length() == after.length()).to_string(),
-  )
-  // 6. Score explanation
-  let t6 = @bench.monotonic_clock_start()
-  let exp = idx.explain("搜索", "doc-0") catch { _ => None }
-  let e6 = @bench.monotonic_clock_end(t6)
-  let detail_len = match exp {
-    Some(x) => x.details.length()
-    None => 0
-  }
-  println(
-    "=== explain: " +
-    us_to_ms(e6).to_string() +
-    " ms, " +
-    detail_len.to_string() +
-    " score components ===",
   )
   println("=== done ===")
 }
