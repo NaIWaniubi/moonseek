@@ -70,18 +70,30 @@ fn main {
     index.add(doc)
   }
   // Facets: language (zh/en), topic (free-form keyword bag).
-  index.set_facets("doc-1", [
+  let _ = index.set_facets("doc-1", [
     ("lang", ["zh"]),
     ("topic", ["moonbit", "language"]),
   ])
-  index.set_facets("doc-2", [("lang", ["en"]), ("topic", ["search", "index"])])
-  index.set_facets("doc-3", [("lang", ["zh"]), ("topic", ["search", "index"])])
-  index.set_facets("doc-4", [
+  let _ = index.set_facets("doc-2", [
+    ("lang", ["en"]),
+    ("topic", ["search", "index"]),
+  ])
+  let _ = index.set_facets("doc-3", [
+    ("lang", ["zh"]),
+    ("topic", ["search", "index"]),
+  ])
+  let _ = index.set_facets("doc-4", [
     ("lang", ["en"]),
     ("topic", ["language", "safety"]),
   ])
-  index.set_facets("doc-5", [("lang", ["en"]), ("topic", ["wasm", "runtime"])])
-  index.set_facets("doc-6", [("lang", ["zh"]), ("topic", ["search", "wasm"])])
+  let _ = index.set_facets("doc-5", [
+    ("lang", ["en"]),
+    ("topic", ["wasm", "runtime"]),
+  ])
+  let _ = index.set_facets("doc-6", [
+    ("lang", ["zh"]),
+    ("topic", ["search", "wasm"]),
+  ])
   println("=== faceted search: query + filter + aggregation ===")
   let opts : @moonseek.SearchOptions = {
     limit: 5,

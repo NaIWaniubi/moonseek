@@ -7,13 +7,17 @@
 ///|
 /// Append an unsigned varint (LEB128) to the buffer.
 /// Every byte except the last has the continuation bit (0x80) set.
+/// Negative values are reinterpreted as their unsigned 32-bit bit pattern,
+/// so every Int32 input produces a well-formed stream a reader can round
+/// trip; the old behavior emitted a lone 0xFF that silently misaligned
+/// every following byte.
 pub fn write_varint(buf : Array[Byte], value : Int32) -> Unit {
-  let mut v = value
+  let mut v = value.reinterpret_as_uint()
   while v >= 0x80 {
-    buf.push(((v & 0x7F) | 0x80).to_byte())
+    buf.push(((v & 0x7F) | 0x80).reinterpret_as_int().to_byte())
     v = v >> 7
   }
-  buf.push(v.to_byte())
+  buf.push(v.reinterpret_as_int().to_byte())
 }
 
 ///|
@@ -51,6 +55,31 @@ pub extend CodecError with Eq::{equal, not_equal}
 pub extend CodecError with @debug.Debug::{to_repr}
 
 ///|
+/// Human-readable one-line description, used by the WAL segment header
+/// diagnostics and by `Show` interpolation in user-facing messages.
+pub extend CodecError with Show::{to_string, output}
+
+///|
+pub impl Show for CodecError with fn output(self : CodecError, logger : &Logger) -> Unit {
+  match self {
+    UnexpectedEof => logger.write_string("unexpected eof")
+    VarintOverflow => logger.write_string("varint overflow")
+    InvalidUtf8 => logger.write_string("invalid utf-8")
+    BadMagic => logger.write_string("bad magic")
+    BadVersion(v) => {
+      logger.write_string("bad version: ")
+      logger.write_string(v.to_string())
+    }
+    CrcMismatch(expected, actual) => {
+      logger.write_string("crc mismatch: expected ")
+      logger.write_string(expected.to_string())
+      logger.write_string(", got ")
+      logger.write_string(actual.to_string())
+    }
+  }
+}
+
+///|
 pub fn Reader::read_byte(self : Reader) -> Byte raise CodecError {
   match self.data.get(self.pos) {
     Some(b) => {
@@ -63,20 +92,23 @@ pub fn Reader::read_byte(self : Reader) -> Byte raise CodecError {
 
 ///|
 pub fn Reader::read_varint(self : Reader) -> Int32 raise CodecError {
-  let mut result = 0
+  // Int32 shifts wrap at 32 bits, so decoding is done in UInt32 and the
+  // canonical-encoding bound is 5 groups (28 bits of the last one used).
+  // A 6th continuation byte can never belong to an Int32 varint.
+  let mut result : UInt32 = 0U
   let mut shift = 0
   while true {
     let b = self.read_byte().to_int()
-    result = result | ((b & 0x7F) << shift)
+    result = result | ((b & 0x7F).reinterpret_as_uint() << shift)
     if b < 0x80 {
-      break result
+      break result.reinterpret_as_int()
     }
     shift += 7
-    if shift >= 63 {
+    if shift >= 32 {
       raise CodecError::VarintOverflow
     }
   } nobreak {
-    result
+    result.reinterpret_as_int()
   }
 }
 

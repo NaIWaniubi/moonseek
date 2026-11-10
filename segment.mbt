@@ -1,7 +1,7 @@
 ///|
 /// Segmented index: a stack of immutable segments plus one active
 /// in-memory segment. Each segment is a full `Index` (already
-/// serializable via MSK2), so freezing is just moving a reference.
+/// serializable via MSK3), so freezing is just moving a reference.
 /// Pure MoonBit — usable on native, wasm-gc and js alike.
 ///
 /// Ordering contract: `segments` is oldest-first, `active` is newest.
@@ -438,8 +438,8 @@ fn SegmentedIndex::collapse(
 ///|
 /// Serialize: magic "MSKS" | payload | crc32(payload) u32le.
 /// Payload: version | segment_max_docs | schema | analyzer/bm25 config |
-/// immutable segment count | each segment as length-prefixed MSK2 image |
-/// active segment as length-prefixed MSK2 image.
+/// immutable segment count | each segment as length-prefixed MSK3 image |
+/// active segment as length-prefixed MSK3 image.
 pub fn SegmentedIndex::to_bytes(self : SegmentedIndex) -> Bytes {
   let payload : Array[Byte] = []
   write_varint(payload, SEGMENT_VERSION)

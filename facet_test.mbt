@@ -20,10 +20,13 @@ fn facet_index() -> @moonseek.Index {
     id: "d4",
     fields: [("title", "Go guide"), ("body", "language cloud")],
   })
-  idx.set_facets("d1", [("lang", ["en"]), ("topic", ["moonbit", "wasm"])])
-  idx.set_facets("d2", [("lang", ["en"]), ("topic", ["rust"])])
-  idx.set_facets("d3", [("lang", ["zh"]), ("topic", ["search"])])
-  idx.set_facets("d4", [("lang", ["en"]), ("topic", ["go", "cloud"])])
+  let _ = idx.set_facets("d1", [
+    ("lang", ["en"]),
+    ("topic", ["moonbit", "wasm"]),
+  ])
+  let _ = idx.set_facets("d2", [("lang", ["en"]), ("topic", ["rust"])])
+  let _ = idx.set_facets("d3", [("lang", ["zh"]), ("topic", ["search"])])
+  let _ = idx.set_facets("d4", [("lang", ["en"]), ("topic", ["go", "cloud"])])
   idx
 }
 

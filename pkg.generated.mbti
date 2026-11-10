@@ -3,7 +3,6 @@ package "NaIWaniubi/moonseek"
 
 import {
   "moonbitlang/core/debug",
-  "moonbitlang/core/hashmap",
 }
 
 // Values
@@ -46,7 +45,10 @@ pub(all) suberror CodecError {
 } derive(Eq, @debug.Debug)
 pub fn CodecError::equal(Self, Self) -> Bool
 pub fn CodecError::not_equal(Self, Self) -> Bool
+pub fn CodecError::output(Self, &Logger) -> Unit
 pub fn CodecError::to_repr(Self) -> @debug.Repr
+pub fn CodecError::to_string(Self) -> String
+pub impl Show for CodecError
 
 pub(all) suberror QueryError {
   EmptyQuery
@@ -83,6 +85,7 @@ pub fn Analyzer::default() -> Self
 pub fn Analyzer::equal(Self, Self) -> Bool
 pub fn Analyzer::not_equal(Self, Self) -> Bool
 pub fn Analyzer::to_repr(Self) -> @debug.Repr
+pub impl Default for Analyzer
 
 pub struct BkTree {
   // private fields
@@ -101,6 +104,7 @@ pub fn Bm25Params::default() -> Self
 pub fn Bm25Params::equal(Self, Self) -> Bool
 pub fn Bm25Params::not_equal(Self, Self) -> Bool
 pub fn Bm25Params::to_repr(Self) -> @debug.Repr
+pub impl Default for Bm25Params
 
 pub struct ByteWriter {
   // private fields
@@ -131,6 +135,7 @@ pub(all) struct Explanation {
 } derive(Eq, @debug.Debug)
 pub fn Explanation::equal(Self, Self) -> Bool
 pub fn Explanation::not_equal(Self, Self) -> Bool
+pub fn Explanation::to_json(Self) -> Json
 pub fn Explanation::to_repr(Self) -> @debug.Repr
 
 pub(all) struct FacetCount {
@@ -139,6 +144,7 @@ pub(all) struct FacetCount {
 } derive(Eq, @debug.Debug)
 pub fn FacetCount::equal(Self, Self) -> Bool
 pub fn FacetCount::not_equal(Self, Self) -> Bool
+pub fn FacetCount::to_json(Self) -> Json
 pub fn FacetCount::to_repr(Self) -> @debug.Repr
 
 pub(all) struct FacetFilter {
@@ -147,6 +153,7 @@ pub(all) struct FacetFilter {
 } derive(Eq, @debug.Debug)
 pub fn FacetFilter::equal(Self, Self) -> Bool
 pub fn FacetFilter::not_equal(Self, Self) -> Bool
+pub fn FacetFilter::to_json(Self) -> Json
 pub fn FacetFilter::to_repr(Self) -> @debug.Repr
 
 pub(all) struct FacetedResult {
@@ -156,6 +163,7 @@ pub(all) struct FacetedResult {
 } derive(Eq, @debug.Debug)
 pub fn FacetedResult::equal(Self, Self) -> Bool
 pub fn FacetedResult::not_equal(Self, Self) -> Bool
+pub fn FacetedResult::to_json(Self) -> Json
 pub fn FacetedResult::to_repr(Self) -> @debug.Repr
 
 pub(all) struct FieldSchema {
@@ -176,9 +184,9 @@ pub fn FuzzyMatch::equal(Self, Self) -> Bool
 pub fn FuzzyMatch::not_equal(Self, Self) -> Bool
 pub fn FuzzyMatch::to_repr(Self) -> @debug.Repr
 
-pub(all) struct HighlightSpan {
+pub struct HighlightSpan {
   start : Int32
-  mut end : Int32
+  end : Int32
 } derive(Eq, @debug.Debug)
 pub fn HighlightSpan::equal(Self, Self) -> Bool
 pub fn HighlightSpan::not_equal(Self, Self) -> Bool
@@ -190,25 +198,19 @@ pub(all) struct Hit {
 } derive(Eq, @debug.Debug)
 pub fn Hit::equal(Self, Self) -> Bool
 pub fn Hit::not_equal(Self, Self) -> Bool
+pub fn Hit::to_json(Self) -> Json
 pub fn Hit::to_repr(Self) -> @debug.Repr
 
 pub struct Index {
   schema : Array[FieldSchema]
   analyzer : Analyzer
   bm25 : Bm25Params
-  postings : @hashmap.HashMap[String, @hashmap.HashMap[String, Array[Posting]]]
-  doc_ids : Array[String]
-  doc_nums : @hashmap.HashMap[String, Int32]
-  stats : @hashmap.HashMap[String, FieldStats]
-  deleted : @hashmap.HashMap[Int32, Unit]
-  stored : @hashmap.HashMap[Int32, Array[(String, String)]]
-  facets : @hashmap.HashMap[Int32, Array[(String, Array[String])]]
-  terms_sorted : @hashmap.HashMap[String, Array[String]]
-  bk_trees : @hashmap.HashMap[String, BkTree]
+  // private fields
 }
 pub fn Index::add(Self, Document) -> Unit
 pub fn Index::analyzer(Self) -> Analyzer
 pub fn Index::bk_tree(Self, field? : String?) -> BkTree
+pub fn Index::bm25(Self) -> Bm25Params
 pub fn Index::delete(Self, String) -> Bool
 pub fn Index::doc_count(Self) -> Int32
 pub fn Index::doc_freq(Self, String, String) -> Int32
@@ -233,7 +235,7 @@ pub fn Index::search(Self, String, limit? : Int32) -> Array[Hit] raise QueryErro
 pub fn Index::search_after(Self, String, after_score~ : Double, after_id~ : String, limit? : Int32) -> Array[Hit] raise QueryError
 pub fn Index::search_faceted(Self, String, options? : SearchOptions) -> FacetedResult raise QueryError
 pub fn Index::search_sorted(Self, String, limit? : Int32, sort? : SortOrder) -> Array[Hit] raise QueryError
-pub fn Index::set_facets(Self, String, Array[(String, Array[String])]) -> Unit
+pub fn Index::set_facets(Self, String, Array[(String, Array[String])]) -> Bool
 pub fn Index::snippet(Self, String, String, String, max_chars? : Int32, pre_tag? : String, post_tag? : String) -> String raise QueryError
 pub fn Index::suggest(Self, String, max_distance? : Int32) -> String?
 pub fn Index::term_count(Self) -> Int32
@@ -262,6 +264,7 @@ pub(all) enum Query {
   Or(Query, Query)
   Not(Query, Query)
   MatchAll
+  MatchField(String)
 } derive(Eq, @debug.Debug)
 pub fn Query::equal(Self, Self) -> Bool
 pub fn Query::not_equal(Self, Self) -> Bool
@@ -290,6 +293,7 @@ pub(all) struct ScoreDetail {
 } derive(Eq, @debug.Debug)
 pub fn ScoreDetail::equal(Self, Self) -> Bool
 pub fn ScoreDetail::not_equal(Self, Self) -> Bool
+pub fn ScoreDetail::to_json(Self) -> Json
 pub fn ScoreDetail::to_repr(Self) -> @debug.Repr
 
 pub(all) struct SearchOptions {
@@ -301,7 +305,9 @@ pub(all) struct SearchOptions {
 pub fn SearchOptions::default() -> Self
 pub fn SearchOptions::equal(Self, Self) -> Bool
 pub fn SearchOptions::not_equal(Self, Self) -> Bool
+pub fn SearchOptions::to_json(Self) -> Json
 pub fn SearchOptions::to_repr(Self) -> @debug.Repr
+pub impl Default for SearchOptions
 
 pub struct SegmentedIndex {
   schema : Array[FieldSchema]

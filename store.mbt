@@ -56,11 +56,17 @@ pub async fn Index::load(path : String) -> Index raise StoreError {
 ///|
 /// Load an index from `path`, or create a fresh one if the file does not
 /// exist. A corrupt file is still an error (never silently discarded).
+/// Existence is judged with `@fs.exists`, not `@fs.can_read`: a file that
+/// exists but is unreadable (permissions, exclusive lock, AV scan) must
+/// surface as an error, because silently creating a fresh in-memory index
+/// would let the next save() atomically overwrite and destroy it.
 pub async fn Index::load_or_create(
   path : String,
   schema : Array[FieldSchema],
 ) -> Index raise StoreError {
-  let exists = @fs.can_read(path) catch { _ => false }
+  let exists = @fs.exists(path) catch {
+    e => raise StoreError::IoError(e.to_string())
+  }
   if exists {
     Index::load(path)
   } else {

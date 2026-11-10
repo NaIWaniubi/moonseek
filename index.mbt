@@ -68,32 +68,42 @@ pub fn Bm25Params::default() -> Bm25Params {
 
 ///|
 /// An in-memory inverted index over a fixed field schema.
+///
+/// All mutable state is private: callers reach it only through the
+/// accessor methods (schema/analyzer/bm25/doc_count/search/...), never by
+/// holding a shared reference to the internal tables. Exposing the
+/// HashMaps would let any caller corrupt index invariants and hard-code
+/// the storage layout into the package ABI.
 pub struct Index {
+  /// Field schema (names and weights), in declaration order.
   schema : Array[FieldSchema]
   analyzer : Analyzer
   bm25 : Bm25Params
   /// field name -> term -> postings (sorted by doc)
-  postings : @hashmap.HashMap[String, @hashmap.HashMap[String, Array[Posting]]]
+  priv postings : @hashmap.HashMap[
+    String,
+    @hashmap.HashMap[String, Array[Posting]],
+  ]
   /// internal doc number -> external id
-  doc_ids : Array[String]
+  priv doc_ids : Array[String]
   /// external id -> internal doc number
-  doc_nums : @hashmap.HashMap[String, Int32]
+  priv doc_nums : @hashmap.HashMap[String, Int32]
   /// field name -> stats
-  stats : @hashmap.HashMap[String, FieldStats]
+  priv stats : @hashmap.HashMap[String, FieldStats]
   /// internal doc numbers of deleted documents
-  deleted : @hashmap.HashMap[Int32, Unit]
+  priv deleted : @hashmap.HashMap[Int32, Unit]
   /// stored original field texts: internal doc number -> (field, text)
-  stored : @hashmap.HashMap[Int32, Array[(String, String)]]
+  priv stored : @hashmap.HashMap[Int32, Array[(String, String)]]
   /// facet values: internal doc number -> (field, values)
-  facets : @hashmap.HashMap[Int32, Array[(String, Array[String])]]
+  priv facets : @hashmap.HashMap[Int32, Array[(String, Array[String])]]
   /// Cached lexicographically sorted term lists per field. Cleared on add
   /// (the only operation that introduces new terms); prefix queries reuse it
   /// instead of re-sorting the whole vocabulary.
-  terms_sorted : @hashmap.HashMap[String, Array[String]]
+  priv terms_sorted : @hashmap.HashMap[String, Array[String]]
   /// Cached BK-trees for fuzzy lookup, keyed by field name ("*" = all fields).
   /// Cleared on add. Building one tree per query was the dominant cost of
   /// fuzzy search on large vocabularies.
-  bk_trees : @hashmap.HashMap[String, BkTree]
+  priv bk_trees : @hashmap.HashMap[String, BkTree]
 }
 
 ///|
@@ -209,6 +219,10 @@ fn Index::delete_by_num(self : Index, num : Int32) -> Unit {
   }
   self.deleted.set(num, ())
   self.stored.remove(num)
+  // Facet values of a deleted document are dead state: keeping them
+  // would serialize them into every snapshot and pin them in memory
+  // (read paths filter by `deleted`, but the payload never shrinks).
+  self.facets.remove(num)
   for (_, stats) in self.stats.iter() {
     match stats.lengths.remove_and_get(num) {
       Some(len) => stats.total_length -= len
@@ -339,15 +353,43 @@ pub fn Index::terms_of(self : Index, field : String) -> Array[String] {
 }
 
 ///|
-/// Average length of a field over live documents.
+/// Average length of a field over the live documents that actually carry
+/// it. A document can declare the schema but omit the field, so dividing
+/// by the global live count would systematically dilute avgdl and skew
+/// BM25 length normalization whenever such documents exist.
 fn Index::avg_field_length(self : Index, field : String) -> Double {
   let stats = self.stats[field]
-  let count = self.doc_count()
+  let count = self.field_live_count(field)
   if count == 0 {
     0.0
   } else {
     stats.total_length.to_double() / count.to_double()
   }
+}
+
+///|
+/// Number of live documents that have analyzed content in `field`.
+fn Index::field_live_count(self : Index, field : String) -> Int32 {
+  let stats = match self.stats.get(field) {
+    Some(s) => s
+    None => return 0
+  }
+  if self.deleted.is_empty() {
+    return stats.lengths.length()
+  }
+  let mut count = 0
+  for (num, _) in stats.lengths.iter2() {
+    if !self.deleted.contains(num) {
+      count += 1
+    }
+  }
+  count
+}
+
+///|
+/// The BM25 parameters this index was created with (for diagnostics).
+pub fn Index::bm25(self : Index) -> Bm25Params {
+  self.bm25
 }
 
 ///|
@@ -409,4 +451,9 @@ fn Bm25Context::score(self : Bm25Context, posting : Posting) -> Double {
   }
   let tf = posting.freq.to_double()
   self.idf * (tf * (self.k1 + 1.0)) / (tf + self.k1 * norm) * self.weight
+}
+
+///|
+pub impl Default for Bm25Params with fn default() -> Bm25Params {
+  { k1: 1.2, b: 0.75, }
 }

@@ -142,17 +142,22 @@ test "wal: bad magic is rejected" {
 }
 
 ///|
-test "wal: unknown entry type is rejected" {
-  // Valid header, then an entry with type byte 0x7F.
+test "wal: unknown entry type is treated as a torn tail" {
+  // Valid header, then an entry with type byte 0x7F. A single flipped
+  // bit in a frame header must degrade to prefix recovery (nothing
+  // replayed), not make the whole log unreadable.
   let buf : Array[Byte] = [b'M', b'W', b'L', b'1', 0x7F]
-  let result = @moonseek.wal_decode(Bytes::from_array(buf[:])) catch {
-    e => {
-      assert_true(e is @moonseek.CodecError::BadVersion(127))
-      return ()
-    }
+  assert_eq(@moonseek.wal_decode(Bytes::from_array(buf[:])).length(), 0)
+  // Valid entries before the unknown frame survive.
+  let good = @moonseek.wal_encode([Add({ id: "a", fields: [("b", "x")], })])
+  let buf : Array[Byte] = []
+  for byte in good.iter() {
+    buf.push(byte)
   }
-  let _ = result
-  fail("unknown entry type should raise")
+  buf.push(0x7F)
+  buf.push(0x00)
+  let decoded = @moonseek.wal_decode(Bytes::from_array(buf[:]))
+  assert_eq(decoded.length(), 1)
 }
 
 ///|

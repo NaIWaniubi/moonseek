@@ -3,8 +3,11 @@ test "facet: snapshot roundtrip preserves facets" {
   let idx = @moonseek.Index::new([{ name: "body", weight: 1.0, }])
   idx.add({ id: "a", fields: [("body", "hello world")], })
   idx.add({ id: "b", fields: [("body", "全文搜索")], })
-  idx.set_facets("a", [("lang", ["en"]), ("topic", ["greeting"])])
-  idx.set_facets("b", [("lang", ["zh"]), ("topic", ["search", "engine"])])
+  let _ = idx.set_facets("a", [("lang", ["en"]), ("topic", ["greeting"])])
+  let _ = idx.set_facets("b", [
+    ("lang", ["zh"]),
+    ("topic", ["search", "engine"]),
+  ])
   let restored = @moonseek.Index::from_bytes(idx.to_bytes())
   let fa = restored.get_facets("a")
   assert_eq(fa.length(), 2)
@@ -27,7 +30,7 @@ test "facet: snapshot roundtrip preserves facets" {
 test "facet: deleted doc facets excluded after roundtrip" {
   let idx = @moonseek.Index::new([{ name: "body", weight: 1.0, }])
   idx.add({ id: "a", fields: [("body", "hello")], })
-  idx.set_facets("a", [("lang", ["en"])])
+  let _ = idx.set_facets("a", [("lang", ["en"])])
   let _ = idx.delete("a")
   let restored = @moonseek.Index::from_bytes(idx.to_bytes())
   assert_eq(restored.get_facets("a").length(), 0)

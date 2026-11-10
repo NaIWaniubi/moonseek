@@ -211,7 +211,8 @@ pub fn Index::fuzzy_search(
   hits.sort_by(fn(a, b) {
     let cmp = b.score.compare(a.score)
     if cmp == 0 {
-      a.id.compare(b.id)
+      // Match Index::search's tie-break: pure lexicographic, not shortlex.
+      a.id.lexical_compare(b.id)
     } else {
       cmp
     }

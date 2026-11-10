@@ -12,6 +12,16 @@ fn schema() -> Array[@moonseek.FieldSchema] {
 }
 
 ///|
+/// The one error protocol for every JSON-returning entry point: failures
+/// come back as {"error":"..."} so callers can distinguish failure from
+/// an empty result.
+fn error_json(msg : String) -> String {
+  let fields : Map[String, Json] = Map([])
+  fields["error"] = @json.to_json(msg)
+  Json::object(fields).stringify()
+}
+
+///|
 /// Create a fresh empty index, discarding any previous one.
 #export_name("ms_init")
 pub fn ms_init() -> Unit {
@@ -28,7 +38,9 @@ pub fn ms_load(image : Bytes) -> String {
     engine.val = Some(index)
     ""
   } catch {
-    e => @debug.to_string(e)
+    // CodecError implements Show, so users get a readable message
+    // instead of a Debug repr like CodecError::BadMagic(...).
+    e => e.to_string()
   }
 }
 
@@ -62,16 +74,9 @@ pub fn ms_search(query : String, limit : Int32) -> String {
   match engine.val {
     Some(index) => {
       let hits = index.search(query, limit~) catch {
-        e => return "{\"error\":\"\{@debug.to_string(e)}\"}"
+        e => return error_json(e.to_string())
       }
-      let items : Array[Json] = []
-      for hit in hits {
-        let fields : Map[String, Json] = Map([])
-        fields["id"] = @json.to_json(hit.id)
-        fields["score"] = @json.to_json(hit.score)
-        items.push(Json::object(fields))
-      }
-      Json::array(items).stringify()
+      Json::array(hits.map(fn(h) { h.to_json() })).stringify()
     }
     None => "{\"error\":\"index not initialized\"}"
   }
@@ -134,8 +139,11 @@ pub fn ms_snapshot_size() -> Int32 {
 #export_name("ms_highlight")
 pub fn ms_highlight(id : String, field : String, query : String) -> String {
   match engine.val {
-    Some(index) => index.highlight(id, field, query) catch { _ => "" }
-    None => ""
+    Some(index) =>
+      index.highlight(id, field, query) catch {
+        e => error_json(e.to_string())
+      }
+    None => error_json("index not initialized")
   }
 }
 
@@ -149,8 +157,11 @@ pub fn ms_snippet(
   max_chars : Int32,
 ) -> String {
   match engine.val {
-    Some(index) => index.snippet(id, field, query, max_chars~) catch { _ => "" }
-    None => ""
+    Some(index) =>
+      index.snippet(id, field, query, max_chars~) catch {
+        e => error_json(e.to_string())
+      }
+    None => error_json("index not initialized")
   }
 }
 
@@ -171,18 +182,11 @@ pub fn ms_fuzzy(term : String, max_distance : Int32, limit : Int32) -> String {
   match engine.val {
     Some(index) => {
       let hits = index.fuzzy_search(term, max_distance~, limit~) catch {
-        _ => return "[]"
+        e => return error_json(e.to_string())
       }
-      let items : Array[Json] = []
-      for hit in hits {
-        let fields : Map[String, Json] = Map([])
-        fields["id"] = @json.to_json(hit.id)
-        fields["score"] = @json.to_json(hit.score)
-        items.push(Json::object(fields))
-      }
-      Json::array(items).stringify()
+      Json::array(hits.map(fn(h) { h.to_json() })).stringify()
     }
-    None => "[]"
+    None => error_json("index not initialized")
   }
 }
 
@@ -220,8 +224,11 @@ pub fn ms_set_facets(id : String, json : String) -> String {
           }
         None => ()
       }
-      index.set_facets(id, facets)
-      ""
+      if index.set_facets(id, facets) {
+        ""
+      } else {
+        "no such document: " + id
+      }
     }
     None => "index not initialized"
   }
@@ -268,13 +275,14 @@ pub fn ms_search_faceted(
         facet_fields: ["cat", "lang"],
       }
       let result = index.search_faceted(query, options~) catch {
-        e => return "{\"error\":\"" + @debug.to_string(e) + "\"}"
+        e => return error_json(e.to_string())
       }
       let hits : Array[Json] = []
       for hit in result.hits {
-        let fields : Map[String, Json] = Map([])
-        fields["id"] = @json.to_json(hit.id)
-        fields["score"] = @json.to_json(hit.score)
+        let fields : Map[String, Json] = hit
+          .to_json()
+          .as_object()
+          .unwrap_or(Map([]))
         fields["title"] = @json.to_json(
           index.get_field(hit.id, "title").unwrap_or(""),
         )
@@ -311,30 +319,15 @@ pub fn ms_search_faceted(
 pub fn ms_explain(id : String, query : String) -> String {
   match engine.val {
     Some(index) => {
-      let exp = index.explain(query, id) catch { _ => None }
+      let exp = index.explain(query, id) catch {
+        e => return error_json(e.to_string())
+      }
       match exp {
         None => "null"
-        Some(e) => {
-          let details : Array[Json] = []
-          for d in e.details {
-            let fields : Map[String, Json] = Map([])
-            fields["field"] = @json.to_json(d.field)
-            fields["term"] = @json.to_json(d.term)
-            fields["tf"] = @json.to_json(d.tf)
-            fields["df"] = @json.to_json(d.df)
-            fields["idf"] = @json.to_json(d.idf)
-            fields["score"] = @json.to_json(d.score)
-            details.push(Json::object(fields))
-          }
-          let out : Map[String, Json] = Map([])
-          out["id"] = @json.to_json(e.id)
-          out["total"] = @json.to_json(e.total_score)
-          out["details"] = Json::array(details)
-          Json::object(out).stringify()
-        }
+        Some(e) => e.to_json().stringify()
       }
     }
-    None => "null"
+    None => error_json("index not initialized")
   }
 }
 

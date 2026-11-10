@@ -5,6 +5,14 @@
 /// visits children whose edge distance is in [dist(query,node)-d,
 /// dist(query,node)+d] — pruning most of the tree for small d.
 /// This turns fuzzy matching from O(vocab) to O(vocab^0.5) typical.
+///
+/// Metric choice: the tree edges use Levenshtein (a true metric, so the
+/// triangle-inequality pruning stays sound), while reported matches use
+/// Damerau-Levenshtein so `BkTree::search` agrees with
+/// `Index::fuzzy_terms` on adjacent transpositions. DL >= Lev always, so
+/// visiting every candidate the Lev window admits and re-filtering with
+/// DL finds exactly the DL-ball — no candidate inside the DL ball can
+/// fall outside the Lev window that contains it.
 
 ///|
 priv struct BkNode {
@@ -87,13 +95,17 @@ pub fn BkTree::search(
           Some(n) => n
           None => break
         }
-        let d = levenshtein(query, node.term)
+        let lev = levenshtein(query, node.term)
+        // Match semantics follow fuzzy_terms: Damerau-Levenshtein.
+        let d = damerau_levenshtein_bounded(query, node.term, max_distance)
         if d <= max_distance {
           results.push({ term: node.term, distance: d, })
         }
-        // Only visit children whose edge distance could yield a match.
-        let low = d - max_distance
-        let high = d + max_distance
+        // Prune with the Levenshtein edge distance: it is a true metric,
+        // and DL >= Lev means a DL-ball is always contained in the Lev
+        // window, so this never skips a qualifying candidate.
+        let low = lev - max_distance
+        let high = lev + max_distance
         for (edge_dist, child) in node.children.iter() {
           if edge_dist >= low && edge_dist <= high {
             stack.push(child)

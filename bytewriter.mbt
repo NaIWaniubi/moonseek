@@ -72,12 +72,14 @@ pub fn ByteWriter::to_bytes(self : ByteWriter) -> Bytes {
 ///|
 /// Varint (LEB128), string, double and u32 writers matching codec.mbt.
 pub fn ByteWriter::write_varint(self : ByteWriter, value : Int32) -> Unit {
-  let mut v = value
+  // Negative values encode as their unsigned 32-bit bit pattern, exactly
+  // like codec.mbt's write_varint (the two must stay byte-compatible).
+  let mut v = value.reinterpret_as_uint()
   while v >= 0x80 {
-    self.push(((v & 0x7F) | 0x80).to_byte())
+    self.push(((v & 0x7F) | 0x80).reinterpret_as_int().to_byte())
     v = v >> 7
   }
-  self.push(v.to_byte())
+  self.push(v.reinterpret_as_int().to_byte())
 }
 
 ///|

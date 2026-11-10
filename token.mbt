@@ -158,3 +158,8 @@ pub fn Analyzer::analyze(self : Analyzer, text : String) -> Array[Token] {
 pub fn tokenize(text : String) -> Array[Token] {
   Analyzer::default().analyze(text)
 }
+
+///|
+pub impl Default for Analyzer with fn default() -> Analyzer {
+  { lowercase: true, remove_stop_words: true, cjk_bigram: true, }
+}

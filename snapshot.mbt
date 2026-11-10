@@ -1,6 +1,6 @@
 ///|
 /// Snapshot format: a self-contained, checksummed byte image of an index.
-/// Layout: magic "MSK2" | payload | crc32(payload) as u32le.
+/// Layout: magic "MSK3" | payload | crc32(payload) as u32le.
 /// The payload is versioned; readers reject unknown versions and any
 /// checksum mismatch, so a torn write is detected rather than loaded.
 /// Version 2 adds stored original field texts (version 1 images are still
@@ -66,8 +66,14 @@ pub fn Index::to_bytes(self : Index) -> Bytes {
     }
   }
   // Facet values (live documents only, in doc order)
-  payload.write_varint(self.facets.length())
+  let live_facets : Array[Int32] = []
   for num in 0..<self.doc_ids.length() {
+    if self.facets.contains(num) && !self.deleted.contains(num) {
+      live_facets.push(num)
+    }
+  }
+  payload.write_varint(live_facets.length())
+  for num in live_facets {
     match self.facets.get(num) {
       Some(facets) => {
         payload.write_varint(num)

@@ -13,6 +13,9 @@ pub(all) enum Query {
   Not(Query, Query)
   /// Matches every live document.
   MatchAll
+  /// Matches every live document that has content in `field`. Produced by
+  /// `field:*`; unlike MatchAll it never leaks documents lacking the field.
+  MatchField(String)
 } derive(Eq, Debug)
 
 ///|
@@ -219,6 +222,23 @@ fn Parser::parse_primary(self : Parser) -> Query raise QueryError {
     }
     Some(Word(word)) => {
       self.pos += 1
+      // field:"phrase": the lexer stops a Word buffer at the quote, so
+      // this form arrives as Word("field:") followed by PhraseText. When
+      // the word ends with ':' and a phrase follows, fold both tokens
+      // into a field-scoped phrase node instead of falling through to
+      // parse_word (which would see an empty value and raise).
+      if word.has_suffix(":") && self.peek() is Some(PhraseText(text)) {
+        let f = word[:word.length() - 1].to_owned()
+        if !self.fields.contains(f) {
+          raise QueryError::UnknownField(f)
+        }
+        self.pos += 1
+        let terms = self.analyzer.analyze(text).map(fn(t) { t.term })
+        if terms.is_empty() {
+          raise QueryError::EmptyQuery
+        }
+        return Phrase(terms, Some(f))
+      }
       self.parse_word(word)
     }
     Some(NotOp) => {
@@ -247,7 +267,10 @@ fn Parser::parse_word(self : Parser, word : String) -> Query raise QueryError {
     None => (None, word)
   }
   if value == "*" {
-    return MatchAll
+    return match field {
+      Some(f) => MatchField(f)
+      None => MatchAll
+    }
   }
   if value.has_suffix("*") {
     let prefix = value[:value.length() - 1].to_owned()
@@ -297,6 +320,15 @@ fn Index::eval(self : Index, query : Query) -> @hashmap.HashMap[Int32, Double] {
       }
       result
     }
+    MatchField(field) => {
+      let result : @hashmap.HashMap[Int32, Double] = @hashmap.HashMap([])
+      for num in 0..<self.doc_ids.length() {
+        if !self.deleted.contains(num) && self.has_field_content(num, field) {
+          result.set(num, 1.0)
+        }
+      }
+      result
+    }
     Term(term, field) => self.eval_term(term, field)
     Phrase(terms, field) => self.eval_phrase(terms, field)
     Prefix(prefix, field) => self.eval_prefix(prefix, field)
@@ -320,11 +352,44 @@ fn Index::eval(self : Index, query : Query) -> @hashmap.HashMap[Int32, Double] {
       result
     }
     Not(left, right) => {
-      let result = self.eval(left)
-      for (doc, _) in self.eval(right).iter() {
-        result.remove(doc)
+      // Score provenance: only real scoring nodes may contribute. A
+      // leading NOT parses as Not(MatchAll, x); carrying MatchAll's
+      // constant 1.0 into the result would inflate every hit by 1.0 and
+      // make the total undiscoverable by explain. So when the left side
+      // is a pure selector (MatchAll / MatchField), the result scores
+      // come from nothing: exclusion only, every survivor scores 0.0.
+      let excluded = self.eval(right)
+      match left {
+        MatchAll => {
+          let result : @hashmap.HashMap[Int32, Double] = @hashmap.HashMap([])
+          for num in 0..<self.doc_ids.length() {
+            if !self.deleted.contains(num) && !excluded.contains(num) {
+              result.set(num, 0.0)
+            }
+          }
+          result
+        }
+        MatchField(f) => {
+          let result : @hashmap.HashMap[Int32, Double] = @hashmap.HashMap([])
+          for num in 0..<self.doc_ids.length() {
+            if !self.deleted.contains(num) &&
+              !excluded.contains(num) &&
+              self.has_field_content(num, f) {
+              result.set(num, 0.0)
+            }
+          }
+          result
+        }
+        _ => {
+          // A scored left branch (e.g. `rust AND NOT x`): keep its scores
+          // minus the excluded documents.
+          let result = self.eval(left)
+          for (doc, _) in excluded.iter() {
+            result.remove(doc)
+          }
+          result
+        }
       }
-      result
     }
   }
 }
@@ -332,6 +397,17 @@ fn Index::eval(self : Index, query : Query) -> @hashmap.HashMap[Int32, Double] {
 ///|
 fn Index::field_names(self : Index) -> Array[String] {
   self.schema.map(fn(f) { f.name })
+}
+
+///|
+/// True if a live document has analyzed content in `field`. A document may
+/// declare the schema but omit the field, so presence is judged from the
+/// field's stored lengths, not from doc existence.
+fn Index::has_field_content(self : Index, num : Int32, field : String) -> Bool {
+  match self.stats.get(field) {
+    Some(stats) => stats.lengths.contains(num)
+    None => false
+  }
 }
 
 ///|
@@ -487,6 +563,57 @@ fn Index::eval_phrase(
     }
   }
   result
+}
+
+///|
+/// Count the phrase occurrences of a multi-term phrase in one field of one
+/// document. This is the same count `eval_phrase` scores with, exposed so
+/// `explain` can reproduce the phrase frequency in its details.
+fn Index::phrase_count(
+  self : Index,
+  terms : Array[String],
+  field : String,
+  num : Int32,
+) -> Int32 {
+  if terms.length() < 2 {
+    return 0
+  }
+  let lists : Array[@hashmap.HashMap[Int32, Posting]] = []
+  for term in terms {
+    let by_doc : @hashmap.HashMap[Int32, Posting] = @hashmap.HashMap([])
+    for p in self.postings_of(field, term) {
+      by_doc.set(p.doc, p)
+    }
+    if by_doc.is_empty() {
+      return 0
+    }
+    lists.push(by_doc)
+  }
+  let posting = match lists[0].get(num) {
+    Some(p) => p
+    None => return 0
+  }
+  let mut count = 0
+  for start_pos in posting.positions {
+    let mut matched = true
+    for k in 1..<terms.length() {
+      match lists[k].get(num) {
+        Some(p) =>
+          if !p.positions.contains(start_pos + k) {
+            matched = false
+            break
+          }
+        None => {
+          matched = false
+          break
+        }
+      }
+    }
+    if matched {
+      count += 1
+    }
+  }
+  count
 }
 
 ///|

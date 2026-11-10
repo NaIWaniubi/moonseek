@@ -70,9 +70,13 @@ pub fn Index::explain(
   // expanded to the matching dictionary terms. Using the raw query terms
   // would list contributions that are not in the total.
   let details : Array[ScoreDetail] = []
-  let terms = explain_terms(self, parsed)
-  for term in terms {
-    for field in self.field_names() {
+  let leaves = explain_leaves(self, parsed)
+  for (term, field, phrase) in leaves {
+    let fields = match field {
+      Some(f) => [f]
+      None => self.field_names()
+    }
+    for field in fields {
       let postings = self.postings_of(field, term)
       // Postings are sorted by doc: binary search for this document.
       let mut lo = 0
@@ -95,6 +99,18 @@ pub fn Index::explain(
         Some(posting) => {
           let ctx = self.bm25_context(field, term)
           if ctx.valid {
+            // A phrase leaf carries the phrase count as its frequency;
+            // the raw posting frequency would overstate tf and make the
+            // detail unreproducible against eval_phrase's score.
+            let tf = match phrase {
+              Some(terms) => self.phrase_count(terms, field, doc_num)
+              None => posting.freq
+            }
+            let scored : Posting = {
+              doc: posting.doc,
+              freq: tf,
+              positions: [],
+            }
             let dl = self.stats[field].lengths
               .get_or_default(doc_num, 0)
               .to_double()
@@ -106,11 +122,11 @@ pub fn Index::explain(
             details.push({
               field,
               term,
-              tf: posting.freq,
+              tf,
               df: ctx.df,
               idf: ctx.idf,
               norm,
-              score: ctx.score(posting),
+              score: ctx.score(scored),
             })
           }
         }
@@ -224,22 +240,54 @@ pub fn Index::search_after(
 /// Prefix expands to the matching dictionary terms, Not contributes only
 /// its left branch.
 pub fn explain_terms(index : Index, query : Query) -> Array[String] {
+  let leaves = explain_leaves(index, query)
   let out : Array[String] = []
   let seen : @hashmap.HashMap[String, Unit] = @hashmap.HashMap([])
+  for (term, _, _) in leaves {
+    if !seen.contains(term) {
+      seen.set(term, ())
+      out.push(term)
+    }
+  }
+  out
+}
+
+///|
+/// One scored leaf: (term, field restriction, phrase terms?). `field` is
+/// None for an all-fields leaf; `phrase_terms` is Some(all terms) when the
+/// leaf's frequency is the phrase count rather than the posting frequency.
+type ExplainLeaf = (String, String?, Array[String]?)
+
+///|
+/// The evaluator's scoring leaves with their field scoping, mirroring
+/// `eval` exactly. Deduplication keeps the first occurrence per
+/// (term, field) pair; a term appearing both scoped and unscoped stays as
+/// two leaves because they score different posting sets.
+fn explain_leaves(index : Index, query : Query) -> Array[ExplainLeaf] {
+  let out : Array[ExplainLeaf] = []
+  let seen : @hashmap.HashMap[(String, String?), Unit] = @hashmap.HashMap([])
+  fn push(term : String, field : String?, phrase : Array[String]?) -> Unit {
+    let key = (term, field)
+    if !seen.contains(key) {
+      seen.set(key, ())
+      out.push((term, field, phrase))
+    }
+  }
+
   fn walk(node : Query) -> Unit {
     match node {
-      Term(term, _) =>
-        if !seen.contains(term) {
-          seen.set(term, ())
-          out.push(term)
-        }
-      Phrase(terms, _) =>
+      Term(term, field) => push(term, field, None)
+      Phrase(terms, field) =>
         if terms.length() > 0 {
-          let term = terms[0]
-          if !seen.contains(term) {
-            seen.set(term, ())
-            out.push(term)
-          }
+          push(
+            terms[0],
+            field,
+            if terms.length() > 1 {
+              Some(terms)
+            } else {
+              None
+            },
+          )
         }
       Prefix(prefix, field) => {
         let fields = match field {
@@ -248,9 +296,8 @@ pub fn explain_terms(index : Index, query : Query) -> Array[String] {
         }
         for f in fields {
           for term in index.terms_of(f) {
-            if term.has_prefix(prefix) && !seen.contains(term) {
-              seen.set(term, ())
-              out.push(term)
+            if term.has_prefix(prefix) {
+              push(term, Some(f), None)
             }
           }
         }
@@ -261,6 +308,7 @@ pub fn explain_terms(index : Index, query : Query) -> Array[String] {
       }
       Not(left, _) => walk(left)
       MatchAll => ()
+      MatchField(_) => ()
     }
   }
   walk(query)

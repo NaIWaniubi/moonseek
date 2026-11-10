@@ -210,7 +210,7 @@ fn main {
     } else {
       "misc"
     }
-    idx.set_facets("doc-\{i}", [("lang", [lang]), ("topic", [topic])])
+    let _ = idx.set_facets("doc-\{i}", [("lang", [lang]), ("topic", [topic])])
   }
   let set_us = @bench.monotonic_clock_end(tf)
   println("  set facets for 20k docs: " + us_to_ms(set_us).to_string() + " ms")

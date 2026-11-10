@@ -51,6 +51,27 @@ pub async fn SegmentedIndex::open_or_create(
     let entries = wal_decode(data.binary()) catch {
       e => raise StoreError::CorruptIndex(@debug.to_string(e))
     }
+    // Schema guard BEFORE any replay: an Add referencing a field absent
+    // from the snapshot schema would abort() deep inside Index::add
+    // (uncatchable, process dies on open). Fail as a catchable
+    // StoreError instead so callers can quarantine the directory.
+    let known : @hashmap.HashMap[String, Unit] = @hashmap.HashMap([])
+    for field in schema {
+      known.set(field.name, ())
+    }
+    for entry in entries {
+      match entry {
+        Add(doc) =>
+          for (name, _) in doc.fields {
+            if !known.contains(name) {
+              raise StoreError::CorruptIndex(
+                "wal references unknown field: " + name,
+              )
+            }
+          }
+        Delete(_) => ()
+      }
+    }
     for entry in entries {
       match entry {
         Add(doc) => seg.add(doc)
@@ -74,13 +95,47 @@ pub async fn SegmentedIndex::checkpoint(
   try {
     @fs.write_file(tmp, image, sync=Data)
     @fs.rename(tmp, dest)
+    // Order guarantee between the rename and the WAL truncation is what
+    // makes the crash window below safe: without syncing the directory
+    // entry, a power loss can persist the truncate before the rename,
+    // leaving "old snapshot + empty WAL" — every write since the last
+    // checkpoint lost even though checkpoint() returned. Sync the
+    // directory now so the rename is durable BEFORE the WAL is emptied.
+    // Windows: FlushFileBuffers needs write access on the directory
+    // handle; POSIX: fsync on a ReadOnly fd is enough. Without this
+    // (wasm/js), skip — those targets have no durability contract here.
+    sync_directory(dir)
     // The snapshot now covers everything; the WAL may be discarded.
-    // A crash between rename and truncate is safe: replaying the WAL
-    // on top of the new snapshot is idempotent.
+    // A crash between the dir sync and truncate is safe: replaying the
+    // WAL on top of the new snapshot is idempotent.
     @fs.write_file(dir + "/wal.log", b"", sync=Data)
   } catch {
     e => raise StoreError::IoError(e.to_string())
   }
+}
+
+///|
+// fsync the directory entry itself so a rename inside `dir` is durable
+// before subsequent writes. Windows: FlushFileBuffers rejects a
+// GENERIC_READ directory handle (Access denied), so open WriteOnly —
+// O_WRONLY on a directory succeeds there and OpenExisting carries no
+// truncate semantics. POSIX: opening a directory write-only fails with
+// EISDIR, so ReadOnly is used; fsync on that fd is exactly the
+// directory-entry durability primitive. A failure surfaces to the caller
+// as StoreError rather than silently skipping the ordering guarantee.
+#cfg(all(target="native", platform="windows"))
+async fn sync_directory(dir : String) -> Unit {
+  let f = @fs.open(dir, mode=WriteOnly)
+  defer f.close()
+  f.sync(only_data=false)
+}
+
+///|
+#cfg(all(target="native", not(platform="windows")))
+async fn sync_directory(dir : String) -> Unit {
+  let f = @fs.open(dir, mode=ReadOnly)
+  defer f.close()
+  f.sync(only_data=false)
 }
 
 ///|

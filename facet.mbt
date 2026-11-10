@@ -34,7 +34,10 @@ pub extend FacetFilter with @debug.Debug::{to_repr}
 /// Search options extending the basic query with facets and pagination.
 pub(all) struct SearchOptions {
   limit : Int32
-  /// Skip hits before this (score, id) cursor for stable pagination.
+  /// Numeric offset into the sorted result set: skip the first `offset`
+  /// hits. NOTE: unlike `Index::search_after`, this is NOT a (score, id)
+  /// cursor — pages can shift when documents are added or removed between
+  /// calls. Use `search_after` for stable cursor-based pagination.
   offset : Int32
   /// Facet filters: a document must match at least one value per filter.
   filters : Array[FacetFilter]
@@ -70,16 +73,20 @@ pub extend FacetedResult with @debug.Debug::{to_repr}
 
 ///|
 /// Set facet values for a document (replaces any previous values).
-/// The document must already exist in the index. Unknown fields are
+/// Returns false (and does nothing) when the document does not exist or
+/// is deleted; true when the values were stored. Unknown fields are
 /// created on the fly (facets don't need schema declaration).
 pub fn Index::set_facets(
   self : Index,
   id : String,
   facets : Array[(String, Array[String])],
-) -> Unit {
+) -> Bool {
   match self.doc_nums.get(id) {
-    Some(num) if !self.deleted.contains(num) => self.facets.set(num, facets)
-    _ => ()
+    Some(num) if !self.deleted.contains(num) => {
+      self.facets.set(num, facets)
+      true
+    }
+    _ => false
   }
 }
 
@@ -207,4 +214,74 @@ pub fn Index::search_faceted(
     facets.push((field, sorted))
   }
   { hits, total, facets, }
+}
+
+///|
+/// JSON serialization for result types (public API parity with web/api.mbt).
+pub fn Hit::to_json(self : Hit) -> Json {
+  let fields : Map[String, Json] = Map([])
+  fields["id"] = @json.to_json(self.id)
+  fields["score"] = @json.to_json(self.score)
+  Json::object(fields)
+}
+
+///|
+pub fn ScoreDetail::to_json(self : ScoreDetail) -> Json {
+  let fields : Map[String, Json] = Map([])
+  fields["field"] = @json.to_json(self.field)
+  fields["term"] = @json.to_json(self.term)
+  fields["tf"] = @json.to_json(self.tf)
+  fields["df"] = @json.to_json(self.df)
+  fields["idf"] = @json.to_json(self.idf)
+  fields["norm"] = @json.to_json(self.norm)
+  fields["score"] = @json.to_json(self.score)
+  Json::object(fields)
+}
+
+///|
+pub fn Explanation::to_json(self : Explanation) -> Json {
+  let fields : Map[String, Json] = Map([])
+  fields["id"] = @json.to_json(self.id)
+  fields["total_score"] = @json.to_json(self.total_score)
+  fields["details"] = Json::array(self.details.map(fn(d) { d.to_json() }))
+  Json::object(fields)
+}
+
+///|
+pub fn FacetCount::to_json(self : FacetCount) -> Json {
+  Json::array([@json.to_json(self.value), @json.to_json(self.count)])
+}
+
+///|
+pub fn SearchOptions::to_json(self : SearchOptions) -> Json {
+  let fields : Map[String, Json] = Map([])
+  fields["limit"] = @json.to_json(self.limit)
+  fields["offset"] = @json.to_json(self.offset)
+  Json::object(fields)
+}
+
+///|
+pub fn FacetFilter::to_json(self : FacetFilter) -> Json {
+  let fields : Map[String, Json] = Map([])
+  fields["field"] = @json.to_json(self.field)
+  fields["values"] = Json::array(self.values.map(fn(v) { @json.to_json(v) }))
+  Json::object(fields)
+}
+
+///|
+pub fn FacetedResult::to_json(self : FacetedResult) -> Json {
+  let fields : Map[String, Json] = Map([])
+  fields["hits"] = Json::array(self.hits.map(fn(h) { h.to_json() }))
+  fields["total"] = @json.to_json(self.total)
+  let facet_obj : Map[String, Json] = Map([])
+  for (name, counts) in self.facets {
+    facet_obj[name] = Json::array(counts.map(fn(c) { c.to_json() }))
+  }
+  fields["facets"] = Json::object(facet_obj)
+  Json::object(fields)
+}
+
+///|
+pub impl Default for SearchOptions with fn default() -> SearchOptions {
+  { limit: 10, offset: 0, filters: [], facet_fields: [], }
 }

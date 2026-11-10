@@ -1,9 +1,9 @@
 ///|
 /// A half-open character range [start, end) in a stored field's original text.
 /// Offsets count Unicode codepoints: neither bytes nor UTF-16 code units.
-pub(all) struct HighlightSpan {
+pub struct HighlightSpan {
   start : Int32
-  mut end : Int32
+  end : Int32
 } derive(Eq, Debug)
 
 ///|
@@ -37,7 +37,7 @@ fn collect_highlight_nodes(query : Query) -> Array[HighlightNode] {
         walk(right)
       }
       Not(left, _) => walk(left)
-      MatchAll => ()
+      MatchAll | MatchField(_) => ()
     }
   }
   walk(query)
@@ -160,8 +160,11 @@ fn merge_spans(spans : Array[HighlightSpan]) -> Array[HighlightSpan] {
     if merged.length() > 0 {
       let last = merged[merged.length() - 1]
       if span.start < last.end {
+        // Overlap: extend the last merged span in place. HighlightSpan's
+        // end field is immutable from outside the package, but merge_spans
+        // is the owner of freshly built spans, so rebuild the tail entry.
         if span.end > last.end {
-          last.end = span.end
+          merged[merged.length() - 1] = { start: last.start, end: span.end, }
         }
         continue
       }

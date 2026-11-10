@@ -83,8 +83,9 @@ fn wal_encode_entry(buf : Array[Byte], entry : WalEntry) -> Unit {
 /// header may appear at the start and again after any entry (each
 /// append batch to a fresh file carries one); a torn header *tail* is
 /// ignored. Stops silently at a torn or corrupt entry tail (crash
-/// recovery); raises only if the leading header is not a WAL, a
-/// mid-stream header is corrupt, or an entry type is unknown.
+/// recovery), including a frame whose type byte is not a known entry
+/// kind; raises only if the leading header is not a WAL or a mid-stream
+/// header is corrupt.
 pub fn wal_decode(data : Bytes) -> Array[WalEntry] raise CodecError {
   if data.length() < WAL_MAGIC.length() {
     // A shorter-than-magic prefix is a torn header write: nothing to replay.
@@ -171,10 +172,12 @@ fn is_wal_prefix(data : Bytes) -> Bool {
 }
 
 ///|
-/// Read one entry's type + payload. Returns None on a torn frame (the
-/// caller then stops replay). Raises on an unknown type byte: that is
-/// format corruption, not a torn write.
-fn wal_read_entry(reader : Reader) -> WalEntry? raise CodecError {
+/// Read one entry's type + payload. Returns None on a torn frame OR on an
+/// unknown type byte (the caller then stops replay): a single flipped bit
+/// in the frame header must degrade to prefix recovery, not make the
+/// whole WAL unreadable. The frame CRC still runs for known types, so a
+/// torn tail with a recognizable type byte is dropped the same way.
+fn wal_read_entry(reader : Reader) -> WalEntry? {
   let type_byte = reader.read_byte() catch { _ => return None }
   match type_byte.to_int() {
     WAL_TYPE_ADD => {
@@ -192,6 +195,6 @@ fn wal_read_entry(reader : Reader) -> WalEntry? raise CodecError {
       let id = reader.read_string() catch { _ => return None }
       Some(Delete(id))
     }
-    _ => raise CodecError::BadVersion(type_byte.to_int())
+    _ => None
   }
 }
