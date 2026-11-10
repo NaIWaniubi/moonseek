@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0 (2026-11-11)
+
+### Added
+- **`ByteWriter`** (`bytewriter.mbt`): preallocated `FixedArray[Byte]` buffer with amortized growth and `blit_from_bytes`. Snapshot serialization on the 17.6 MB stress image: 2.4 s → ~1.0 s; deserialize 1.7 s → ~0.8 s (single `blit` instead of per-byte HashMap-of-Array pushes).
+- **`docs/benchmark.md`**: performance whitepaper — environment, reproduction commands, full stress/`moon bench`/WasmGC tables, and an honest limitations section (single-threaded scheduler, per-query score map, no SIMD).
+- **`docs/comparison.md`**: 17-dimension feature matrix vs tantivy / Lucene / bleve with honest gaps and positioning.
+- **`examples/advanced`**: one runnable program exercising facets, BK-tree fuzzy, suggest, explain, sort orders, cursor pagination, highlight and snippet.
+- **Stress harness hardening**: explain is now measured 100× *before* the snapshot roundtrip — the earlier 1.9 s reading was GC-pause pollution from the 17 MB allocation immediately prior, not algorithmic cost (real: ~3.3 ms).
+
+### Changed
+- `Bm25Context` carries `df` so explain no longer recomputes document frequency per term.
+- `doc_freq` fast path: when the index has no tombstones, df is just the posting-list length (no per-element `deleted` probes).
+- Stress harness prints a revision table comparing Array-push vs ByteWriter serialization.
+
 ## 0.3.0 (2026-11-05)
 
 ### Added
