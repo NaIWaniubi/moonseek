@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>moonseek 控制台</title>
+<!--
+  moonseek web console - single file, zero dependencies, offline.
+  Pair with console.js (plain <script>, no import). Dark theme, Chinese UI.
+  All rendering goes through escapeHtml()/safeSnippet() in console.js.
+-->
+<style>
+  :root {
+    --bg: #0b0f14;
+    --bg2: #0d131b;
+    --panel: #121a24;
+    --panel2: #0f161f;
+    --border: #1f2b39;
+    --border2: #2a3a4d;
+    --fg: #d8e2ee;
+    --muted: #8394a8;
+    --dim: #5d6b7d;
+    --accent: #3ddc97;
+    --accent2: #4aa8ff;
+    --warn: #ffb454;
+    --err: #ff6b6b;
+    --mark: #ffd54a;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  code, .mono { font-family: var(--mono); font-variant-ligatures: none; }
+  a { color: var(--accent2); }
+
+  /* ---------- topbar ---------- */
+  .topbar {
+    position: sticky; top: 0; z-index: 50;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 10px 16px;
+    background: linear-gradient(180deg, #0e1620, #0b111a);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: baseline; gap: 8px; white-space: nowrap; }
+  .logo { color: var(--accent); font-size: 18px; line-height: 1; }
+  .brand-name { font-weight: 700; letter-spacing: .3px; font-size: 15px; }
+  .brand-sub { color: var(--dim); font-size: 12px; }
+  .conn { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+  .base-label { color: var(--muted); font-size: 12px; }
+  input, button, select, textarea { font-family: inherit; font-size: 13px; }
+  #base {
+    width: 240px; padding: 6px 9px;
+    background: #0a1017; color: var(--fg);
+    border: 1px solid var(--border2); border-radius: 7px; outline: none;
+  }
+  #base:focus { border-color: var(--accent2); box-shadow: 0 0 0 2px rgba(74,168,255,.15); }
+  button {
+    cursor: pointer; color: var(--fg);
+    background: #1a2533; border: 1px solid var(--border2);
+    border-radius: 7px; padding: 6px 12px;
+    transition: background .12s, border-color .12s;
+  }
+  button:hover { background: #223142; border-color: #38506c; }
+  button.primary { background: #123a2b; border-color: #1f6b4d; color: #b8f5da; }
+  button.primary:hover { background: #17503a; }
+  button.mini { padding: 3px 8px; font-size: 11.5px; border-radius: 6px; }
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #4a5563; box-shadow: 0 0 0 3px rgba(74,85,99,.18);
+    display: inline-block; flex: none;
+  }
+  .dot.ok { background: var(--accent); box-shadow: 0 0 0 3px rgba(61,220,151,.18); }
+  .dot.bad { background: var(--err); box-shadow: 0 0 0 3px rgba(255,107,107,.18); }
+  .status-text { color: var(--muted); font-size: 12px; }
+  .version { color: var(--dim); font-size: 12px; }
+
+  /* ---------- layout ---------- */
+  main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 350px;
+    gap: 14px;
+    padding: 14px 16px 40px;
+    max-width: 1560px; margin: 0 auto;
+    align-items: start;
+  }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+  .col-main, .col-side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 13px;
+  }
+  .panel > h2 {
+    margin: 0 0 10px; font-size: 12.5px; font-weight: 600;
+    color: #b9c8da; text-transform: uppercase; letter-spacing: .6px;
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .panel > h2 .hint { margin-left: auto; text-transform: none; letter-spacing: 0; }
+  .hint { color: var(--dim); font-size: 11px; font-weight: 400; }
+  .muted { color: var(--muted); }
+  .empty { color: var(--dim); padding: 10px 2px; font-size: 12.5px; }
+
+  /* ---------- search bar ---------- */
+  .searchbar { display: flex; gap: 8px; align-items: stretch; }
+  #q {
+    flex: 1; min-width: 0; padding: 11px 13px; font-size: 14px;
+    background: #0a1017; color: var(--fg);
+    border: 1px solid var(--border2); border-radius: 9px; outline: none;
+    font-family: var(--mono);
+  }
+  #q:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(61,220,151,.13); }
+  #search-btn { padding: 0 22px; font-size: 14px; background: #123a2b; border-color: #1f6b4d; color: #b8f5da; }
+  #search-btn:hover { background: #17503a; }
+  .limit-wrap { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; padding-left: 4px; }
+  .limit-wrap input { width: 64px; padding: 6px 7px; background: #0a1017; color: var(--fg); border: 1px solid var(--border2); border-radius: 7px; }
+
+  .search-meta {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    min-height: 20px; padding: 2px 2px 0; color: var(--muted); font-size: 12.5px;
+  }
+  .search-meta .k { color: var(--dim); }
+  .search-meta b { color: var(--fg); font-weight: 600; }
+  .pill { font-family: var(--mono); background: #0f1a24; border: 1px solid var(--border); border-radius: 20px; padding: 1px 9px; }
+
+  /* ---------- results ---------- */
+  .results { display: flex; flex-direction: column; gap: 10px; }
+  .hit {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid #24344a;
+    border-radius: 9px; padding: 10px 12px;
+  }
+  .hit:hover { border-left-color: var(--accent2); }
+  .hit-head { display: flex; align-items: center; gap: 10px; }
+  .hit-id { color: var(--accent2); font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+  .hit-rank { color: var(--dim); font-size: 11px; font-family: var(--mono); }
+  .hit-score {
+    margin-left: auto; flex: none;
+    font-family: var(--mono); font-size: 12px; color: var(--mark);
+    background: #1c1a0f; border: 1px solid #453c15; border-radius: 6px; padding: 1px 8px;
+  }
+  .hit-fields { margin-top: 6px; color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+  .hit-fields .fk { color: var(--dim); }
+  .hit-fields .fv { color: #aebdd0; }
+  .hit-snippet {
+    margin-top: 7px; color: #c7d3e2; font-size: 12.5px; line-height: 1.65;
+    word-break: break-word;
+  }
+  mark { background: rgba(255,213,74,.20); color: #ffeaa5; padding: 0 2px; border-radius: 3px; }
+  details.explain { margin-top: 8px; }
+  details.explain > summary {
+    cursor: pointer; color: var(--dim); font-size: 11.5px; user-select: none; width: fit-content;
+  }
+  details.explain > summary:hover { color: var(--accent2); }
+  table.explain-tbl { margin-top: 8px; border-collapse: collapse; width: 100%; font-size: 11.5px; font-family: var(--mono); }
+  table.explain-tbl th, table.explain-tbl td { text-align: right; padding: 3px 8px; border-bottom: 1px solid var(--border); }
+  table.explain-tbl th:first-child, table.explain-tbl td:first-child,
+  table.explain-tbl th:nth-child(2), table.explain-tbl td:nth-child(2) { text-align: left; }
+  table.explain-tbl th { color: var(--dim); font-weight: 500; }
+  table.explain-tbl td { color: #b7c5d6; }
+  table.explain-tbl td.num { color: #cfe3ff; }
+
+  .suggest {
+    margin-top: 4px; padding: 10px 12px; border-radius: 9px;
+    background: #1a1608; border: 1px solid #4a3d12; color: var(--warn); font-size: 13px;
+  }
+  .suggest b { color: #ffe08a; font-family: var(--mono); }
+  .suggest button { background: transparent; border-color: #6b5718; color: var(--warn); padding: 2px 9px; margin-left: 6px; }
+
+  /* ---------- facets ---------- */
+  .facet-group { margin-bottom: 12px; }
+  .facet-group:last-child { margin-bottom: 2px; }
+  .facet-title { color: #a9b9cc; font-size: 12px; margin-bottom: 6px; font-family: var(--mono); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 7px;
+    background: var(--panel2); border: 1px solid var(--border2); border-radius: 20px;
+    padding: 3px 10px; font-size: 12px; color: #c3d0e0;
+  }
+  .chip .chip-count { font-family: var(--mono); color: var(--dim); font-size: 11px; }
+  .chip:hover { border-color: #3c5573; background: #16202c; }
+  .chip.on { background: #123a2b; border-color: var(--accent); color: #b9f7dd; }
+  .chip.on .chip-count { color: #7fe4b8; }
+
+  /* ---------- stats ---------- */
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; position: relative; overflow: hidden; }
+  .stat-label { color: var(--dim); font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px; display: block; }
+  .stat-val { font-family: var(--mono); font-size: 15px; color: #dbe8f6; margin-top: 3px; display: block; }
+  .stat-bar { position: absolute; left: 0; bottom: 0; height: 3px; background: linear-gradient(90deg, var(--accent2), var(--accent)); opacity: .75; }
+  .stat.wide { grid-column: span 2; }
+
+  /* ---------- aggs ---------- */
+  .agg-config { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 10px; }
+  .agg-config label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+  .agg-config input { width: 90px; padding: 5px 7px; background: #0a1017; color: var(--fg); border: 1px solid var(--border2); border-radius: 6px; }
+  .agg-config input.num { width: 60px; }
+  .aggs { display: flex; flex-direction: column; gap: 12px; }
+  .agg-block { border-top: 1px dashed var(--border); padding-top: 10px; }
+  .agg-block:first-child { border-top: none; padding-top: 0; }
+  .agg-block-title { color: #a9b9cc; font-size: 11.5px; margin-bottom: 7px; font-family: var(--mono); }
+  .agg-block-title .tag { color: var(--dim); border: 1px solid var(--border2); border-radius: 5px; padding: 0 6px; margin-right: 7px; font-size: 10.5px; }
+  .bars { display: flex; flex-direction: column; gap: 4px; }
+  .bar-row { display: grid; grid-template-columns: 130px 1fr 54px; align-items: center; gap: 8px; font-size: 12px; }
+  .bar-key { font-family: var(--mono); color: #b7c5d6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar-track { background: #0a1017; border-radius: 4px; height: 14px; overflow: hidden; border: 1px solid var(--border); }
+  .bar-fill { height: 100%; background: linear-gradient(90deg, #2c6bd6, var(--accent2)); border-radius: 3px 0 0 3px; }
+  .bar-fill.hist { background: linear-gradient(90deg, #7a4dd6, #b07bff); }
+  .bar-num { font-family: var(--mono); color: var(--dim); text-align: right; }
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px; }
+  .stats-grid .cell { background: var(--panel2); border: 1px solid var(--border); border-radius: 7px; padding: 6px 8px; }
+  .stats-grid .cell .lbl { color: var(--dim); font-size: 10.5px; text-transform: uppercase; }
+  .stats-grid .cell .val { font-family: var(--mono); color: #dbe8f6; font-size: 14px; }
+
+  /* ---------- ingest ---------- */
+  input[type=file] { color: var(--muted); font-size: 12px; width: 100%; }
+  input[type=file]::file-selector-button {
+    background: #1a2533; color: var(--fg); border: 1px solid var(--border2);
+    border-radius: 6px; padding: 4px 10px; margin-right: 10px; cursor: pointer;
+  }
+  .ingest-hint { color: var(--dim); font-size: 11px; margin: 7px 0; line-height: 1.5; }
+  .progress { height: 6px; background: #0a1017; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; margin: 8px 0; }
+  .progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent2), var(--accent)); transition: width .15s; }
+  .ingest-status { font-size: 11.5px; color: var(--muted); font-family: var(--mono); min-height: 16px; }
+  .ingest-result { margin-top: 8px; font-size: 12px; }
+  .file-row { display: flex; gap: 8px; font-family: var(--mono); font-size: 11.5px; padding: 2px 0; border-bottom: 1px dotted var(--border); }
+  .file-row .fname { color: #b7c5d6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .file-row .fmeta { color: var(--dim); flex: none; }
+  .file-row .fok { color: var(--accent); }
+  .file-row .fbad { color: var(--err); }
+  #ingest-run { margin-top: 4px; width: 100%; }
+
+  /* ---------- cheatsheet ---------- */
+  table.cheats { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.cheats td { padding: 4px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  table.cheats td:first-child { color: var(--accent2); white-space: nowrap; font-size: 11.5px; }
+  table.cheats td:last-child { color: var(--muted); }
+  code.kbd { background: #0a1017; border: 1px solid var(--border2); border-radius: 4px; padding: 0 5px; color: #b7c5d6; }
+
+  /* ---------- toast ---------- */
+  .toast {
+    position: fixed; right: 16px; bottom: 16px; z-index: 100; max-width: 460px;
+    background: #2a1113; border: 1px solid #6b2226; color: #ffc9c9;
+    border-radius: 9px; padding: 10px 13px; font-size: 12.5px; line-height: 1.5;
+    box-shadow: 0 10px 30px rgba(0,0,0,.5); word-break: break-word;
+  }
+  .toast.ok { background: #0f2a1e; border-color: #1f6b4d; color: #b9f7dd; }
+  .toast .toast-close { float: right; margin-left: 10px; color: inherit; background: transparent; border: none; cursor: pointer; opacity: .7; }
+  .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid #2a3a4d; border-top-color: var(--accent2); border-radius: 50%; animation: sp .7s linear infinite; vertical-align: -1px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">&#9686;</span>
+    <span class="brand-name">moonseek</span>
+    <span class="brand-sub">搜索控制台</span>
+  </div>
+  <div class="conn">
+    <label class="base-label" for="base">服务地址</label>
+    <input id="base" class="mono" value="http://127.0.0.1:7700" spellcheck="false" autocomplete="off" aria-label="服务地址">
+    <button id="connect">连接</button>
+    <span id="dot" class="dot" title="未连接" aria-hidden="true"></span>
+    <span id="status-text" class="status-text">未连接</span>
+    <span id="version" class="version mono">&mdash;</span>
+  </div>
+</header>
+
+<main>
+  <!-- ======================= main column ======================= -->
+  <div class="col-main">
+    <section class="searchbar">
+      <input id="q" placeholder='搜索… term / "phrase"~3 / A AND B / field:term / pre*' spellcheck="false" autocomplete="off" aria-label="搜索">
+      <button id="search-btn" class="primary" type="button">搜索</button>
+      <label class="limit-wrap">limit
+        <input id="limit" class="mono" type="number" min="1" max="1000" value="10" aria-label="结果条数上限">
+      </label>
+    </section>
+
+    <div id="search-meta" class="search-meta muted">输入查询词后按 Enter 或点击「搜索」。</div>
+    <div id="suggest" class="suggest" hidden></div>
+    <div id="results" class="results"></div>
+
+    <section class="panel" id="aggs-panel">
+      <h2>聚合 <span class="hint">POST /search &middot; terms / stats / histogram</span></h2>
+      <div class="agg-config">
+        <label>stats 字段 <input id="agg-stats-field" class="mono" value="versions"></label>
+        <label>histogram 字段 <input id="agg-hist-field" class="mono" value="year"></label>
+        <label>interval <input id="agg-hist-interval" class="mono num" type="number" min="1" value="1"></label>
+        <button id="agg-run" type="button">运行聚合</button>
+      </div>
+      <div id="aggs" class="aggs"><div class="empty">尚未运行聚合。</div></div>
+    </section>
+  </div>
+
+  <!-- ======================= side column ======================= -->
+  <aside class="col-side">
+    <section class="panel">
+      <h2>分面筛选
+        <button id="clear-filters" class="mini" type="button" hidden>清除筛选</button>
+      </h2>
+      <div class="facet-title-config" style="margin-bottom:8px;display:flex;gap:6px;align-items:center;">
+        <span class="hint">分面字段</span>
+        <input id="facet-fields" class="mono" value="license,year" spellcheck="false" style="flex:1;min-width:0;padding:4px 7px;background:#0a1017;color:var(--fg);border:1px solid var(--border2);border-radius:6px;">
+      </div>
+      <div id="facets" class="facets"><div class="empty">搜索后显示分面。</div></div>
+    </section>
+
+    <section class="panel">
+      <h2>索引统计 <span class="hint">GET /_stats &middot; 每 2s</span></h2>
+      <div id="stats" class="stats"><div class="empty">等待连接…</div></div>
+    </section>
+
+    <section class="panel">
+      <h2>建索引 <span class="hint">POST /index/bulk</span></h2>
+      <input id="ingest-files" type="file" multiple accept=".json,.jsonl,.csv,.md,.txt" aria-label="选择要导入的文件">
+      <div class="ingest-hint">
+        .jsonl：每行一个 JSON 对象 &middot; .json：数组 / 对象 / JSONL &middot;
+        .csv：按逗号切分成字段（首行若为表头则用作字段名）&middot;
+        .md / .txt：整体作为 <code class="mono">desc</code>，文件名作为 <code class="mono">title</code>
+      </div>
+      <div id="ingest-progress" class="progress" hidden><div id="ingest-bar" class="progress-bar"></div></div>
+      <div id="ingest-status" class="ingest-status"></div>
+      <div id="ingest-files-list"></div>
+      <button id="ingest-run" class="primary" type="button">上传并索引</button>
+      <div id="ingest-result" class="ingest-result"></div>
+    </section>
+
+    <section class="panel">
+      <h2>查询语法速查</h2>
+      <table class="cheats">
+        <tbody>
+          <tr><td class="mono">term</td><td>全文匹配</td></tr>
+          <tr><td class="mono">"a b"</td><td>精确短语（位置相邻）</td></tr>
+          <tr><td class="mono">"a b"~3</td><td>松散短语：相邻词间最多 3 个词，顺序不变</td></tr>
+          <tr><td class="mono">A AND B / A OR B</td><td>布尔；并置即为隐式 AND</td></tr>
+          <tr><td class="mono">A NOT B</td><td>排除</td></tr>
+          <tr><td class="mono">field:term</td><td>限定字段（亦可 <span class="mono">field:"a b"~2</span>）</td></tr>
+          <tr><td class="mono">pre*</td><td>前缀（按字典序展开）</td></tr>
+          <tr><td class="mono">(A OR B) C</td><td>分组</td></tr>
+        </tbody>
+      </table>
+      <div class="hint" style="margin-top:8px">
+        CJK 以重叠二元组索引，中文可直接检索。<br>
+        快捷键：<code class="kbd mono">/</code> 聚焦搜索框，<code class="kbd mono">Esc</code> 清空。
+      </div>
+    </section>
+  </aside>
+</main>
+
+<div id="toast" class="toast" role="alert" hidden>
+  <button class="toast-close" type="button" aria-label="关闭">&times;</button>
+  <span id="toast-msg"></span>
+</div>
+
+<script src="console.js"></script>
+</body>
+</html>

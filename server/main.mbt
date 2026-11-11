@@ -1,0 +1,1664 @@
+///|
+/// moonseek-server: the HTTP search service.
+///
+/// A thin routing and serialization layer over the library. Everything that
+/// decides a result — analysis, scoring, ranking, aggregation — happens in the
+/// engine; this file only maps HTTP onto those calls, so the service and the
+/// embedded library cannot drift apart.
+///
+/// The wire contract is docs/api.md, written before the implementation.
+
+///|
+/// Process-wide state: the index plus the counters the stats endpoint reports.
+/// One struct is enough because `run_forever` runs each request handler to
+/// completion on a cooperative scheduler — nothing preempts a handler midway.
+struct ServerState {
+  mut index : @moonseek.Index
+  schema : Array[@moonseek.FieldSchema]
+  started_ms : UInt64
+  mut queries_served : Int64
+  mut indexed_docs : Int64
+  mut deleted_docs : Int64
+  /// Sum of query durations in milliseconds (@env.now() is ms, not us).
+  mut total_query_ms : Double
+  mut max_query_ms : Double
+  /// Ring buffer of recent query latencies, for a p99 that does not need a
+  /// histogram per request and does not grow with traffic.
+  recent : Array[Double]
+  mut recent_next : Int32
+  /// Shards this process coordinates. Empty means "answer from the local
+  /// index", which is the single-node case and also the shard case.
+  mut cluster : Array[ShardGroup]
+  /// Candidate pool asked of each shard before the coordinator's top-k cut.
+  mut pool_per_shard : Int32
+}
+
+///|
+fn ServerState::new(schema : Array[@moonseek.FieldSchema]) -> ServerState {
+  {
+    index: @moonseek.Index::new(schema),
+    schema,
+    started_ms: @env.now(),
+    queries_served: 0,
+    indexed_docs: 0,
+    deleted_docs: 0,
+    total_query_ms: 0.0,
+    max_query_ms: 0.0,
+    recent: Array::make(1024, 0.0),
+    recent_next: 0,
+    cluster: [],
+    pool_per_shard: 200,
+  }
+}
+
+///|
+fn ServerState::observe_query(self : ServerState, ms : Double) -> Unit {
+  self.queries_served += 1
+  self.total_query_ms += ms
+  if ms > self.max_query_ms {
+    self.max_query_ms = ms
+  }
+  self.recent[self.recent_next] = ms
+  self.recent_next = (self.recent_next + 1) % self.recent.length()
+}
+
+///|
+fn ServerState::avg_query_ms(self : ServerState) -> Double {
+  if self.queries_served == 0 {
+    0.0
+  } else {
+    self.total_query_ms / self.queries_served.to_double()
+  }
+}
+
+///|
+/// p99 over the filled prefix of the ring buffer, so the number is right from
+/// the first request instead of being diluted by unused zeros.
+fn ServerState::p99_query_ms(self : ServerState) -> Double {
+  let filled = if self.queries_served < self.recent.length().to_int64() {
+    self.recent_next
+  } else {
+    self.recent.length()
+  }
+  if filled <= 0 {
+    return 0.0
+  }
+  let values : Array[Double] = []
+  for i in 0..<filled {
+    values.push(self.recent[i])
+  }
+  values.sort()
+  let idx = (filled.to_double() * 0.99).to_int()
+  let clamped = if idx >= filled { filled - 1 } else { idx }
+  values[clamped]
+}
+
+///|
+/// Cap on `limit`, so one request cannot ask the server to materialize an
+/// entire index.
+const MAX_LIMIT : Int32 = 1000
+
+///|
+async fn main {
+  let argv = @env.args()
+  let mut addr_text = "127.0.0.1:7700"
+  let mut snapshot : String? = None
+  let mut assets_dir : String? = None
+  let mut schema_text = "title:6,keywords:3,desc:1,deps:1.5"
+  let mut shards_text = ""
+  let mut pool_per_shard : Int32 = 200
+  let mut shard_port : String? = None
+  let mut i = 1
+  while i < argv.length() {
+    let a = argv[i]
+    if a == "--addr" && i + 1 < argv.length() {
+      addr_text = argv[i + 1]
+      i += 2
+    } else if a == "--index" && i + 1 < argv.length() {
+      snapshot = Some(argv[i + 1])
+      i += 2
+    } else if a == "--assets" && i + 1 < argv.length() {
+      assets_dir = Some(argv[i + 1])
+      i += 2
+    } else if a == "--schema" && i + 1 < argv.length() {
+      schema_text = argv[i + 1]
+      i += 2
+    } else if a == "--shards" && i + 1 < argv.length() {
+      shards_text = argv[i + 1]
+      i += 2
+    } else if a == "--pool" && i + 1 < argv.length() {
+      pool_per_shard = @string.parse_int(argv[i + 1]) catch { _ => 200 }
+      i += 2
+    } else if a == "--shard-port" && i + 1 < argv.length() {
+      shard_port = Some(argv[i + 1])
+      i += 2
+    } else if a == "--help" {
+      println(
+        "moonseek-server [--addr host:port] [--index snap.msk] [--assets dir] [--schema name:w,...] [--shards h:p[|r],...] [--pool N] [--shard-port host:port]",
+      )
+      return ()
+    } else {
+      println("unknown argument: \{a}")
+      return ()
+    }
+  }
+  let schema = match parse_schema(schema_text) {
+    Some(s) => s
+    None => {
+      println("bad --schema: \{schema_text}")
+      return ()
+    }
+  }
+  let state = ServerState::new(schema)
+  match snapshot {
+    Some(path) => {
+      let file = @fs.read_file(path) catch {
+        e => {
+          println("cannot read \{path}: \{e}")
+          return ()
+        }
+      }
+      let loaded = file.binary()
+      let index = @moonseek.Index::from_bytes(loaded) catch {
+        e => {
+          println("cannot decode \{path}: \{e}")
+          return ()
+        }
+      }
+      let docs = index.doc_count()
+      state.index = index
+      println("loaded \{docs} documents from \{path}")
+    }
+    None => ()
+  }
+  // A coordinator owns no documents: it holds a shard list and fans out. Both
+  // roles run the same binary, so this is the only switch between them.
+  if !shards_text.is_empty() {
+    state.cluster = parse_shards(shards_text)
+    state.pool_per_shard = pool_per_shard
+    println(
+      "coordinating " + state.cluster.length().to_string() + " shard group(s)",
+    )
+  }
+  let assets : String? = assets_dir
+  let addr = @socket.Addr::parse(addr_text) catch {
+    e => {
+      println("bad address \{addr_text}: \{e}")
+      return ()
+    }
+  }
+  let server = @http.Server::Server(addr)
+  println("moonseek-server listening on http://\{addr_text}")
+  match assets {
+    Some(d) => println("serving console from \{d}")
+    None => ()
+  }
+  match shard_port {
+    Some(port) => {
+      // The shard listener runs alongside the HTTP server: one process can be a
+      // shard for a coordinator and a search API at the same time, which is how
+      // the cluster benchmark starts N shards without N binaries.
+      let shard_addr = @socket.Addr::parse(port) catch {
+        e => {
+          println("bad --shard-port " + port + ": " + e.to_string())
+          return ()
+        }
+      }
+      println("shard listener on tcp://" + port)
+      @async.with_task_group(async fn(group) {
+        let _ = group.spawn(async fn() {
+          run_shard_listener(state, shard_addr)
+        })
+        server.run_forever(async fn(req, reader, conn) {
+          handle(state, assets, req, reader, conn)
+        })
+      })
+    }
+    None =>
+      server.run_forever(async fn(req, reader, conn) {
+        handle(state, assets, req, reader, conn)
+      })
+  }
+}
+
+///|
+/// The shard protocol: one JSON object per connection, one JSON answer back,
+/// then close. Deliberately tiny — the coordinator needs exactly four
+/// operations, and a larger protocol is a larger thing to get wrong.
+async fn run_shard_listener(state : ServerState, addr : @socket.Addr) -> Unit {
+  let listener = @socket.TcpServer(addr)
+  listener.run_forever(async fn(sock, _peer) {
+    // Length-prefixed frames in both directions. Reading to EOF would deadlock
+    // against a client that sends a request and then waits for the answer.
+    let header = sock.read_exactly(4) catch { _ => return () }
+    let length = unframe_length(header)
+    if length <= 0 {
+      return ()
+    }
+    let body = sock.read_exactly(length) catch { _ => return () }
+    let text = @utf8.decode(body) catch { _ => return () }
+    let answer = shard_handle(state, text.trim().to_owned())
+    sock.write(frame(@utf8.encode(answer))) catch { _ => () }
+  })
+}
+
+///|
+/// Parse the optional `stats` block of a shard search request:
+/// `{"n": 3000, "df": {"f\u0000t": 12}, "avgdl": {"f": 41.2}}`.
+fn stats_from_request(obj : Map[String, Json]) -> @moonseek.ExternalStats? {
+  let stats_json = match obj.get("stats") {
+    Some(Object(m)) => m
+    _ => return None
+  }
+  let n = match stats_json.get("n") {
+    Some(Number(v, ..)) => v.to_int()
+    _ => 0
+  }
+  let df : Array[((String, String), Int32)] = []
+  match stats_json.get("df") {
+    Some(Object(pairs)) =>
+      for (key, value) in pairs.iter() {
+        match value {
+          Number(v, ..) => df.push((split_stat_key(key), v.to_int()))
+          _ => ()
+        }
+      }
+    _ => ()
+  }
+  let avgdl : Array[(String, Double)] = []
+  match stats_json.get("avgdl") {
+    Some(Object(pairs)) =>
+      for (field, value) in pairs.iter() {
+        match value {
+          Number(v, ..) => avgdl.push((field, v))
+          _ => ()
+        }
+      }
+    _ => ()
+  }
+  Some(@moonseek.ExternalStats::new(n, df~, avgdl~))
+}
+
+///|
+/// `"field\u0000term"` back into a pair. The NUL separator is unambiguous
+/// because neither a field name nor an analyzed term can contain one.
+fn split_stat_key(key : String) -> (String, String) {
+  match key.find("\u{0}") {
+    Some(idx) => (key[:idx].to_owned(), key[idx + 1:].to_owned())
+    None => (key, "")
+  }
+}
+
+///|
+/// Answer one shard request.
+fn shard_handle(state : ServerState, request : String) -> String {
+  let json = match parse_json_or_none(request) {
+    Some(j) => j
+    None => return "{\"error\":\"bad json\"}"
+  }
+  let obj = match json {
+    Object(o) => o
+    _ => return "{\"error\":\"not an object\"}"
+  }
+  let op = match obj.get("op") {
+    Some(String(s)) => s
+    _ => return "{\"error\":\"missing op\"}"
+  }
+  match op {
+    "ping" => "{\"ok\":true}"
+    "index" => {
+      let body = match obj.get("body") {
+        Some(String(s)) => s
+        _ => return "{\"error\":\"missing body\"}"
+      }
+      let text = apply_document(state, body) catch {
+        e => return error_json("bad_request", e.to_string())
+      }
+      state.indexed_docs += 1
+      text
+    }
+    "search" => {
+      let query = match obj.get("query") {
+        Some(String(s)) => s
+        _ => ""
+      }
+      let limit = match obj.get("limit") {
+        Some(Number(n, ..)) => n.to_int()
+        _ => 10
+      }
+      // A `stats` block means the coordinator wants globally consistent
+      // scoring: install the corpus-wide numbers for this one query, then take
+      // them straight back out. Leaving them installed would mis-score a later
+      // local query, which is the kind of bug that only shows up under load.
+      match stats_from_request(obj) {
+        Some(stats) => {
+          state.index.set_external_stats(Some(stats))
+          defer state.index.set_external_stats(None)
+          shard_search(state, query, limit)
+        }
+        None => shard_search(state, query, limit)
+      }
+    }
+    "stats" =>
+      // `df` and field lengths for the terms the coordinator named, so a
+      // two-phase query carries only the statistics it will read.
+      shard_stats(state, requested_terms(obj))
+    _ => "{\"error\":\"unknown op\"}"
+  }
+}
+
+///|
+/// The `[["term","field"], ...]` list a `stats` request carries.
+fn requested_terms(obj : Map[String, Json]) -> Array[(String, String)] {
+  let out : Array[(String, String)] = []
+  match obj.get("terms") {
+    Some(Array(items)) =>
+      for item in items {
+        match item {
+          Array(pair) if pair.length() == 2 =>
+            match (pair[0], pair[1]) {
+              (String(term), String(field)) => out.push((field, term))
+              _ => ()
+            }
+          _ => ()
+        }
+      }
+    _ => ()
+  }
+  out
+}
+
+///|
+fn shard_search(state : ServerState, query : String, limit : Int32) -> String {
+  let hits = state.index.search(query, limit~) catch {
+    e => return error_json("bad_request", e.to_string())
+  }
+  let items : Array[String] = []
+  for h in hits {
+    items.push(
+      "[" + @json.to_json(h.id).stringify() + "," + h.score.to_string() + "]",
+    )
+  }
+  // The match count has to be exact rather than "at least pool", or the
+  // coordinator's total would be a lower bound presented as a number. It must
+  // also not cost a second ranking: `search(limit=0)` builds and sorts every
+  // hit, which dominated the cluster's per-query latency until this became a
+  // count-only path.
+  let total = state.index.count(query) catch { _ => 0 }
+  "{\"hits\":[" + items.join(",") + "],\"docs\":" +
+  state.index.doc_count().to_string() + ",\"total\":" +
+  total.to_string() + "}"
+}
+
+///|
+/// Corpus statistics for the named (field, term) pairs, plus per-field length
+/// sums and live counts so the coordinator can compute a global `avgdl`.
+fn shard_stats(
+  state : ServerState,
+  terms : Array[(String, String)],
+) -> String {
+  let entries : Array[String] = []
+  let fields_seen : Array[String] = []
+  for (field, term) in terms {
+    let key = stat_key(field, term)
+    entries.push(
+      @json.to_json(key).stringify() + ":" +
+      state.index.doc_freq(field, term).to_string(),
+    )
+    if !fields_seen.contains(field) {
+      fields_seen.push(field)
+    }
+  }
+  let lengths : Array[String] = []
+  let counts : Array[String] = []
+  for field in fields_seen {
+    // O(1) from the index's own per-field statistics. The previous version
+    // re-analyzed every document's text to recount tokens, which turned a
+    // statistics round into a full re-index and cost ~45 ms per query.
+    lengths.push(
+      @json.to_json(field).stringify() + ":" +
+      state.index.field_length_total(field).to_string(),
+    )
+    counts.push(
+      @json.to_json(field).stringify() + ":" +
+      state.index.field_doc_count(field).to_string(),
+    )
+  }
+  "{\"docs\":" + state.index.doc_count().to_string() + ",\"df\":{" +
+  entries.join(",") + "},\"field_lengths\":{" + lengths.join(",") +
+  "},\"field_counts\":{" + counts.join(",") + "}}"
+}
+
+
+///|
+/// Parse `name:weight,name:weight` into a schema.
+fn parse_schema(text : String) -> Array[@moonseek.FieldSchema]? {
+  let out : Array[@moonseek.FieldSchema] = []
+  for part in text.split(",") {
+    let trimmed = part.trim()
+    if trimmed.is_empty() {
+      continue
+    }
+    match trimmed.find(":") {
+      Some(idx) => {
+        let name = trimmed[:idx].to_owned()
+        let weight = @string.parse_double(trimmed[idx + 1:].to_owned()) catch {
+          _ => return None
+        }
+        out.push({ name, weight })
+      }
+      None => return None
+    }
+  }
+  if out.is_empty() {
+    None
+  } else {
+    Some(out)
+  }
+}
+
+///|
+/// Route one request. Every handler answers; nothing is allowed to fall through
+/// without writing a response.
+async fn handle(
+  state : ServerState,
+  assets : String?,
+  req : @http.Request,
+  reader : &@io.Reader,
+  conn : @http.ServerConnection,
+) -> Unit {
+  let path = req.path
+  let http_method = req.meth
+  let (route, query_text) = match path.find("?") {
+    Some(idx) => (path[:idx].to_owned(), path[idx + 1:].to_owned())
+    None => (path, "")
+  }
+  let params = parse_query_string(query_text)
+  match route {
+    "/healthz" => {
+      respond_json(conn, 200, "OK", health_json(state))
+      return ()
+    }
+    "/_stats" => {
+      respond_json(conn, 200, "OK", stats_json(state))
+      return ()
+    }
+    "/search" => {
+      let started = @env.now()
+      if http_method is Post {
+        let body = read_body(reader)
+        let parsed = @json.parse(body) catch {
+          e =>
+            return respond_json(
+              conn,
+              400,
+              "Bad Request",
+              error_json("bad_request", "bad json: " + @debug.to_string(e)),
+            )
+        }
+        let text = do_search(state, params, Some(parsed)) catch {
+          e =>
+            return respond_json(
+              conn,
+              400,
+              "Bad Request",
+              error_json("bad_request", e.to_string()),
+            )
+        }
+        state.observe_query((@env.now() - started).to_double())
+        respond_json(conn, 200, "OK", text)
+        return ()
+      }
+      let text = do_search(state, params, None) catch {
+        e =>
+          return respond_json(
+            conn,
+            400,
+            "Bad Request",
+            error_json("bad_request", e.to_string()),
+          )
+      }
+      state.observe_query((@env.now() - started).to_double())
+      respond_json(conn, 200, "OK", text)
+      return ()
+    }
+    "/_dfs" => {
+      // Diagnostics for the two-phase path: what the coordinator gathered.
+      if state.cluster.is_empty() {
+        return respond_json(
+          conn,
+          400,
+          "Bad Request",
+          error_json("bad_request", "not a coordinator"),
+        )
+      }
+      let q = get_param(params, "q")
+      let config : ClusterConfig = {
+        shards: state.cluster,
+        pool_per_shard: state.pool_per_shard,
+        timeout_ms: 2000,
+      }
+      let body = match query_terms_local(state, q) {
+        Some(terms) => {
+          let gathered = cluster_gather_stats(config, terms)
+          stats_to_json(gathered)
+        }
+        None => error_json("bad_request", "query terms are shard-dependent")
+      }
+      respond_json(conn, 200, "OK", body)
+      return ()
+    }
+    "/suggest" => {
+      let q = get_param(params, "q")
+      let fields : Map[String, Json] = Map([])
+      fields["suggestion"] = @json.to_json(state.index.suggest(q).unwrap_or(""))
+      let fuzzy : Array[Json] = []
+      for m in state.index.fuzzy_terms(q, max_distance=2) {
+        fuzzy.push(Json::array([@json.to_json(m.term), @json.to_json(m.distance)]))
+      }
+      fields["fuzzy"] = Json::array(fuzzy)
+      respond_json(conn, 200, "OK", Json::object(fields).stringify())
+      return ()
+    }
+    "/terms" => {
+      respond_json(conn, 200, "OK", terms_json(state, params))
+      return ()
+    }
+    "/explain" => {
+      let id = get_param(params, "id")
+      let q = get_param(params, "q")
+      // A malformed query is the client's fault (400); a well-formed query that
+      // matches nothing is a missing document (404). Parse first so the two are
+      // distinguished instead of collapsed into one error.
+      let parsed = @moonseek.parse_query(
+        q,
+        analyzer=state.index.analyzer(),
+        fields=schema_names(state),
+      ) catch {
+        e =>
+          return respond_json(
+            conn,
+            400,
+            "Bad Request",
+            error_json("bad_request", e.to_string()),
+          )
+      }
+      let _ = parsed
+      // With a query that parsed, explain cannot fail; the catch keeps the
+      // handler's signature free of raise.
+      let explained : @moonseek.Explanation? = state.index.explain(q, id) catch {
+        _ => None
+      }
+      match explained {
+        Some(e) => respond_json(conn, 200, "OK", e.to_json().stringify())
+        None =>
+          respond_json(
+            conn,
+            404,
+            "Not Found",
+            error_json("not_found", "no such document or no match: " + id),
+          )
+      }
+      return ()
+    }
+    "/index" => {
+      if http_method is Post {
+        let body = read_body(reader)
+        let text = apply_document(state, body) catch {
+          e =>
+            return respond_json(
+              conn,
+              400,
+              "Bad Request",
+              error_json("bad_request", e.to_string()),
+            )
+        }
+        state.indexed_docs += 1
+        respond_json(conn, 202, "Accepted", text)
+        return ()
+      }
+      if http_method is Delete {
+        let id = get_param(params, "id")
+        let deleted = state.index.delete(id)
+        if deleted {
+          state.deleted_docs += 1
+        }
+        let fields : Map[String, Json] = Map([])
+        fields["deleted"] = @json.to_json(deleted)
+        respond_json(conn, 200, "OK", Json::object(fields).stringify())
+        return ()
+      }
+    }
+    "/index/bulk" => {
+      if http_method is Post {
+        let body = read_body(reader)
+        respond_json(conn, 200, "OK", index_bulk(state, body))
+        return ()
+      }
+    }
+    _ => ()
+  }
+  if (serve_asset(assets, route, conn)) {
+    return ()
+  }
+  respond_json(
+    conn,
+    404,
+    "Not Found",
+    error_json("not_found", "no route for " + route),
+  )
+}
+
+///|
+/// The field a snippet is taken from when the client does not name one.
+fn prose_field(state : ServerState) -> String {
+  let mut best = ""
+  let mut best_weight = 1.0e300
+  for f in state.schema {
+    if f.name == "body" {
+      return "body"
+    }
+    if f.weight < best_weight {
+      best_weight = f.weight
+      best = f.name
+    }
+  }
+  best
+}
+
+///|
+/// Declared field names, for query parsing.
+fn schema_names(state : ServerState) -> Array[String] {
+  let out : Array[String] = []
+  for f in state.schema {
+    out.push(f.name)
+  }
+  out
+}
+
+///|
+/// Serve a file from the console directory. Returns true when it answered.
+async fn serve_asset(
+  assets : String?,
+  route : String,
+  conn : @http.ServerConnection,
+) -> Bool {
+  let dir = match assets {
+    Some(d) => d
+    None => return false
+  }
+  let relative = if route == "/" || route.is_empty() {
+    "index.html"
+  } else if route.has_prefix("/") {
+    route[1:].to_owned()
+  } else {
+    route
+  }
+  // Path-traversal guard: the request must not escape the asset directory.
+  if relative.contains("..") {
+    return false
+  }
+  let full = dir + "/" + relative
+  let file = @fs.read_file(full) catch { _ => return false }
+  let text = file.text() catch { _ => return false }
+  let content_type = if relative.has_suffix(".html") {
+    "text/html; charset=utf-8"
+  } else if relative.has_suffix(".js") {
+    "text/javascript; charset=utf-8"
+  } else if relative.has_suffix(".css") {
+    "text/css; charset=utf-8"
+  } else if relative.has_suffix(".json") {
+    "application/json; charset=utf-8"
+  } else {
+    "application/octet-stream"
+  }
+  let headers : Map[@http.CaseInsensitiveString, String] = Map([])
+  headers[@http.CaseInsensitiveString("Content-Type")] = content_type
+  headers[@http.CaseInsensitiveString("Access-Control-Allow-Origin")] = "*"
+  conn.send_response(200, "OK", extra_headers=headers)
+  conn.write_string(text)
+  true
+}
+
+///|
+/// Read a request body fully.
+async fn read_body(reader : &@io.Reader) -> String {
+  let data = reader.read_all() catch { _ => return "" }
+  data.text() catch { _ => "" }
+}
+
+///|
+async fn respond_json(
+  conn : @http.ServerConnection,
+  code : Int,
+  reason : String,
+  body : String,
+) -> Unit {
+  let headers : Map[@http.CaseInsensitiveString, String] = Map([])
+  headers[@http.CaseInsensitiveString("Content-Type")] = "application/json; charset=utf-8"
+  headers[@http.CaseInsensitiveString("Access-Control-Allow-Origin")] = "*"
+  headers[@http.CaseInsensitiveString("Cache-Control")] = "no-store"
+  conn.send_response(code, reason, extra_headers=headers)
+  conn.write_string(body)
+}
+
+///|
+fn error_json(code : String, msg : String) -> String {
+  let fields : Map[String, Json] = Map([])
+  fields["error"] = @json.to_json(msg)
+  fields["code"] = @json.to_json(code)
+  Json::object(fields).stringify()
+}
+
+///|
+fn health_json(state : ServerState) -> String {
+  let fields : Map[String, Json] = Map([])
+  fields["status"] = @json.to_json("ok")
+  fields["version"] = @json.to_json("0.7.0")
+  fields["uptime_ms"] = @json.to_json(
+    (@env.now() - state.started_ms).to_int().to_double(),
+  )
+  Json::object(fields).stringify()
+}
+
+///|
+fn stats_json(state : ServerState) -> String {
+  let index = state.index
+  let fields : Map[String, Json] = Map([])
+  fields["docs"] = @json.to_json(index.doc_count())
+  fields["terms"] = @json.to_json(index.term_count())
+  let names : Array[Json] = []
+  for f in state.schema {
+    names.push(@json.to_json(f.name))
+  }
+  fields["fields"] = Json::array(names)
+  fields["snapshot_bytes"] = @json.to_json(index.to_bytes().length())
+  fields["queries_served"] = @json.to_json(state.queries_served.to_int())
+  fields["indexed_docs"] = @json.to_json(state.indexed_docs.to_int())
+  fields["deleted_docs"] = @json.to_json(state.deleted_docs.to_int())
+  fields["avg_query_ms"] = @json.to_json(state.avg_query_ms())
+  fields["p99_query_ms"] = @json.to_json(state.p99_query_ms())
+  fields["max_query_ms"] = @json.to_json(state.max_query_ms)
+  if !state.cluster.is_empty() {
+    // A coordinator owns no documents, so its own counters are all zero; the
+    // shard list is the only honest thing it can report about the corpus.
+    let groups : Array[Json] = []
+    for group in state.cluster {
+      let replicas : Array[Json] = []
+      for r in group.replicas {
+        replicas.push(@json.to_json(r))
+      }
+      let entry : Map[String, Json] = Map([])
+      entry["primary"] = @json.to_json(group.primary)
+      entry["replicas"] = Json::array(replicas)
+      groups.push(Json::object(entry))
+    }
+    fields["shards"] = Json::array(groups)
+    fields["role"] = @json.to_json("coordinator")
+  } else {
+    fields["role"] = @json.to_json("node")
+  }
+  Json::object(fields).stringify()
+}
+
+///|
+fn terms_json(state : ServerState, params : Array[(String, String)]) -> String {
+  let requested = get_param(params, "field")
+  let field = if requested.is_empty() {
+    match state.schema.get(0) {
+      Some(s) => s.name
+      None => ""
+    }
+  } else {
+    requested
+  }
+  let limit = int_param(params, "limit", 50)
+  let items : Array[Json] = []
+  let mut count = 0
+  for term in state.index.terms_of(field) {
+    if count >= limit {
+      break
+    }
+    items.push(
+      Json::array([
+        @json.to_json(term),
+        @json.to_json(state.index.doc_freq(field, term)),
+      ]),
+    )
+    count += 1
+  }
+  let fields : Map[String, Json] = Map([])
+  fields["terms"] = Json::array(items)
+  Json::object(fields).stringify()
+}
+
+///|
+/// Query string to (key, value) pairs, percent-decoded once.
+fn parse_query_string(text : String) -> Array[(String, String)] {
+  let out : Array[(String, String)] = []
+  if text.is_empty() {
+    return out
+  }
+  for pair in text.split("&") {
+    if pair.is_empty() {
+      continue
+    }
+    match pair.find("=") {
+      Some(idx) =>
+        out.push((
+          percent_decode(pair[:idx].to_owned()),
+          percent_decode(pair[idx + 1:].to_owned()),
+        ))
+      None => out.push((percent_decode(pair.to_owned()), ""))
+    }
+  }
+  out
+}
+
+///|
+/// Percent- and plus-decoding. Operates on bytes, so a multi-byte UTF-8
+/// sequence encoded as `%E4%B8%AD` is reassembled before the string is built —
+/// decoding per character would corrupt it.
+fn percent_decode(text : String) -> String {
+  if !text.contains("%") && !text.contains("+") {
+    return text
+  }
+  let chars = text.to_array()
+  let bytes : Array[Int] = []
+  let mut i = 0
+  while i < chars.length() {
+    let c = chars[i]
+    if c == '+' {
+      bytes.push(32)
+      i += 1
+    } else if c == '%' && i + 2 < chars.length() {
+      match (hex_value(chars[i + 1]), hex_value(chars[i + 2])) {
+        (Some(h), Some(l)) => {
+          bytes.push(h * 16 + l)
+          i += 3
+        }
+        _ => {
+          // A stray '%' is literal text, not an error worth failing a request
+          // over.
+          bytes.push(c.to_int())
+          i += 1
+        }
+      }
+    } else {
+      let code = c.to_int()
+      if code < 128 {
+        bytes.push(code)
+      } else {
+        // Already-decoded non-ASCII: re-encode to UTF-8 bytes so the whole
+        // buffer can be decoded once at the end.
+        for b in @utf8.encode(c.to_string()).iter() {
+          bytes.push(b.to_int())
+        }
+      }
+      i += 1
+    }
+  }
+  let out = @buffer.Buffer(size_hint=bytes.length())
+  for b in bytes {
+    out.write_byte(b.to_byte())
+  }
+  @utf8.decode_lossy(out.to_bytes())
+}
+
+///|
+fn hex_value(c : Char) -> Int? {
+  let n = c.to_int()
+  if n >= 48 && n <= 57 {
+    Some(n - 48)
+  } else if n >= 97 && n <= 102 {
+    Some(n - 87)
+  } else if n >= 65 && n <= 70 {
+    Some(n - 55)
+  } else {
+    None
+  }
+}
+
+///|
+fn get_param(params : Array[(String, String)], key : String) -> String {
+  let mut out = ""
+  for (k, v) in params {
+    if k == key {
+      out = v
+    }
+  }
+  out
+}
+
+///|
+fn params_all(params : Array[(String, String)], key : String) -> Array[String] {
+  let out : Array[String] = []
+  for (k, v) in params {
+    if k == key {
+      out.push(v)
+    }
+  }
+  out
+}
+
+///|
+fn int_param(params : Array[(String, String)], key : String, fallback : Int32) -> Int32 {
+  let text = get_param(params, key)
+  if text.is_empty() {
+    return fallback
+  }
+  @string.parse_int(text) catch { _ => fallback }
+}
+
+///|
+fn double_param(
+  params : Array[(String, String)],
+  key : String,
+  fallback : Double,
+) -> Double {
+  let text = get_param(params, key)
+  if text.is_empty() {
+    return fallback
+  }
+  @string.parse_double(text) catch { _ => fallback }
+}
+
+///|
+fn bool_param(params : Array[(String, String)], key : String) -> Bool {
+  let text = get_param(params, key)
+  text == "true" || text == "1" || text == "yes"
+}
+
+///|
+/// The search path: parameters in, JSON out.
+///
+/// The query string carries `q` and pagination; the optional JSON body adds
+/// facets, aggregations, filters, sort and the vector query.
+async fn do_search(
+  state : ServerState,
+  params : Array[(String, String)],
+  body : Json?,
+) -> String raise {
+  let index = state.index
+  let mut query = get_param(params, "q")
+  let mut limit = int_param(params, "limit", 10)
+  let mut offset = int_param(params, "offset", 0)
+  let facet_fields : Array[String] = []
+  // Default highlight field: the lowest-weighted declared field. Weighting a
+  // field down is the schema's way of saying "this is the prose", so title/body
+  // picks body and the registry schema's title/keywords/desc/deps picks desc.
+  // Hardcoding "body" meant every hit on the registry came back with an empty
+  // snippet.
+  let mut highlight_field = prose_field(state)
+  let snippet_chars = int_param(params, "snippet_chars", 160)
+  let mut want_explain = bool_param(params, "explain")
+  let filters : Array[@moonseek.FacetFilter] = []
+  let aggs : Array[@moonseek.AggSpec] = []
+  let knn_vector : Array[Double] = []
+  let mut knn_field = ""
+  let mut knn_k : Int32 = 100
+  let mut fusion = @moonseek.Rrf
+  // Query-string forms first; the body overrides where both are present.
+  let facet_text = get_param(params, "facets")
+  if !facet_text.is_empty() {
+    for name in facet_text.split(",") {
+      if !name.is_empty() {
+        facet_fields.push(name.to_owned())
+      }
+    }
+  }
+  for raw in params_all(params, "filter") {
+    match raw.find(":") {
+      Some(idx) => push_filter(filters, raw[:idx].to_owned(), raw[idx + 1:].to_owned())
+      None => ()
+    }
+  }
+  for raw in params_all(params, "agg") {
+    match parse_agg_shorthand(raw) {
+      Some(spec) => aggs.push(spec)
+      None => ()
+    }
+  }
+  match body {
+    Some(Object(fields)) => {
+      match fields.get("query") {
+        Some(String(q)) => query = q
+        _ => ()
+      }
+      match fields.get("limit") {
+        Some(Number(n, ..)) => limit = n.to_int()
+        _ => ()
+      }
+      match fields.get("offset") {
+        Some(Number(n, ..)) => offset = n.to_int()
+        _ => ()
+      }
+      match fields.get("facets") {
+        Some(Array(items)) => {
+          facet_fields.clear()
+          for item in items {
+            if item is String(s) {
+              facet_fields.push(s)
+            }
+          }
+        }
+        _ => ()
+      }
+      match fields.get("filters") {
+        Some(Array(items)) =>
+          for item in items {
+            if item is Object(f) {
+              let field = match f.get("field") {
+                Some(String(s)) => s
+                _ => ""
+              }
+              if field == "" {
+                continue
+              }
+              match f.get("values") {
+                Some(Array(values)) =>
+                  for v in values {
+                    if v is String(sv) {
+                      push_filter(filters, field, sv)
+                    }
+                  }
+                _ => ()
+              }
+            }
+          }
+        _ => ()
+      }
+      match fields.get("aggs") {
+        Some(Array(items)) =>
+          for item in items {
+            match parse_agg_json(item) {
+              Some(spec) => aggs.push(spec)
+              None => ()
+            }
+          }
+        _ => ()
+      }
+      match fields.get("highlight") {
+        Some(String(s)) => highlight_field = s
+        _ => ()
+      }
+      match fields.get("explain") {
+        Some(True) => want_explain = true
+        _ => ()
+      }
+      match fields.get("knn") {
+        Some(Object(k)) => {
+          match k.get("field") {
+            Some(String(s)) => knn_field = s
+            _ => ()
+          }
+          match k.get("k") {
+            Some(Number(n, ..)) => knn_k = n.to_int()
+            _ => ()
+          }
+          match k.get("vector") {
+            Some(Array(values)) =>
+              for v in values {
+                match v {
+                  Number(n, ..) => knn_vector.push(n)
+                  _ => ()
+                }
+              }
+            _ => ()
+          }
+        }
+        _ => ()
+      }
+      match fields.get("fusion") {
+        Some(String(s)) =>
+          fusion = if s == "weighted" {
+            @moonseek.Weighted(double_param(params, "alpha", 0.5))
+          } else {
+            @moonseek.Rrf
+          }
+        _ => ()
+      }
+    }
+    _ => ()
+  }
+  if limit > MAX_LIMIT {
+    limit = MAX_LIMIT
+  }
+  if limit < 0 {
+    limit = 0
+  }
+  if offset < 0 {
+    offset = 0
+  }
+  let started = @env.now()
+  if !state.cluster.is_empty() {
+    // Cluster path. Hybrid retrieval is not fanned out: fusing two rankings
+    // that live on different shards would need per-shard vectors and a second
+    // merge, which is a different design (see docs/cluster.md).
+    if !knn_vector.is_empty() && !knn_field.is_empty() {
+      raise Failure::Failure(
+        "hybrid (knn) search is not available in coordinator mode",
+      )
+    }
+    // `dfs=true` asks for a ranking identical to a single-node index of the
+    // same corpus: gather df/avgdl/N from every shard first, then score with
+    // those. It costs one extra round trip per query, which is why it is
+    // opt-in rather than the default.
+    let want_dfs = bool_param(params, "dfs")
+    return render_cluster(state, query, limit, started, want_dfs)
+  }
+  if !knn_vector.is_empty() && !knn_field.is_empty() {
+    // Hybrid takes a different engine path: the two rankings must be fused
+    // before the top-k cut, not after.
+    let fused = index.hybrid_search(
+      query,
+      knn_vector,
+      knn_field,
+      limit~,
+      candidate_pool=knn_k,
+      fusion~,
+    )
+    return render_hybrid(
+      state,
+      fused,
+      query,
+      highlight_field,
+      snippet_chars,
+      started,
+      fusion,
+    )
+  }
+  let options : @moonseek.SearchOptions = {
+    limit,
+    offset,
+    filters,
+    facet_fields,
+  }
+  let result = index.search_faceted(query, options~)
+  let took = (@env.now() - started).to_double()
+  let fields : Map[String, Json] = Map([])
+  fields["query"] = @json.to_json(query)
+  fields["total"] = @json.to_json(result.total)
+  fields["took_ms"] = @json.to_json(took)
+  let hits : Array[Json] = []
+  for hit in result.hits {
+    hits.push(
+      hit_json(state, hit, query, highlight_field, snippet_chars, want_explain),
+    )
+  }
+  fields["hits"] = Json::array(hits)
+  let facet_obj : Map[String, Json] = Map([])
+  for (field, counts) in result.facets {
+    let arr : Array[Json] = []
+    for c in counts {
+      arr.push(Json::array([@json.to_json(c.value), @json.to_json(c.count)]))
+    }
+    facet_obj[field] = Json::array(arr)
+  }
+  fields["facets"] = Json::object(facet_obj)
+  if !aggs.is_empty() {
+    let agg_results = index.aggregate(query, aggs, filters=simple_filters(filters))
+    let arr : Array[Json] = []
+    for a in agg_results {
+      arr.push(a.to_json())
+    }
+    fields["aggs"] = Json::array(arr)
+  }
+  // Offer a correction only when there is nothing to show; next to real results
+  // a suggestion is noise.
+  if result.total == 0 {
+    let suggestion = index.suggest(query).unwrap_or("")
+    if !suggestion.is_empty() {
+      fields["suggest"] = @json.to_json(suggestion)
+    }
+  }
+  Json::object(fields).stringify()
+}
+
+///|
+fn simple_filters(
+  filters : Array[@moonseek.FacetFilter],
+) -> Array[(String, Array[String])] {
+  let out : Array[(String, Array[String])] = []
+  for f in filters {
+    out.push((f.field, f.values))
+  }
+  out
+}
+
+///|
+/// Fan a query out to the shards and render the merged answer.
+///
+/// Scoring uses each shard's own statistics by default. `dfs=true` switches on
+/// the two-phase path: gather global `df`/`avgdl`/`N`, install them on every
+/// shard, then score. Both are reported so a client can tell which ranking it
+/// got, and the cluster test measures the difference between them instead of
+/// asserting it away.
+async fn render_cluster(
+  state : ServerState,
+  query : String,
+  limit : Int32,
+  started : UInt64,
+  want_dfs : Bool,
+) -> String raise {
+  let config : ClusterConfig = {
+    shards: state.cluster,
+    pool_per_shard: state.pool_per_shard,
+    timeout_ms: 2000,
+  }
+  // Phase one, only when the client asked for consistent scoring. A query whose
+  // term set is shard-dependent (a prefix) cannot be handled this way, and
+  // saying so is better than silently mixing two rankings.
+  let mut dfs_applied = false
+  let mut dfs_note = ""
+  let stats : @moonseek.ExternalStats? = if want_dfs {
+    match query_terms_local(state, query) {
+      Some(terms) => {
+        let gathered = cluster_gather_stats(config, terms)
+        match gathered {
+          Some(_) => {
+            dfs_applied = true
+            gathered
+          }
+          None => {
+            dfs_note = "no shard answered the statistics round"
+            None
+          }
+        }
+      }
+      None => {
+        dfs_note = "query has shard-dependent terms (prefix); dfs not applied"
+        None
+      }
+    }
+  } else {
+    None
+  }
+  let result = cluster_search(config, query, limit, stats)
+  let took = (@env.now() - started).to_double()
+  let fields : Map[String, Json] = Map([])
+  fields["query"] = @json.to_json(query)
+  fields["total"] = @json.to_json(result.total)
+  fields["took_ms"] = @json.to_json(took)
+  fields["dfs"] = @json.to_json(dfs_applied)
+  if !dfs_note.is_empty() {
+    fields["dfs_note"] = @json.to_json(dfs_note)
+  }
+  let hits : Array[Json] = []
+  for (id, score) in result.hits {
+    let entry : Map[String, Json] = Map([])
+    entry["id"] = @json.to_json(id)
+    entry["score"] = @json.to_json(score)
+    hits.push(Json::object(entry))
+  }
+  fields["hits"] = Json::array(hits)
+  fields["facets"] = Json::object(Map([]))
+  // The shard accounting is part of the contract: a partial answer must say so.
+  let shards : Map[String, Json] = Map([])
+  shards["total"] = @json.to_json(result.shards_total)
+  shards["ok"] = @json.to_json(result.shards_ok)
+  shards["failed"] = @json.to_json(result.shards_failed)
+  let failed : Array[Json] = []
+  for address in result.failed {
+    failed.push(@json.to_json(address))
+  }
+  shards["failed_addresses"] = Json::array(failed)
+  fields["shards"] = Json::object(shards)
+  Json::object(fields).stringify()
+}
+
+///|
+/// The (field, term) pairs a query would score, resolved against the schema
+/// this process declares. Used to decide which statistics a df-gathering round
+/// needs to fetch.
+fn query_terms_local(
+  state : ServerState,
+  query : String,
+) -> Array[(String, String)]? {
+  let names : Array[String] = []
+  for f in state.schema {
+    names.push(f.name)
+  }
+  let probe = @moonseek.Index::new(state.schema)
+  let parsed = @moonseek.parse_query(
+    query,
+    analyzer=probe.analyzer(),
+    fields=names,
+  ) catch {
+    _ => return None
+  }
+  @moonseek.scoring_terms(probe, parsed)
+}
+
+///|
+/// Merge a filter value in: repeated `filter=license:MIT` and
+/// `filter=license:Apache-2.0` mean "either", while different fields mean "and".
+fn push_filter(
+  filters : Array[@moonseek.FacetFilter],
+  field : String,
+  value : String,
+) -> Unit {
+  for i in 0..<filters.length() {
+    if filters[i].field == field {
+      filters[i].values.push(value)
+      return ()
+    }
+  }
+  filters.push({ field, values: [value] })
+}
+
+///|
+/// `field:terms[:size]` / `field:stats` / `field:histogram:interval` /
+/// `field:percentiles` shorthand for the query-string form.
+fn parse_agg_shorthand(text : String) -> @moonseek.AggSpec? {
+  // split() yields StringViews; materialize to owned Strings so the match below
+  // can bind them by value.
+  let parts : Array[String] = []
+  for piece in text.split(":") {
+    parts.push(piece.to_owned())
+  }
+  match parts {
+    [field, "terms"] => Some(@moonseek.TermsAgg(field, 10))
+    [field, "terms", size] =>
+      Some(
+        @moonseek.TermsAgg(
+          field,
+          @string.parse_int(size) catch { _ => 10 },
+        ),
+      )
+    [field, "stats"] => Some(@moonseek.StatsAgg(field))
+    [field, "histogram", interval] =>
+      Some(
+        @moonseek.HistogramAgg(
+          field,
+          @string.parse_double(interval) catch { _ => 1.0 },
+        ),
+      )
+    [field, "percentiles"] => Some(@moonseek.PercentilesAgg(field, [50.0, 90.0, 99.0]))
+    _ => None
+  }
+}
+
+///|
+/// `{"kind":"terms","field":"license","size":10}` from the JSON form; `type` is
+/// accepted as an alias because that is what the console sends.
+fn parse_agg_json(item : Json) -> @moonseek.AggSpec? {
+  match item {
+    Object(fields) => {
+      let kind = match fields.get("kind") {
+        Some(String(s)) => s
+        _ =>
+          match fields.get("type") {
+            Some(String(s)) => s
+            _ => ""
+          }
+      }
+      let field = match fields.get("field") {
+        Some(String(s)) => s
+        _ => ""
+      }
+      if field == "" {
+        return None
+      }
+      match kind {
+        "terms" => {
+          let size = match fields.get("size") {
+            Some(Number(n, ..)) => n.to_int()
+            _ => 10
+          }
+          Some(@moonseek.TermsAgg(field, size))
+        }
+        "stats" => Some(@moonseek.StatsAgg(field))
+        "histogram" => {
+          let interval = match fields.get("interval") {
+            Some(Number(n, ..)) => n
+            _ => 1.0
+          }
+          Some(@moonseek.HistogramAgg(field, interval))
+        }
+        "percentiles" => {
+          let ps : Array[Double] = []
+          match fields.get("percentiles") {
+            Some(Array(items)) =>
+              for v in items {
+                match v {
+                  Number(n, ..) => ps.push(n)
+                  _ => ()
+                }
+              }
+            _ => ()
+          }
+          if ps.is_empty() {
+            ps.push(50.0)
+            ps.push(90.0)
+            ps.push(99.0)
+          }
+          Some(@moonseek.PercentilesAgg(field, ps))
+        }
+        _ => None
+      }
+    }
+    _ => None
+  }
+}
+
+///|
+/// One hit as JSON. The snippet comes from the engine (escaped, with CJK-aware
+/// `<mark>` spans), not from string surgery here.
+fn hit_json(
+  state : ServerState,
+  hit : @moonseek.Hit,
+  query : String,
+  highlight_field : String,
+  snippet_chars : Int32,
+  want_explain : Bool,
+) -> Json {
+  let index = state.index
+  let fields : Map[String, Json] = Map([])
+  fields["id"] = @json.to_json(hit.id)
+  fields["score"] = @json.to_json(hit.score)
+  let stored : Map[String, Json] = Map([])
+  for f in state.schema {
+    match index.get_field(hit.id, f.name) {
+      Some(text) => stored[f.name] = @json.to_json(text)
+      None => ()
+    }
+  }
+  fields["fields"] = Json::object(stored)
+  let snippet = index.snippet(
+    hit.id,
+    highlight_field,
+    query,
+    max_chars=snippet_chars,
+  ) catch {
+    _ => ""
+  }
+  fields["snippet"] = @json.to_json(snippet)
+  if want_explain {
+    let explained : @moonseek.Explanation? = index.explain(query, hit.id) catch {
+      _ => None
+    }
+    match explained {
+      Some(e) => fields["explain"] = e.to_json()
+      None => ()
+    }
+  }
+  Json::object(fields)
+}
+
+///|
+fn render_hybrid(
+  state : ServerState,
+  fused : Array[@moonseek.HybridHit],
+  query : String,
+  highlight_field : String,
+  snippet_chars : Int32,
+  started : UInt64,
+  fusion : @moonseek.Fusion,
+) -> String {
+  let took = (@env.now() - started).to_double()
+  let fields : Map[String, Json] = Map([])
+  fields["query"] = @json.to_json(query)
+  fields["total"] = @json.to_json(fused.length())
+  fields["took_ms"] = @json.to_json(took)
+  fields["fusion"] = @json.to_json(
+    match fusion {
+      @moonseek.Rrf => "rrf"
+      @moonseek.Weighted(_) => "weighted"
+    },
+  )
+  let hits : Array[Json] = []
+  for h in fused {
+    let hit : @moonseek.Hit = { id: h.id, score: h.score }
+    let json = hit_json(state, hit, query, highlight_field, snippet_chars, false)
+    match json {
+      Object(map) => {
+        map["lexical_rank"] = @json.to_json(h.lexical_rank)
+        map["vector_rank"] = @json.to_json(h.vector_rank)
+      }
+      _ => ()
+    }
+    hits.push(json)
+  }
+  fields["hits"] = Json::array(hits)
+  fields["facets"] = Json::object(Map([]))
+  Json::object(fields).stringify()
+}
+
+///|
+/// Apply one document JSON object: fields, facets, numeric values, vectors.
+fn apply_document(state : ServerState, body : String) -> String raise {
+  let json = @json.parse(body)
+  let index = state.index
+  let obj = match json {
+    Object(o) => o
+    _ => raise Failure::Failure("document must be a JSON object")
+  }
+  let id = match obj.get("id") {
+    Some(String(s)) => s
+    _ => raise Failure::Failure("document needs a string id")
+  }
+  let values : Map[String, String] = Map([])
+  match obj.get("fields") {
+    Some(Object(fs)) =>
+      for (name, value) in fs.iter() {
+        match value {
+          String(s) => values[name] = s
+          _ => ()
+        }
+      }
+    _ => ()
+  }
+  // Every declared field must be present in the document or `add` aborts on the
+  // missing ones, so the gaps are filled with empty text.
+  let doc_fields : Array[(String, String)] = []
+  for f in state.schema {
+    doc_fields.push((f.name, values.get_or_default(f.name, "")))
+  }
+  index.add({ id, fields: doc_fields })
+  match obj.get("facets") {
+    Some(Object(fs)) => {
+      let facets : Array[(String, Array[String])] = []
+      for (name, value) in fs.iter() {
+        match value {
+          Array(items) => {
+            let vals : Array[String] = []
+            for v in items {
+              if v is String(s) {
+                vals.push(s)
+              }
+            }
+            facets.push((name, vals))
+          }
+          String(single) => facets.push((name, [single]))
+          _ => ()
+        }
+      }
+      let _ = index.set_facets(id, facets)
+    }
+    _ => ()
+  }
+  match obj.get("nums") {
+    Some(Object(ns)) =>
+      for (name, value) in ns.iter() {
+        match value {
+          Number(n, ..) => {
+            let _ = index.set_num(id, name, n)
+          }
+          _ => ()
+        }
+      }
+    _ => ()
+  }
+  match obj.get("vector") {
+    Some(Object(vs)) =>
+      for (name, value) in vs.iter() {
+        match value {
+          Array(items) => {
+            let vec : Array[Double] = []
+            for v in items {
+              match v {
+                Number(n, ..) => vec.push(n)
+                _ => ()
+              }
+            }
+            if !index.set_vector(id, name, vec) {
+              let fields : Map[String, Json] = Map([])
+              fields["error"] = @json.to_json(
+                "vector rejected: dimensionality mismatch for field " + name,
+              )
+              fields["code"] = @json.to_json("bad_request")
+              return Json::object(fields).stringify()
+            }
+          }
+          _ => ()
+        }
+      }
+    _ => ()
+  }
+  let out : Map[String, Json] = Map([])
+  out["ok"] = @json.to_json(true)
+  out["id"] = @json.to_json(id)
+  Json::object(out).stringify()
+}
+
+///|
+/// `POST /index/bulk`: newline-delimited JSON documents.
+fn index_bulk(state : ServerState, body : String) -> String {
+  let started = @env.now()
+  let mut indexed = 0
+  let mut failed = 0
+  let first_error : Array[String] = []
+  for line in body.split("\n") {
+    let trimmed = line.trim().to_owned()
+    if trimmed.is_empty() {
+      continue
+    }
+    let text = apply_document(state, trimmed) catch {
+      _ => {
+        failed += 1
+        continue
+      }
+    }
+    // apply_document reports a rejected vector in its body rather than by
+    // raising, so bulk ingest has to inspect it to count honestly.
+    if text.contains("\"error\"") {
+      failed += 1
+      if first_error.is_empty() {
+        first_error.push(text)
+      }
+    } else {
+      indexed += 1
+    }
+  }
+  state.indexed_docs += indexed.to_int64()
+  let took = (@env.now() - started).to_double()
+  let fields : Map[String, Json] = Map([])
+  fields["indexed"] = @json.to_json(indexed)
+  fields["failed"] = @json.to_json(failed)
+  fields["took_ms"] = @json.to_json(took)
+  if !first_error.is_empty() {
+    fields["first_error"] = @json.to_json(first_error[0])
+  }
+  Json::object(fields).stringify()
+}

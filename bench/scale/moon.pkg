@@ -1,0 +1,21 @@
+// Large-scale benchmark harness (100k-1M docs).
+//
+// Note on dependencies: the specification named moonseek, core/bench,
+// core/env and core/json. File I/O for `--out` / `--index` is not available
+// in, and cannot be synthesised from, any of those four packages, so this
+// package also imports moonbitlang/async/fs (plus the core utf8 encoder it
+// consumes), exactly as tools/registry and tools/eval do for the same
+// reason.
+import {
+  "NaIWaniubi/moonseek",
+  "moonbitlang/core/bench",
+  "moonbitlang/core/env",
+  "moonbitlang/core/json",
+  "moonbitlang/core/encoding/utf8",
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+}
+
+supported_targets = "+native"
+
+pkgtype(kind: "executable")
