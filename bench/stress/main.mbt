@@ -187,11 +187,26 @@ fn main {
   // vocab_size - 1, so "w4999x" never exists and the case silently measured
   // an empty posting list.
   let cases : Array[(String, String)] = [
-    ("selective term (df " + idx.doc_freq("body", "w4998x").to_string() + ")", "w4998x"),
-    ("mid term (df " + idx.doc_freq("body", "w2500x").to_string() + ")", "w2500x"),
-    ("anchor term (df " + idx.doc_freq("body", "moonbit").to_string() + ")", "moonbit"),
-    ("saturated term (df " + idx.doc_freq("body", "search").to_string() + ")", "search"),
-    ("chinese bigram (df " + idx.doc_freq("body", "搜索").to_string() + ")", "搜索"),
+    (
+      "selective term (df " + idx.doc_freq("body", "w4998x").to_string() + ")",
+      "w4998x",
+    ),
+    (
+      "mid term (df " + idx.doc_freq("body", "w2500x").to_string() + ")",
+      "w2500x",
+    ),
+    (
+      "anchor term (df " + idx.doc_freq("body", "moonbit").to_string() + ")",
+      "moonbit",
+    ),
+    (
+      "saturated term (df " + idx.doc_freq("body", "search").to_string() + ")",
+      "search",
+    ),
+    (
+      "chinese bigram (df " + idx.doc_freq("body", "搜索").to_string() + ")",
+      "搜索",
+    ),
     ("boolean", "search AND engine"),
     ("phrase", "\"database index\""),
     ("sloppy phrase ~3", "\"database index\"~3"),

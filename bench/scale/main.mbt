@@ -51,7 +51,7 @@ fn Rng::next(self : Rng) -> UInt64 {
 }
 
 ///|
-fn Rng::below(self : Rng, n : Int) -> Int {
+fn Rng::below(self : Rng, n : Int32) -> Int32 {
   (self.next() % n.to_uint64()).to_int()
 }
 
@@ -85,7 +85,7 @@ fn us_ms(us : Double) -> Double {
 
 ///|
 /// Fixed-decimal formatting without locale or exponent surprises.
-fn fmt(x : Double, digits : Int) -> String {
+fn fmt(x : Double, digits : Int32) -> String {
   let mut scale = 1.0
   for _ in 0..<digits {
     scale = scale * 10.0
@@ -108,14 +108,14 @@ fn fmt(x : Double, digits : Int) -> String {
 
 ///|
 /// Bytes -> mebibytes as a Double.
-fn mb(bytes : Int) -> Double {
+fn mb(bytes : Int32) -> Double {
   bytes.to_double() / 1048576.0
 }
 
 ///|
 /// Parse a non-negative decimal integer. Returns None on any other input, so
 /// a typo never silently becomes the default.
-fn parse_int_string(s : String) -> Int? {
+fn parse_int_string(s : String) -> Int32? {
   let chars = s.to_array()
   if chars.length() == 0 {
     return None
@@ -133,7 +133,7 @@ fn parse_int_string(s : String) -> Int? {
 
 ///|
 /// The p-th percentile of an ascending array (nearest-rank).
-fn percentile(sorted : Array[Double], p : Int) -> Double {
+fn percentile(sorted : Array[Double], p : Int32) -> Double {
   if sorted.length() == 0 {
     return 0.0
   }
@@ -150,12 +150,12 @@ fn percentile(sorted : Array[Double], p : Int) -> Double {
 ///|
 /// Synthetic vocabulary index candidates, geometric so that the same list
 /// works at 100k and at 1M documents. The generated term is `w{k}x`.
-fn candidate_ks() -> Array[Int] {
+fn candidate_ks() -> Array[Int32] {
   [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 32, 40, 50, 64, 80, 100,
-    125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500,
-    3200, 4000, 5000, 6400, 8000, 10000, 12500, 16000, 20000, 25000, 32000,
-    40000, 50000, 64000, 80000, 100000, 125000, 160000, 199999,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 32, 40, 50, 64, 80, 100, 125,
+    160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000,
+    5000, 6400, 8000, 10000, 12500, 16000, 20000, 25000, 32000, 40000, 50000, 64000,
+    80000, 100000, 125000, 160000, 199999,
   ]
 }
 
@@ -168,9 +168,9 @@ fn candidate_ks() -> Array[Int] {
 fn pick_term(
   idx : @moonseek.Index,
   field : String,
-  target : Int,
-  vocab : Int,
-) -> (String, Int) {
+  target : Int32,
+  vocab : Int32,
+) -> (String, Int32) {
   let mut best = ("", -1)
   let mut best_delta = 1 << 30
   for k in candidate_ks() {
@@ -191,7 +191,7 @@ fn pick_term(
 ///|
 /// The term with the highest document frequency among the anchors and the
 /// very first synthetic words — i.e. the saturated case.
-fn pick_saturated(idx : @moonseek.Index) -> (String, Int) {
+fn pick_saturated(idx : @moonseek.Index) -> (String, Int32) {
   let cands : Array[String] = []
   for w in anchors() {
     cands.push(w)
@@ -217,7 +217,7 @@ fn pick_saturated(idx : @moonseek.Index) -> (String, Int) {
 /// keeps the matching terms contiguous in lexicographic order. Counting walks
 /// the (cached, sorted) term list once per candidate; at most six candidates,
 /// so this is a one-off O(vocab) cost, not a per-query one.
-fn pick_prefix(idx : @moonseek.Index, vocab : Int) -> (String, Int) {
+fn pick_prefix(idx : @moonseek.Index, vocab : Int32) -> (String, Int32) {
   let terms = idx.terms_of("body")
   let digits = (vocab - 1).to_string()
   let mut best = ("", -1)
@@ -249,10 +249,10 @@ fn pick_prefix(idx : @moonseek.Index, vocab : Int) -> (String, Int) {
 /// during generation so the memory model has measured inputs even when the
 /// postings themselves are too large to enumerate.
 fn make_index(
-  docs : Int,
-  vocab : Int,
+  docs : Int32,
+  vocab : Int32,
   verbose : Bool,
-) -> (@moonseek.Index, Int, Int) {
+) -> (@moonseek.Index, Int32, Int32) {
   let words : Array[String] = []
   for i in 0..<vocab {
     words.push("w" + i.to_string() + "x")
@@ -305,8 +305,8 @@ struct ShapeResult {
   p50 : Double
   p90 : Double
   p99 : Double
-  matches : Int
-  sink : Int
+  matches : Int32
+  sink : Int32
 }
 
 ///|
@@ -317,24 +317,18 @@ struct ShapeResult {
 fn timed_search(
   idx : @moonseek.Index,
   q : String,
-  samples : Int,
-  warmup : Int,
+  samples : Int32,
+  warmup : Int32,
 ) -> ShapeResult {
   for _ in 0..<warmup {
-    let _ = idx.search(q, limit=10) catch {
-      _ => []
-    }
+    let _ = idx.search(q, limit=10) catch { _ => [] }
   }
-  let matches = (idx.search(q, limit=0) catch {
-    _ => []
-  }).length()
+  let matches = (idx.search(q, limit=0) catch { _ => [] }).length()
   let xs : Array[Double] = []
   let mut sink = 0
   for _ in 0..<samples {
     let t = @bench.monotonic_clock_start()
-    let hits = idx.search(q, limit=10) catch {
-      _ => []
-    }
+    let hits = idx.search(q, limit=10) catch { _ => [] }
     let e = @bench.monotonic_clock_end(t)
     xs.push(e)
     sink += hits.length()
@@ -353,7 +347,7 @@ fn timed_search(
 /// Count postings and positions by walking the built index. Only used at
 /// modest scale; at a million documents the walk is the dominant cost and the
 /// totals are taken from the generator instead.
-fn enumerate_postings(idx : @moonseek.Index) -> (Int, Int) {
+fn enumerate_postings(idx : @moonseek.Index) -> (Int32, Int32) {
   let mut postings = 0
   let mut positions = 0
   for field in ["title", "body"] {
@@ -371,9 +365,7 @@ fn enumerate_postings(idx : @moonseek.Index) -> (Int, Int) {
 /// Deserialize or return None; lets the caller time `from_bytes` without an
 /// unwieldy result type.
 fn try_from_bytes(img : Bytes) -> @moonseek.Index? {
-  let ix = @moonseek.Index::from_bytes(img) catch {
-    _ => return None
-  }
+  let ix = @moonseek.Index::from_bytes(img) catch { _ => return None }
   Some(ix)
 }
 
@@ -410,7 +402,7 @@ fn snapshot_stats(
 ///|
 /// The numbers the Markdown row and the JSON sidecar are built from.
 struct Metrics {
-  terms : Int
+  terms : Int32
   snapshot_mb : Double
   ser_ms : Double
   deser_ms : Double
@@ -418,11 +410,11 @@ struct Metrics {
   sel_p50 : Double
   sat_p50 : Double
   sat_p99 : Double
-  deleted : Int
+  deleted : Int32
   del_sat_p50 : Double
   est_index_mb : Double
-  postings : Int
-  positions : Int
+  postings : Int32
+  positions : Int32
   enumerated : Bool
 }
 
@@ -431,12 +423,12 @@ struct Metrics {
 /// index and print the detailed sections.
 fn measure(
   idx : @moonseek.Index,
-  docs : Int,
-  samples : Int,
+  docs : Int32,
+  samples : Int32,
   roundtrip : Bool,
-  raw_bytes : Int,
-  total_tokens : Int,
-  vocab : Int,
+  raw_bytes : Int32,
+  total_tokens : Int32,
+  vocab : Int32,
 ) -> Metrics {
   let terms = idx.term_count()
   println("=== index ===")
@@ -446,7 +438,11 @@ fn measure(
     " terms=" +
     terms.to_string() +
     " raw_text=" +
-    (if raw_bytes == 0 { "n/a (loaded snapshot)" } else { fmt(mb(raw_bytes), 1) + " MB" }),
+    (if raw_bytes == 0 {
+      "n/a (loaded snapshot)"
+    } else {
+      fmt(mb(raw_bytes), 1) + " MB"
+    }),
   )
   // ---- query latency, clean index ----
   println(
@@ -463,14 +459,8 @@ fn measure(
   let bool_q = a[0] + " AND " + a[1]
   let pfx = pick_prefix(idx, vocab)
   let labels : Array[String] = [
-    "selective term (df~100)",
-    "mid term (df~docs/50)",
-    "saturated term",
-    "boolean AND",
-    "exact phrase",
-    "sloppy phrase ~3",
-    "prefix expansion",
-    "field-scoped title:",
+    "selective term (df~100)", "mid term (df~docs/50)", "saturated term", "boolean AND",
+    "exact phrase", "sloppy phrase ~3", "prefix expansion", "field-scoped title:",
   ]
   let queries : Array[String] = [
     sel.0,
@@ -525,11 +515,7 @@ fn measure(
   println("=== snapshot ===")
   let (snapshot_mb, ser_ms, deser_ms, deser_ok) = snapshot_stats(idx, roundtrip)
   println(
-    "  serialize: " +
-    fmt(ser_ms, 1) +
-    " ms, " +
-    fmt(snapshot_mb, 1) +
-    " MB",
+    "  serialize: " + fmt(ser_ms, 1) + " ms, " + fmt(snapshot_mb, 1) + " MB",
   )
   if roundtrip {
     println(
@@ -539,7 +525,9 @@ fn measure(
       deser_ok.to_string(),
     )
   } else {
-    println("  deserialize: skipped at this scale (image + restored index would both be resident)")
+    println(
+      "  deserialize: skipped at this scale (image + restored index would both be resident)",
+    )
   }
   // ---- deletion / tombstone cost ----
   println("=== after deleting 10% (tombstone cost) ===")
@@ -565,7 +553,7 @@ fn measure(
   // per BM25 context while tombstones exist; keep this phase small and skip
   // the wide prefix case so the run stays bounded.
   let del_samples = if samples > 50 { 50 } else { samples }
-  let post_idxs : Array[Int] = [0, 2, 3, 4]
+  let post_idxs : Array[Int32] = [0, 2, 3, 4]
   let mut del_sat_p50 = 0.0
   for i in post_idxs {
     let r = timed_search(idx, queries[i], del_samples, 5)
@@ -589,8 +577,16 @@ fn measure(
   // ---- memory model ----
   println("=== memory (model, not an in-process RSS reading) ===")
   let enumerated = docs <= 400000
-  let postings = if enumerated { enumerate_postings(idx).0 } else { total_tokens }
-  let positions = if enumerated { enumerate_postings(idx).1 } else { total_tokens }
+  let postings = if enumerated {
+    enumerate_postings(idx).0
+  } else {
+    total_tokens
+  }
+  let positions = if enumerated {
+    enumerate_postings(idx).1
+  } else {
+    total_tokens
+  }
   println(
     "  stored field text (measured, sum of generated bytes): " +
     fmt(mb(raw_bytes), 1) +
@@ -616,7 +612,9 @@ fn measure(
     fmt(est_index_mb, 1) +
     " MB  (raw_text + postings*48B + terms*100B)",
   )
-  println("  peak RSS: NOT measured in-process (core/env exposes no memory API);")
+  println(
+    "  peak RSS: NOT measured in-process (core/env exposes no memory API);",
+  )
   println("            measure externally, e.g. PowerShell")
   println("            `Get-Process scale | Select -Expand WorkingSet64`")
   {
@@ -647,8 +645,8 @@ const TABLE_SEP : String = "|---:|---:|---:|---:|---:|---:|"
 /// Merge this run's row into an existing table (by the scale column), so
 /// running 200k then 1M produces one two-row table. Unparseable input is
 /// discarded in favour of a fresh table.
-fn render_table(existing : String, new_row : String, new_key : Int) -> String {
-  let rows : Array[(Int, String)] = []
+fn render_table(existing : String, new_row : String, new_key : Int32) -> String {
+  let rows : Array[(Int32, String)] = []
   for line in existing.split("\n") {
     let l = line.trim().to_owned()
     if l.has_prefix("|") && !l.contains("---") && !l.contains("scale") {
@@ -687,8 +685,8 @@ fn render_table(existing : String, new_row : String, new_key : Int) -> String {
 /// console output. Written with `@json`'s constructors only (no indexing into
 /// parsed JSON, which the 0.10 deprecation replaced with pattern matching).
 fn render_json(
-  docs : Int,
-  vocab : Int,
+  docs : Int32,
+  vocab : Int32,
   docs_per_s : Double,
   m : Metrics,
   build_med_ms : Double,
@@ -736,12 +734,8 @@ fn usage() -> String {
 ///|
 /// Read a file, returning "" if it does not exist or cannot be decoded.
 async fn read_or_empty(path : String) -> String {
-  let raw = @fs.read_file(path) catch {
-    _ => return ""
-  }
-  let text = raw.text() catch {
-    _ => return ""
-  }
+  let raw = @fs.read_file(path) catch { _ => return "" }
+  let text = raw.text() catch { _ => return "" }
   text
 }
 
@@ -842,7 +836,9 @@ async fn main {
         }
         idx = loaded
         docs = idx.doc_count()
-        println("loaded snapshot " + p + " (" + idx.doc_count().to_string() + " docs)")
+        println(
+          "loaded snapshot " + p + " (" + idx.doc_count().to_string() + " docs)",
+        )
       }
       None => {
         println("--skip-build requires --index FILE")
@@ -876,7 +872,14 @@ async fn main {
       fmt(build_med_ms, 1) +
       " ms over " +
       runs.to_string() +
-      (if build_single { " run (single run)" } else { " runs, range " + fmt(us_ms(times[0]), 1) + "-" + fmt(us_ms(times[times.length() - 1]), 1) }),
+      (if build_single {
+        " run (single run)"
+      } else {
+        " runs, range " +
+        fmt(us_ms(times[0]), 1) +
+        "-" +
+        fmt(us_ms(times[times.length() - 1]), 1)
+      }),
     )
   }
   match save_index_path {
@@ -892,7 +895,9 @@ async fn main {
   // Above 300k docs that doubles resident memory, so it is off by default at
   // scale and can be forced with --roundtrip.
   let do_roundtrip = force_roundtrip || (roundtrip && docs <= 300000)
-  let m = measure(idx, docs, samples, do_roundtrip, raw_bytes, total_tokens, vocab)
+  let m = measure(
+    idx, docs, samples, do_roundtrip, raw_bytes, total_tokens, vocab,
+  )
   let docs_per_s = if build_med_ms > 0.0 {
     docs.to_double() / (build_med_ms / 1000.0)
   } else {
@@ -937,7 +942,9 @@ async fn main {
   }
   match json_path {
     Some(p) => {
-      let js = render_json(docs, vocab, docs_per_s, m, build_med_ms, build_single)
+      let js = render_json(
+        docs, vocab, docs_per_s, m, build_med_ms, build_single,
+      )
       @fs.write_file(p, @utf8.encode(js)) catch {
         e => println("cannot write \{p}: \{e}")
       }

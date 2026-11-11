@@ -33,10 +33,10 @@ pub fn configs() -> Array[Config] {
     {
       name: "bm25-uniform",
       schema: [
-        { name: "title", weight: 1.0 },
-        { name: "keywords", weight: 1.0 },
-        { name: "desc", weight: 1.0 },
-        { name: "deps", weight: 1.0 },
+        { name: "title", weight: 1.0, },
+        { name: "keywords", weight: 1.0, },
+        { name: "desc", weight: 1.0, },
+        { name: "deps", weight: 1.0, },
       ],
       field: "",
       isolates: "field weights: does the title/keyword boost earn its place?",
@@ -44,14 +44,14 @@ pub fn configs() -> Array[Config] {
     // Description only: what a naive single-field index would return.
     {
       name: "desc-only",
-      schema: [{ name: "desc", weight: 1.0 }],
+      schema: [{ name: "desc", weight: 1.0, }],
       field: "",
       isolates: "indexing only prose: how much do names and keywords matter?",
     },
     // Name only: the "just grep the package list" baseline.
     {
       name: "title-only",
-      schema: [{ name: "title", weight: 1.0 }],
+      schema: [{ name: "title", weight: 1.0, }],
       field: "",
       isolates: "the substring-search-the-names baseline every registry UI ships",
     },
@@ -59,8 +59,8 @@ pub fn configs() -> Array[Config] {
     {
       name: "metadata-only",
       schema: [
-        { name: "title", weight: 6.0 },
-        { name: "keywords", weight: 3.0 },
+        { name: "title", weight: 6.0, },
+        { name: "keywords", weight: 3.0, },
       ],
       field: "",
       isolates: "is indexing prose (the expensive part) worth anything?",
@@ -81,7 +81,7 @@ pub fn configs() -> Array[Config] {
 /// through the schema alone.
 pub fn build_for(config : Config, docs : Array[Json]) -> @moonseek.Index {
   let bm25 : @moonseek.Bm25Params = if config.name == "no-length-norm" {
-    { k1: 1.2, b: 0.0 }
+    { k1: 1.2, b: 0.0, }
   } else {
     @moonseek.Bm25Params::default()
   }

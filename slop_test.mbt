@@ -10,14 +10,14 @@
 
 ///|
 fn slop_index() -> @moonseek.Index {
-  let idx = @moonseek.Index::new([{ name: "body", weight: 1.0 }])
+  let idx = @moonseek.Index::new([{ name: "body", weight: 1.0, }])
   // "alpha beta" adjacent (slop 0), then a 1-token gap, then a 2-token gap,
   // then reversed order (must never match an ordered phrase).
-  idx.add({ id: "adjacent", fields: [("body", "alpha beta gamma delta")] })
-  idx.add({ id: "gap1", fields: [("body", "alpha x beta gamma")] })
-  idx.add({ id: "gap2", fields: [("body", "alpha x y beta gamma")] })
-  idx.add({ id: "reversed", fields: [("body", "beta alpha gamma")] })
-  idx.add({ id: "far", fields: [("body", "alpha x y z w beta")] })
+  idx.add({ id: "adjacent", fields: [("body", "alpha beta gamma delta")], })
+  idx.add({ id: "gap1", fields: [("body", "alpha x beta gamma")], })
+  idx.add({ id: "gap2", fields: [("body", "alpha x y beta gamma")], })
+  idx.add({ id: "reversed", fields: [("body", "beta alpha gamma")], })
+  idx.add({ id: "far", fields: [("body", "alpha x y z w beta")], })
   idx
 }
 
@@ -26,7 +26,7 @@ fn slop_ids(
   idx : @moonseek.Index,
   query : String,
 ) -> Array[String] raise @moonseek.QueryError {
-  let ids = (idx.search(query, limit=0)).map(fn(h) { h.id })
+  let ids = idx.search(query, limit=0).map(fn(h) { h.id })
   // lexicographic, so expectations read alphabetically (sort() is shortlex)
   ids.sort_by(fn(a, b) { a.lexical_compare(b) })
   ids
@@ -47,7 +47,9 @@ test "slop admits ordered matches within the gap budget" {
   assert_eq(slop_ids(idx, "\"alpha beta\"~1"), ["adjacent", "gap1"])
   // 2 tokens between -> slop 2; "far" has 4 and stays out.
   assert_eq(slop_ids(idx, "\"alpha beta\"~2"), ["adjacent", "gap1", "gap2"])
-  assert_eq(slop_ids(idx, "\"alpha beta\"~4"), ["adjacent", "far", "gap1", "gap2"])
+  assert_eq(slop_ids(idx, "\"alpha beta\"~4"), [
+    "adjacent", "far", "gap1", "gap2",
+  ])
 }
 
 ///|
@@ -76,7 +78,7 @@ test "slop is monotone: a larger budget is a superset" {
 
 ///|
 test "phrase frequency counts occurrences, not starting positions" {
-  let idx = @moonseek.Index::new([{ name: "body", weight: 1.0 }])
+  let idx = @moonseek.Index::new([{ name: "body", weight: 1.0, }])
   // "alpha x beta" appears three times. With slop 1 a naive implementation
   // would also count each of the three positions of "alpha" against each of
   // the three of "beta" that lie in range, giving 9 instead of 3.
@@ -84,7 +86,7 @@ test "phrase frequency counts occurrences, not starting positions" {
     id: "three",
     fields: [("body", "alpha x beta alpha x beta alpha x beta")],
   })
-  idx.add({ id: "once", fields: [("body", "alpha x beta")] })
+  idx.add({ id: "once", fields: [("body", "alpha x beta")], })
   let exp = idx.explain("\"alpha beta\"~1", "three")
   let detail = match exp {
     Some(e) =>
@@ -101,10 +103,10 @@ test "phrase frequency counts occurrences, not starting positions" {
 
 ///|
 test "slop works with three or more terms" {
-  let idx = @moonseek.Index::new([{ name: "body", weight: 1.0 }])
-  idx.add({ id: "tight", fields: [("body", "a b c")] })
-  idx.add({ id: "loose", fields: [("body", "a x b y c")] })
-  idx.add({ id: "too-loose", fields: [("body", "a x y b z w c")] })
+  let idx = @moonseek.Index::new([{ name: "body", weight: 1.0, }])
+  idx.add({ id: "tight", fields: [("body", "a b c")], })
+  idx.add({ id: "loose", fields: [("body", "a x b y c")], })
+  idx.add({ id: "too-loose", fields: [("body", "a x y b z w c")], })
   // Each of the two gaps costs 1 token in "loose", so slop 1 admits it.
   assert_eq(slop_ids(idx, "\"a b c\""), ["tight"])
   assert_eq(slop_ids(idx, "\"a b c\"~1"), ["loose", "tight"])
@@ -115,8 +117,8 @@ test "slop works with three or more terms" {
 ///|
 test "slop is scoped by the field prefix" {
   let idx = @moonseek.Index::new([
-    { name: "title", weight: 2.0 },
-    { name: "body", weight: 1.0 },
+    { name: "title", weight: 2.0, },
+    { name: "body", weight: 1.0, },
   ])
   idx.add({
     id: "a",
@@ -133,10 +135,9 @@ test "slop is scoped by the field prefix" {
 test "slop survives a boolean combination" {
   let idx = slop_index()
   // A sloppy phrase is a normal set operand.
-  assert_eq(
-    slop_ids(idx, "\"alpha beta\"~2 AND gamma"),
-    ["adjacent", "gap1", "gap2"],
-  )
+  assert_eq(slop_ids(idx, "\"alpha beta\"~2 AND gamma"), [
+    "adjacent", "gap1", "gap2",
+  ])
   // NOT with a sloppy phrase excludes exactly its matches.
   let all = slop_ids(idx, "*")
   let outside = slop_ids(idx, "\"alpha beta\"~1")
@@ -160,22 +161,20 @@ test "slop round-trips through a snapshot" {
 
 ///|
 test "CJK slop: distance between two CJK runs is gap-tolerant" {
-  let idx = @moonseek.Index::new([{ name: "body", weight: 1.0 }])
+  let idx = @moonseek.Index::new([{ name: "body", weight: 1.0, }])
   // Overlapping bigrams are what make "搜索引擎" a three-token exact phrase:
   // 全文0 文搜1 搜索2 索引3 引擎4. Note that inserting a character *breaks
   // the bigram chain itself* (索的 is a different term than 索引), so the
   // interesting slop case for CJK is the distance between two separate runs.
-  idx.add({ id: "compound", fields: [("body", "全文搜索引擎")] })
-  idx.add({ id: "one-gap", fields: [("body", "搜索 qq 引擎")] })
-  idx.add({ id: "two-gaps", fields: [("body", "搜索 qq zz 引擎")] })
+  idx.add({ id: "compound", fields: [("body", "全文搜索引擎")], })
+  idx.add({ id: "one-gap", fields: [("body", "搜索 qq 引擎")], })
+  idx.add({ id: "two-gaps", fields: [("body", "搜索 qq zz 引擎")], })
   // In "compound" 搜索(2) and 引擎(4) are one token apart, so slop 1 covers it.
   assert_eq(slop_ids(idx, "\"搜索 引擎\"~1"), ["compound", "one-gap"])
   assert_eq(slop_ids(idx, "\"搜索 引擎\"~2"), [
-    "compound",
-    "one-gap",
-    "two-gaps",
+    "compound", "one-gap", "two-gaps",
   ])
   // Exact adjacency of two separate runs still works at slop 0.
-  idx.add({ id: "tight", fields: [("body", "搜索 引擎")] })
+  idx.add({ id: "tight", fields: [("body", "搜索 引擎")], })
   assert_eq(slop_ids(idx, "\"搜索 引擎\""), ["tight"])
 }

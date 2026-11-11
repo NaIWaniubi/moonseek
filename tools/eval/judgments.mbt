@@ -46,25 +46,85 @@ pub(all) struct EvalQuery {
 pub fn eval_queries() -> Array[EvalQuery] {
   [
     // --- keyword queries: crowded topics, the hard ones for ranking ---
-    { text: "parser", judgement: Keywords("parser"), note: "232 packages declare it" },
-    { text: "wasm", judgement: Keywords("wasm"), note: "240 packages, name collision with title" },
-    { text: "json", judgement: Keywords("json"), note: "150 packages, several named *json*" },
-    { text: "cli", judgement: Keywords("cli"), note: "173 packages, name and keyword both hit" },
-    { text: "http", judgement: Keywords("http"), note: "95 packages" },
-    { text: "async", judgement: Keywords("async"), note: "47 packages, it is also a dependency hub" },
-    { text: "gui", judgement: Keywords("gui"), note: "sparse topic" },
-    { text: "database", judgement: Keywords("database"), note: "no package is *named* database" },
-    { text: "regexp", judgement: Keywords("regexp"), note: "small, precise topic" },
-    { text: "serialization", judgement: Keywords("serialization"), note: "long keyword, one token" },
-    { text: "compiler", judgement: Keywords("compiler"), note: "no title hits at all" },
-    { text: "benchmark", judgement: Keywords("benchmark"), note: "sparse topic" },
+    {
+      text: "parser",
+      judgement: Keywords("parser"),
+      note: "232 packages declare it",
+    },
+    {
+      text: "wasm",
+      judgement: Keywords("wasm"),
+      note: "240 packages, name collision with title",
+    },
+    {
+      text: "json",
+      judgement: Keywords("json"),
+      note: "150 packages, several named *json*",
+    },
+    {
+      text: "cli",
+      judgement: Keywords("cli"),
+      note: "173 packages, name and keyword both hit",
+    },
+    { text: "http", judgement: Keywords("http"), note: "95 packages", },
+    {
+      text: "async",
+      judgement: Keywords("async"),
+      note: "47 packages, it is also a dependency hub",
+    },
+    { text: "gui", judgement: Keywords("gui"), note: "sparse topic", },
+    {
+      text: "database",
+      judgement: Keywords("database"),
+      note: "no package is *named* database",
+    },
+    {
+      text: "regexp",
+      judgement: Keywords("regexp"),
+      note: "small, precise topic",
+    },
+    {
+      text: "serialization",
+      judgement: Keywords("serialization"),
+      note: "long keyword, one token",
+    },
+    {
+      text: "compiler",
+      judgement: Keywords("compiler"),
+      note: "no title hits at all",
+    },
+    {
+      text: "benchmark",
+      judgement: Keywords("benchmark"),
+      note: "sparse topic",
+    },
     // --- dependency queries: the graph question ---
-    { text: "moonbitlang/async", judgement: DependsOn("moonbitlang/async"), note: "938 dependents" },
-    { text: "moonbitlang/x", judgement: DependsOn("moonbitlang/x"), note: "898 dependents" },
-    { text: "cli/core", judgement: DependsOn("cli/core"), note: "76 dependents" },
+    {
+      text: "moonbitlang/async",
+      judgement: DependsOn("moonbitlang/async"),
+      note: "938 dependents",
+    },
+    {
+      text: "moonbitlang/x",
+      judgement: DependsOn("moonbitlang/x"),
+      note: "898 dependents",
+    },
+    {
+      text: "cli/core",
+      judgement: DependsOn("cli/core"),
+      note: "76 dependents",
+    },
     // --- name-part queries ---
-    { text: "moon", judgement: NamePart("moon"), note: "348 packages named *moon*" },
-    { text: "mbt", judgement: NamePart("mbt"), note: "54 packages named *mbt*" },
+    {
+      text: "moon",
+      judgement: NamePart("moon"),
+      note: "348 packages named *moon*",
+    },
+    {
+      text: "mbt",
+      judgement: NamePart("mbt"),
+      note: "54 packages named *mbt*",
+    },
   ]
 }
 

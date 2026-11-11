@@ -72,7 +72,12 @@ pub extend AggResult with @debug.Debug::{to_repr}
 /// Unlike text fields, numeric fields need no schema declaration — the same
 /// choice facets make, for the same reason: a search service rarely knows its
 /// numeric facets at compile time.
-pub fn Index::set_num(self : Index, id : String, field : String, value : Double) -> Bool {
+pub fn Index::set_num(
+  self : Index,
+  id : String,
+  field : String,
+  value : Double,
+) -> Bool {
   match self.doc_nums.get(id) {
     Some(num) if !self.deleted.contains(num) => {
       let entries : Array[(String, Double)] = match self.nums.get(num) {
@@ -99,6 +104,7 @@ pub fn Index::set_num(self : Index, id : String, field : String, value : Double)
 }
 
 ///|
+
 ///|
 /// True when a numeric column cell holds no value. Uses the self-comparison
 /// trick: NaN is the only double that is not equal to itself, and writing it
@@ -250,7 +256,11 @@ fn Index::passes_simple_filters(
 }
 
 ///|
-fn Index::run_agg(self : Index, spec : AggSpec, matched : Array[Int32]) -> AggResult {
+fn Index::run_agg(
+  self : Index,
+  spec : AggSpec,
+  matched : Array[Int32],
+) -> AggResult {
   match spec {
     TermsAgg(field, size) => {
       let counts : @hashmap.HashMap[String, Int32] = @hashmap.HashMap([])
@@ -284,17 +294,29 @@ fn Index::run_agg(self : Index, spec : AggSpec, matched : Array[Int32]) -> AggRe
       for i in 0..<cap {
         limited.push((buckets[i].0, buckets[i].1.to_double()))
       }
-      { field, kind: "terms", buckets: limited, stats: None, percentiles: [] }
+      { field, kind: "terms", buckets: limited, stats: None, percentiles: [], }
     }
     StatsAgg(field) => {
       let values = self.collect_numbers(field, matched)
-      { field, kind: "stats", buckets: [], stats: Some(summarize(values)), percentiles: [] }
+      {
+        field,
+        kind: "stats",
+        buckets: [],
+        stats: Some(summarize(values)),
+        percentiles: [],
+      }
     }
     HistogramAgg(field, interval) => {
       // A non-positive interval would divide by zero and produce one infinite
       // bucket, which is worse than an empty answer.
       if interval <= 0.0 {
-        return { field, kind: "histogram", buckets: [], stats: None, percentiles: [] }
+        return {
+          field,
+          kind: "histogram",
+          buckets: [],
+          stats: None,
+          percentiles: [],
+        }
       }
       let values = self.collect_numbers(field, matched)
       let counts : @hashmap.HashMap[Int32, Int32] = @hashmap.HashMap([])
@@ -309,12 +331,14 @@ fn Index::run_agg(self : Index, spec : AggSpec, matched : Array[Int32]) -> AggRe
       keys.sort()
       let buckets : Array[(String, Double)] = []
       for k in keys {
-        buckets.push((
-          format_bucket(k.to_double() * interval, interval),
-          counts.get_or_default(k, 0).to_double(),
-        ))
+        buckets.push(
+          (
+            format_bucket(k.to_double() * interval, interval),
+            counts.get_or_default(k, 0).to_double(),
+          ),
+        )
       }
-      { field, kind: "histogram", buckets, stats: None, percentiles: [] }
+      { field, kind: "histogram", buckets, stats: None, percentiles: [], }
     }
     PercentilesAgg(field, ps) => {
       let values = self.collect_numbers(field, matched)
@@ -323,14 +347,24 @@ fn Index::run_agg(self : Index, spec : AggSpec, matched : Array[Int32]) -> AggRe
       for p in ps {
         out.push((p, percentile_of(values, p)))
       }
-      { field, kind: "percentiles", buckets: [], stats: None, percentiles: out }
+      {
+        field,
+        kind: "percentiles",
+        buckets: [],
+        stats: None,
+        percentiles: out,
+      }
     }
   }
 }
 
 ///|
 /// Non-NaN values of one field over a document set.
-fn Index::collect_numbers(self : Index, field : String, matched : Array[Int32]) -> Array[Double] {
+fn Index::collect_numbers(
+  self : Index,
+  field : String,
+  matched : Array[Int32],
+) -> Array[Double] {
   let col = self.num_column(field)
   let out : Array[Double] = []
   for num in matched {
@@ -347,7 +381,7 @@ fn Index::collect_numbers(self : Index, field : String, matched : Array[Int32]) 
 ///|
 fn summarize(values : Array[Double]) -> StatSummary {
   if values.is_empty() {
-    return { count: 0, min: 0.0, max: 0.0, avg: 0.0, sum: 0.0 }
+    return { count: 0, min: 0.0, max: 0.0, avg: 0.0, sum: 0.0, }
   }
   let mut min = values[0]
   let mut max = values[0]
@@ -375,7 +409,7 @@ fn summarize(values : Array[Double]) -> StatSummary {
 /// `to_int()` truncates toward zero and would put -0.5 and +0.5 in one bucket).
 fn floor_div(value : Double, interval : Double) -> Int32 {
   let q = value / interval
-  let f = if q >= 0.0 { q.floor() } else { -((-q).ceil()) }
+  let f = if q >= 0.0 { q.floor() } else { -(-q).ceil() }
   f.to_int()
 }
 

@@ -29,7 +29,9 @@ async fn main {
     }
   }
   if paths.length() < 2 {
-    println("usage: moonseek-registry <registry.json> <out.msk> [--b64 out.txt]")
+    println(
+      "usage: moonseek-registry <registry.json> <out.msk> [--b64 out.txt]",
+    )
     return ()
   }
   let input_path = paths[0]

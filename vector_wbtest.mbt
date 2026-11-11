@@ -64,10 +64,10 @@ test "zero vectors do not divide by zero" {
 ///|
 /// A corpus of `n` vectors in `dim` dimensions, plus the index holding them.
 fn vector_index(n : Int32, dim : Int32) -> Index {
-  let idx = Index::new([{ name: "body", weight: 1.0 }])
+  let idx = Index::new([{ name: "body", weight: 1.0, }])
   for i in 0..<n {
     let id = "d\{i}"
-    idx.add({ id, fields: [("body", "doc \{i}")] })
+    idx.add({ id, fields: [("body", "doc \{i}")], })
     let _ = idx.set_vector(id, "emb", vec_of(i.to_uint64() + 1UL, dim))
   }
   idx
@@ -130,18 +130,18 @@ test "results are the same regardless of insertion order" {
   // The graph differs with insertion order — that is inherent to an
   // incremental structure — but the top-1 answer on a well-separated query
   // must not.
-  let forward = Index::new([{ name: "body", weight: 1.0 }])
-  let backward = Index::new([{ name: "body", weight: 1.0 }])
+  let forward = Index::new([{ name: "body", weight: 1.0, }])
+  let backward = Index::new([{ name: "body", weight: 1.0, }])
   let n = 200
   for i in 0..<n {
     let id = "d\{i}"
-    forward.add({ id, fields: [("body", "doc")] })
+    forward.add({ id, fields: [("body", "doc")], })
     let _ = forward.set_vector(id, "emb", vec_of(i.to_uint64() + 1UL, 12))
   }
   let mut k = n - 1
   while k >= 0 {
     let id = "d\{k}"
-    backward.add({ id, fields: [("body", "doc")] })
+    backward.add({ id, fields: [("body", "doc")], })
     let _ = backward.set_vector(id, "emb", vec_of(k.to_uint64() + 1UL, 12))
     k -= 1
   }
@@ -155,9 +155,9 @@ test "results are the same regardless of insertion order" {
 
 ///|
 test "vector dimensionality is fixed by the first vector" {
-  let idx = Index::new([{ name: "body", weight: 1.0 }])
-  idx.add({ id: "a", fields: [("body", "x")] })
-  idx.add({ id: "b", fields: [("body", "y")] })
+  let idx = Index::new([{ name: "body", weight: 1.0, }])
+  idx.add({ id: "a", fields: [("body", "x")], })
+  idx.add({ id: "b", fields: [("body", "y")], })
   assert_true(idx.set_vector("a", "emb", [1.0, 0.0, 0.0]))
   // Wrong length is rejected, not truncated.
   assert_true(!idx.set_vector("b", "emb", [1.0, 0.0]))
@@ -168,8 +168,8 @@ test "vector dimensionality is fixed by the first vector" {
 
 ///|
 test "set_vector rejects unknown and deleted documents" {
-  let idx = Index::new([{ name: "body", weight: 1.0 }])
-  idx.add({ id: "a", fields: [("body", "x")] })
+  let idx = Index::new([{ name: "body", weight: 1.0, }])
+  idx.add({ id: "a", fields: [("body", "x")], })
   assert_true(!idx.set_vector("nope", "emb", [1.0, 0.0]))
   let _ = idx.delete("a")
   assert_true(!idx.set_vector("a", "emb", [1.0, 0.0]))
@@ -193,7 +193,7 @@ test "knn skips deleted documents" {
 
 ///|
 test "knn on an empty field returns nothing instead of failing" {
-  let idx = Index::new([{ name: "body", weight: 1.0 }])
+  let idx = Index::new([{ name: "body", weight: 1.0, }])
   let out = idx.knn("emb", [1.0, 0.0], 5)
   assert_eq(out.length(), 0)
   assert_eq(idx.vector_count("emb"), 0)
@@ -222,14 +222,23 @@ test "HNSW graph shape is sane" {
 ///|
 test "hybrid search fuses lexical and vector rankings" {
   let idx = Index::new([
-    { name: "title", weight: 3.0 },
-    { name: "body", weight: 1.0 },
+    { name: "title", weight: 3.0, },
+    { name: "body", weight: 1.0, },
   ])
   // Two documents: one matches the term, one is semantically near the query
   // vector but shares no words.
-  idx.add({ id: "lexical", fields: [("title", "cron parser"), ("body", "cron expression parser")] })
-  idx.add({ id: "semantic", fields: [("title", "scheduler"), ("body", "schedule timing rules")] })
-  idx.add({ id: "other", fields: [("title", "image"), ("body", "png decoding")] })
+  idx.add({
+    id: "lexical",
+    fields: [("title", "cron parser"), ("body", "cron expression parser")],
+  })
+  idx.add({
+    id: "semantic",
+    fields: [("title", "scheduler"), ("body", "schedule timing rules")],
+  })
+  idx.add({
+    id: "other",
+    fields: [("title", "image"), ("body", "png decoding")],
+  })
   let _ = idx.set_vector("lexical", "emb", [1.0, 0.0, 0.0])
   let _ = idx.set_vector("semantic", "emb", [0.0, 1.0, 0.0])
   let _ = idx.set_vector("other", "emb", [0.0, 0.0, 1.0])
@@ -254,22 +263,28 @@ test "hybrid search fuses lexical and vector rankings" {
 
 ///|
 test "hybrid search with RRF and weighted fusion both keep a lexical-only hit" {
-  let idx = Index::new([{ name: "body", weight: 1.0 }])
-  idx.add({ id: "a", fields: [("body", "alpha")] })
-  idx.add({ id: "b", fields: [("body", "beta")] })
+  let idx = Index::new([{ name: "body", weight: 1.0, }])
+  idx.add({ id: "a", fields: [("body", "alpha")], })
+  idx.add({ id: "b", fields: [("body", "beta")], })
   let _ = idx.set_vector("b", "emb", [1.0, 0.0])
   // A query matching only lexically must still be returned under both fusions.
   let rrf = idx.hybrid_search("alpha", [1.0, 0.0], "emb", limit=5, fusion=Rrf)
-  let weighted = idx.hybrid_search("alpha", [1.0, 0.0], "emb", limit=5, fusion=Weighted(0.7))
+  let weighted = idx.hybrid_search(
+    "alpha",
+    [1.0, 0.0],
+    "emb",
+    limit=5,
+    fusion=Weighted(0.7),
+  )
   assert_true(rrf.map(fn(h) { h.id }).contains("a"))
   assert_true(weighted.map(fn(h) { h.id }).contains("a"))
 }
 
 ///|
 test "hybrid search does not lose hits when there are no vectors at all" {
-  let idx = Index::new([{ name: "body", weight: 1.0 }])
-  idx.add({ id: "a", fields: [("body", "alpha")] })
-  idx.add({ id: "b", fields: [("body", "alpha beta")] })
+  let idx = Index::new([{ name: "body", weight: 1.0, }])
+  idx.add({ id: "a", fields: [("body", "alpha")], })
+  idx.add({ id: "b", fields: [("body", "alpha beta")], })
   // No vectors indexed: the vector side is empty and must not break fusion.
   let fused = idx.hybrid_search("alpha", [1.0, 0.0], "emb", limit=5)
   assert_eq(fused.length(), 2)

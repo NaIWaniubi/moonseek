@@ -14,7 +14,11 @@ fn rank_discount(rank : Int32) -> Double {
 ///|
 /// Discounted cumulative gain of a ranked id list, capped at `k`.
 /// `gains` maps id -> grade; an ungraded id contributes nothing.
-fn dcg(gains : @hashmap.HashMap[String, Int32], ranked : Array[String], k : Int32) -> Double {
+fn dcg(
+  gains : @hashmap.HashMap[String, Int32],
+  ranked : Array[String],
+  k : Int32,
+) -> Double {
   let mut sum = 0.0
   let n = if ranked.length() < k { ranked.length() } else { k }
   for i in 0..<n {
@@ -52,7 +56,8 @@ pub fn ndcg_at(
   let mut ideal = 0.0
   let n = if grades.length() < k { grades.length() } else { k }
   for i in 0..<n {
-    ideal += (@math.pow(2.0, grades[i].to_double()) - 1.0) * rank_discount(i + 1)
+    ideal += (@math.pow(2.0, grades[i].to_double()) - 1.0) *
+      rank_discount(i + 1)
   }
   if ideal == 0.0 {
     0.0

@@ -158,7 +158,7 @@ fn fmt(x : Double) -> String {
 }
 
 ///|
-fn zeros(n : Int) -> String {
+fn zeros(n : Int32) -> String {
   let mut out = ""
   let mut i = 0
   while i < n {
@@ -169,7 +169,7 @@ fn zeros(n : Int) -> String {
 }
 
 ///|
-fn pad_end(s : String, width : Int) -> String {
+fn pad_end(s : String, width : Int32) -> String {
   if s.length() >= width {
     return s
   }
@@ -281,7 +281,10 @@ fn delta(value : Double, base : Double) -> String {
 
 ///|
 /// JSON sidecar, so the numbers can be plotted or diffed in CI.
-fn render_json(results : Array[ConfigResult], queries : Array[EvalQuery]) -> String {
+fn render_json(
+  results : Array[ConfigResult],
+  queries : Array[EvalQuery],
+) -> String {
   let root : Map[String, Json] = Map([])
   root["queries"] = Json::array(queries.map(fn(q) { @json.to_json(q.text) }))
   let rows : Array[Json] = []

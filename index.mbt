@@ -176,7 +176,7 @@ pub fn ExternalStats::new(
   for pair in avgdl {
     avgdl_map.set(pair.0, pair.1)
   }
-  { n, df: df_map, avgdl: avgdl_map }
+  { n, df: df_map, avgdl: avgdl_map, }
 }
 
 ///|

@@ -80,7 +80,7 @@ test "deletion does not change the field live count's cost or value" {
   assert_eq(idx.field_live_count("title"), 40)
   // Deleting a document that declared only one field must not shift the other
   // field's count.
-  idx.add({ id: "title-only", fields: [("title", "solo")] })
+  idx.add({ id: "title-only", fields: [("title", "solo")], })
   assert_eq(idx.field_live_count("body"), 40)
   assert_eq(idx.field_live_count("title"), 41)
   let _ = idx.delete("title-only")

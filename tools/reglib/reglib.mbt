@@ -11,10 +11,10 @@
 /// name hit outranks a keyword hit, which outranks prose and dependency text.
 pub fn registry_schema() -> Array[@moonseek.FieldSchema] {
   [
-    { name: "title", weight: 6.0 },
-    { name: "keywords", weight: 3.0 },
-    { name: "desc", weight: 1.0 },
-    { name: "deps", weight: 1.5 },
+    { name: "title", weight: 6.0, },
+    { name: "keywords", weight: 3.0, },
+    { name: "desc", weight: 1.0, },
+    { name: "deps", weight: 1.5, },
   ]
 }
 
@@ -53,7 +53,7 @@ pub fn build_registry_index(
         fields.push(pair)
       }
     }
-    index.add({ id, fields })
+    index.add({ id, fields, })
     if item is Object(obj) {
       if obj.get("facets") is Some(Array(rows)) {
         let _ = index.set_facets(id, parse_facets(rows))

@@ -472,9 +472,10 @@ pub fn ms_set_schema(spec : String) -> String {
         let weight = @string.parse_double(part[i + 1:].to_owned()) catch {
           _ => return "bad weight in schema spec: " + part.to_owned()
         }
-        schema.push({ name, weight })
+        schema.push({ name, weight, })
       }
-      None => return "bad schema entry (expected name:weight): " + part.to_owned()
+      None =>
+        return "bad schema entry (expected name:weight): " + part.to_owned()
     }
   }
   if schema.is_empty() {
@@ -507,7 +508,7 @@ pub fn ms_add_doc(id : String, fields_json : String) -> String {
           }
         None => return "fields_json is not an array"
       }
-      index.add({ id, fields })
+      index.add({ id, fields, })
       ""
     }
     None => "index not initialized"

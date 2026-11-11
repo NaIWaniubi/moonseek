@@ -60,13 +60,17 @@ fn HnswPoints::from(
       }
     }
   }
-  { data, dim: width, slots: point_count, present }
+  { data, dim: width, slots: point_count, present, }
 }
 
 ///|
 /// Cosine distance from the query to the point at `doc`. Returns 2.0 (maximal
 /// distance in this metric) when the document has no vector.
-fn HnswPoints::dist(self : HnswPoints, query : Array[Double], doc : Int32) -> Double {
+fn HnswPoints::dist(
+  self : HnswPoints,
+  query : Array[Double],
+  doc : Int32,
+) -> Double {
   if doc < 0 || doc >= self.slots || !self.present[doc] || self.dim == 0 {
     return 2.0
   }
@@ -255,7 +259,11 @@ fn CandidateHeap::top(self : CandidateHeap) -> Candidate? {
 
 ///|
 /// The order relation: true when `a` should sit above `b` in this heap.
-fn CandidateHeap::above(self : CandidateHeap, a : Candidate, b : Candidate) -> Bool {
+fn CandidateHeap::above(
+  self : CandidateHeap,
+  a : Candidate,
+  b : Candidate,
+) -> Bool {
   if self.min_first {
     // Ties broken by doc number so heap operations stay deterministic; an
     // unstable order would make the graph (and therefore recall) run-dependent.
@@ -575,10 +583,7 @@ fn edge_list(graph : HnswGraph, doc : Int32, layer : Int32) -> Array[Int32]? {
 ///|
 fn add_edge(graph : HnswGraph, from : Int32, to : Int32, layer : Int32) -> Unit {
   match edge_list(graph, from, layer) {
-    Some(list) =>
-      if !list.contains(to) {
-        list.push(to)
-      }
+    Some(list) => if !list.contains(to) { list.push(to) }
     None => ()
   }
 }
@@ -615,7 +620,7 @@ fn trim_edges(
   }
   let scored : Array[Candidate] = []
   for nb in list {
-    scored.push({ doc: nb, dist: points.dist_docs(doc, nb) })
+    scored.push({ doc: nb, dist: points.dist_docs(doc, nb), })
   }
   scored.sort_by(fn(a, b) {
     let cmp = a.dist.compare(b.dist)
@@ -696,10 +701,7 @@ pub fn Index::set_vector(
     _ => return false
   }
   match self.dim.get(field) {
-    Some(d) =>
-      if d != vector.length() {
-        return false
-      }
+    Some(d) => if d != vector.length() { return false }
     None => self.dim.set(field, vector.length())
   }
   let per_field = match self.vecs.get(field) {
@@ -718,7 +720,10 @@ pub fn Index::set_vector(
 
 ///|
 /// Vectors of a field over live documents, ascending by doc number.
-fn Index::live_vectors(self : Index, field : String) -> Array[(Int32, Array[Double])] {
+fn Index::live_vectors(
+  self : Index,
+  field : String,
+) -> Array[(Int32, Array[Double])] {
   let out : Array[(Int32, Array[Double])] = []
   match self.vecs.get(field) {
     Some(per_field) =>
@@ -980,7 +985,7 @@ pub fn Index::hybrid_search(
         a * ln + (1.0 - a) * vn
       }
     }
-    hits.push({ id, score, lexical_rank: lr, vector_rank: vr })
+    hits.push({ id, score, lexical_rank: lr, vector_rank: vr, })
   }
   hits.sort_by(fn(a, b) {
     let cmp = b.score.compare(a.score)

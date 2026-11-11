@@ -264,8 +264,10 @@ fn Parser::parse_primary(self : Parser) -> Query raise QueryError {
       // into a field-scoped phrase node instead of falling through to
       // parse_word (which would see an empty value and raise).
       if word.has_suffix(":") &&
-        (self.peek() is Some(PhraseText(_)) ||
-          self.peek() is Some(PhraseSlop(_, _))) {
+        (
+          self.peek() is Some(PhraseText(_)) ||
+          self.peek() is Some(PhraseSlop(_, _))
+        ) {
         let text = match self.peek() {
           Some(PhraseText(t)) => t
           Some(PhraseSlop(t, _)) => t
@@ -365,10 +367,7 @@ pub fn parse_query(
 /// gather statistics for different terms and neither result would be right.
 /// Callers that need global statistics must reject or rewrite prefix queries
 /// rather than silently produce a mixed ranking.
-pub fn scoring_terms(
-  index : Index,
-  query : Query,
-) -> Array[(String, String)]? {
+pub fn scoring_terms(index : Index, query : Query) -> Array[(String, String)]? {
   let out : Array[(String, String)] = []
   match collect_scoring_terms(index, query, out) {
     true => Some(out)
@@ -838,7 +837,11 @@ pub fn Index::search(
 /// else, and paying for the ranking made the cluster's per-query cost an order
 /// of magnitude larger than the search itself.
 pub fn Index::count(self : Index, query : String) -> Int32 raise QueryError {
-  let parsed = parse_query(query, analyzer=self.analyzer, fields=self.field_names())
+  let parsed = parse_query(
+    query,
+    analyzer=self.analyzer,
+    fields=self.field_names(),
+  )
   let scored = self.eval_sorted(parsed)
   scored.docs.length()
 }

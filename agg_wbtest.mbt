@@ -7,7 +7,7 @@
 
 ///|
 fn agg_index() -> Index {
-  let idx = Index::new([{ name: "body", weight: 1.0 }])
+  let idx = Index::new([{ name: "body", weight: 1.0, }])
   // Six documents with numeric `versions` and a `tier` facet.
   let data : Array[(String, Double, String)] = [
     ("a", 1.0, "small"),
@@ -18,13 +18,13 @@ fn agg_index() -> Index {
     ("f", 51.0, "large"),
   ]
   for (id, versions, tier) in data {
-    idx.add({ id, fields: [("body", "doc " + id)] })
+    idx.add({ id, fields: [("body", "doc " + id)], })
     let _ = idx.set_num(id, "versions", versions)
     let _ = idx.set_facets(id, [("tier", [tier])])
   }
   // One document with no numeric value at all: it must not drag the average
   // toward zero.
-  idx.add({ id: "g", fields: [("body", "doc g")] })
+  idx.add({ id: "g", fields: [("body", "doc g")], })
   idx
 }
 
@@ -131,11 +131,9 @@ test "percentiles interpolate rather than snapping to a sample" {
 test "aggregations run over the filtered result set" {
   let idx = agg_index()
   // Only the two "small" documents.
-  let out = idx.aggregate(
-    "*",
-    [StatsAgg("versions"), TermsAgg("tier", 10)],
-    filters=[("tier", ["small"])],
-  )
+  let out = idx.aggregate("*", [StatsAgg("versions"), TermsAgg("tier", 10)], filters=[
+    ("tier", ["small"]),
+  ])
   let st = out[0].stats.unwrap()
   assert_eq(st.count, 2)
   assert_eq(st.sum, 4.0)
@@ -145,9 +143,9 @@ test "aggregations run over the filtered result set" {
 
 ///|
 test "aggregations follow the query, not the whole index" {
-  let idx = Index::new([{ name: "body", weight: 1.0 }])
-  idx.add({ id: "a", fields: [("body", "alpha")] })
-  idx.add({ id: "b", fields: [("body", "beta")] })
+  let idx = Index::new([{ name: "body", weight: 1.0, }])
+  idx.add({ id: "a", fields: [("body", "alpha")], })
+  idx.add({ id: "b", fields: [("body", "beta")], })
   let _ = idx.set_num("a", "n", 10.0)
   let _ = idx.set_num("b", "n", 100.0)
   let out = idx.aggregate("alpha", [StatsAgg("n")])
@@ -174,10 +172,7 @@ test "external statistics override local scoring statistics" {
   // Pretend the corpus is far larger and the term far rarer: IDF must go up,
   // and with it every score. This is the mechanism a cluster coordinator uses
   // to make shards agree on a ranking.
-  let df : Array[((String, String), Int32)] = [(
-    ("body", "common"),
-    3,
-  )]
+  let df : Array[((String, String), Int32)] = [(("body", "common"), 3)]
   let avgdl : Array[(String, Double)] = [("body", 1.0)]
   idx.set_external_stats(Some(ExternalStats::new(100000, df~, avgdl~)))
   let global = idx.search("common", limit=0)
@@ -193,9 +188,9 @@ test "external statistics override local scoring statistics" {
 
 ///|
 fn aggregate_fixture() -> Index {
-  let idx = Index::new([{ name: "body", weight: 1.0 }])
+  let idx = Index::new([{ name: "body", weight: 1.0, }])
   for i in 0..<3 {
-    idx.add({ id: "d\{i}", fields: [("body", "common")] })
+    idx.add({ id: "d\{i}", fields: [("body", "common")], })
   }
   idx
 }
@@ -203,8 +198,8 @@ fn aggregate_fixture() -> Index {
 ///|
 test "scoring terms of a query are the terms the evaluator scores" {
   let idx = Index::new([
-    { name: "title", weight: 2.0 },
-    { name: "body", weight: 1.0 },
+    { name: "title", weight: 2.0, },
+    { name: "body", weight: 1.0, },
   ])
   let fields : Array[String] = ["title", "body"]
   // A bare term expands to one pair per field.
