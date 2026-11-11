@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.0 (2026-11-12)
+## 0.10.0 (2026-11-12)
 
 The distributed layer is finished in the sense that it can now be *operated*:
 a cluster grows without a reindex, a member that missed writes is brought back,
