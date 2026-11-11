@@ -100,6 +100,10 @@ pub struct Index {
   /// (the only operation that introduces new terms); prefix queries reuse it
   /// instead of re-sorting the whole vocabulary.
   priv terms_sorted : @hashmap.HashMap[String, Array[String]]
+  /// Cached dense field-length arrays (doc number -> token count), built
+  /// lazily from `stats` and invalidated whenever documents or tombstones
+  /// change. Removes the last per-posting hash probe from BM25 scoring.
+  priv lengths_dense : @hashmap.HashMap[String, Array[Int32]]
   /// Cached BK-trees for fuzzy lookup, keyed by field name ("*" = all fields).
   /// Cleared on add. Building one tree per query was the dominant cost of
   /// fuzzy search on large vocabularies.
@@ -139,6 +143,7 @@ pub fn Index::new(
     stored: @hashmap.HashMap([]),
     facets: @hashmap.HashMap([]),
     terms_sorted: @hashmap.HashMap([]),
+    lengths_dense: @hashmap.HashMap([]),
     bk_trees: @hashmap.HashMap([]),
   }
 }
@@ -180,6 +185,9 @@ pub fn Index::add(self : Index, doc : Document) -> Unit {
   if !self.terms_sorted.is_empty() {
     self.terms_sorted.clear()
   }
+  if !self.lengths_dense.is_empty() {
+    self.lengths_dense.clear()
+  }
   if !self.bk_trees.is_empty() {
     self.bk_trees.clear()
   }
@@ -218,6 +226,9 @@ fn Index::delete_by_num(self : Index, num : Int32) -> Unit {
     return
   }
   self.deleted.set(num, ())
+  if !self.lengths_dense.is_empty() {
+    self.lengths_dense.clear()
+  }
   self.stored.remove(num)
   // Facet values of a deleted document are dead state: keeping them
   // would serialize them into every snapshot and pin them in memory
@@ -292,6 +303,12 @@ pub fn Index::schema(self : Index) -> Array[FieldSchema] {
 }
 
 ///|
+/// True when the internal doc number is a tombstone.
+pub fn Index::is_deleted(self : Index, num : Int32) -> Bool {
+  self.deleted.contains(num)
+}
+
+///|
 /// Document frequency of a term in a field (0 if absent).
 pub fn Index::doc_freq(self : Index, field : String, term : String) -> Int32 {
   // Fast path: no deletions ever happened — every posting is live.
@@ -353,6 +370,30 @@ pub fn Index::terms_of(self : Index, field : String) -> Array[String] {
 }
 
 ///|
+/// Dense per-field token counts indexed by internal doc number (0 when the
+/// document has no content in that field). Cached until the next mutation.
+/// Replaces the per-posting `HashMap` probe on the BM25 scoring path.
+pub fn Index::field_lengths(self : Index, field : String) -> Array[Int32] {
+  match self.lengths_dense.get(field) {
+    Some(arr) => arr
+    None => {
+      let arr = Array::make(self.doc_ids.length(), 0)
+      match self.stats.get(field) {
+        Some(stats) =>
+          for (num, len) in stats.lengths.iter() {
+            if num >= 0 && num < arr.length() {
+              arr[num] = len
+            }
+          }
+        None => ()
+      }
+      self.lengths_dense.set(field, arr)
+      arr
+    }
+  }
+}
+
+///|
 /// Average length of a field over the live documents that actually carry
 /// it. A document can declare the schema but omit the field, so dividing
 /// by the global live count would systematically dilute avgdl and skew
@@ -403,8 +444,10 @@ priv struct Bm25Context {
   idf : Double
   avgdl : Double
   weight : Double
-  /// doc -> field length, the only per-document lookup left.
-  lengths : @hashmap.HashMap[Int32, Int32]
+  /// Dense doc-number -> field length array. A HashMap probe per posting was
+  /// the last hashing left on the scoring path; a dense array lookup is a
+  /// single bounds-checked load.
+  lengths : Array[Int32]
   /// False when the term has no live postings (score is always 0).
   valid : Bool
 }
@@ -417,7 +460,6 @@ fn Index::bm25_context(
 ) -> Bm25Context {
   let n = self.doc_count()
   let df = self.doc_freq(field, term)
-  let stats = self.stats[field]
   let valid = df > 0 && n > 0
   let idf = if valid {
     @math.ln(
@@ -433,7 +475,7 @@ fn Index::bm25_context(
     idf,
     avgdl: self.avg_field_length(field),
     weight: self.field_weight(field),
-    lengths: stats.lengths,
+    lengths: self.field_lengths(field),
     valid,
   }
 }
@@ -443,7 +485,7 @@ fn Bm25Context::score(self : Bm25Context, posting : Posting) -> Double {
   if !self.valid {
     return 0.0
   }
-  let dl = self.lengths.get_or_default(posting.doc, 0).to_double()
+  let dl = self.lengths[posting.doc].to_double()
   let norm = if self.avgdl == 0.0 {
     1.0
   } else {

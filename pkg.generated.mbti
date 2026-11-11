@@ -120,6 +120,19 @@ pub fn ByteWriter::write_string(Self, String) -> Unit
 pub fn ByteWriter::write_u32_le(Self, UInt32) -> Unit
 pub fn ByteWriter::write_varint(Self, Int32) -> Unit
 
+pub struct DocScores {
+  docs : Array[Int32]
+  scores : Array[Double]
+}
+pub fn DocScores::diff(Self, Self) -> Self
+pub fn DocScores::empty() -> Self
+pub fn DocScores::from_pairs(Array[(Int32, Double)]) -> Self
+pub fn DocScores::inter(Self, Self) -> Self
+pub fn DocScores::is_empty(Self) -> Bool
+pub fn DocScores::length(Self) -> Int32
+pub fn DocScores::push(Self, Int32, Double) -> Unit
+pub fn DocScores::union(Self, Self) -> Self
+
 pub(all) struct Document {
   id : String
   fields : Array[(String, String)]
@@ -208,14 +221,17 @@ pub struct Index {
   // private fields
 }
 pub fn Index::add(Self, Document) -> Unit
+pub fn Index::all_live_scores(Self, DocScores, (Int32) -> Bool) -> DocScores
 pub fn Index::analyzer(Self) -> Analyzer
 pub fn Index::bk_tree(Self, field? : String?) -> BkTree
 pub fn Index::bm25(Self) -> Bm25Params
+pub fn Index::collect_hits(Self, DocScores, Int32) -> Array[Hit]
 pub fn Index::delete(Self, String) -> Bool
 pub fn Index::doc_count(Self) -> Int32
 pub fn Index::doc_freq(Self, String, String) -> Int32
 pub fn Index::doc_id(Self, Int32) -> String?
 pub fn Index::explain(Self, String, String) -> Explanation? raise QueryError
+pub fn Index::field_lengths(Self, String) -> Array[Int32]
 pub fn Index::from_bytes(Bytes) -> Self raise CodecError
 pub fn Index::fuzzy_search(Self, String, max_distance? : Int32, limit? : Int32) -> Array[Hit] raise QueryError
 pub fn Index::fuzzy_terms(Self, String, max_distance? : Int32, field? : String?) -> Array[FuzzyMatch]
@@ -225,6 +241,7 @@ pub fn Index::get_facets(Self, String) -> Array[(String, Array[String])]
 pub fn Index::get_field(Self, String, String) -> String?
 pub fn Index::highlight(Self, String, String, String, pre_tag? : String, post_tag? : String) -> String raise QueryError
 pub fn Index::highlight_spans(Self, String, String, String) -> Array[HighlightSpan] raise QueryError
+pub fn Index::is_deleted(Self, Int32) -> Bool
 pub async fn Index::load(String) -> Self raise StoreError
 pub async fn Index::load_or_create(String, Array[FieldSchema]) -> Self raise StoreError
 pub fn Index::new(Array[FieldSchema], analyzer? : Analyzer, bm25? : Bm25Params) -> Self

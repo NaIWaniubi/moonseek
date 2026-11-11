@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.5.0 (2026-11-12)
+
+### Changed — query evaluation rewritten (the biggest architectural gap)
+`eval` no longer materializes a `doc -> score` HashMap; it returns ascending
+(doc, score) arrays and every operator is a linear merge (`rank.mbt`).
+`And`/`Or`/`Not` are set merges, `collect_hits` runs a bounded top-K walk that
+only builds a `Hit` once a candidate enters the top set, and BM25 scoring reads
+field lengths from a cached dense array instead of a hash probe per posting.
+Deleted-doc checks are hoisted out of the hot loops when there are no tombstones.
+
+Measured on the 20k-doc / 8.5 MB / 23.8k-term stress corpus (release, per query):
+
+| Query | 0.4.0 | 0.5.0 | |
+|---|---|---|---|
+| Saturated term (df ≈ all docs) | 13.0 ms | **2.5 ms** | 5.3× |
+| Anchor term (df ≈ 2k) | 12.0 ms | **2.3 ms** | 5.1× |
+| Boolean `A AND B` | 22.2 ms | **5.2 ms** | 4.2× |
+| Phrase | 18.5 ms | **7.0 ms** | 2.6× |
+| Prefix | 16.6 ms | **2.4 ms** | 6.9× |
+| Chinese bigram | 13.1 ms | **3.0 ms** | 4.4× |
+| Facet filter + aggregation | 21.3 ms | **11.8 ms** | 1.8× |
+| Explain | 3.3 ms | **2.3 ms** | 1.4× |
+
+### Added
+- **Live demo on GitHub Pages**: <https://naiwaniubi.github.io/moonseek/> — the
+  WasmGC build served statically so the engine can be tried without a local
+  server (release wasm, 204 KB).
+- **`diff_test.mbt`**: differential and invariant tests. A reference BM25
+  recomputed from public primitives (`postings_of`/`doc_freq`/`schema`) matches
+  engine scores to 1e-9; boolean operators are checked against set algebra on
+  the operand result sets; `limit=k` is asserted to be the exact prefix of
+  `limit=0`; insertion order and deletion are asserted not to change relevance.
+- README: live-demo link, badges, demo screenshot, Mermaid pipeline diagram.
+
+### Fixed
+- Test-only: the set-algebra test aliased its operands (`let union = sa`), so
+  the union push mutated the array the later assertions compared against.
+
 ## 0.4.0 (2026-11-11)
 
 ### Added

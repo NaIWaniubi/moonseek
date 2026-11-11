@@ -4,8 +4,14 @@
 
 纯 MoonBit 实现的嵌入式全文搜索引擎：倒排索引、BM25、免词典中文分词、模糊搜索、分面过滤、服务端高亮、WAL 崩溃恢复，支持 native / WASM / JS 三端。
 
+**▶ Live demo: [naiwaniubi.github.io/moonseek](https://naiwaniubi.github.io/moonseek/)** — the engine running in your browser, no server, no network.
+
 [![CI](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml/badge.svg)](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![mooncakes](https://img.shields.io/badge/mooncakes-v0.4.0-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
+[![tests](https://img.shields.io/badge/tests-249%20native%20%C2%B7%20232%20wasm--gc-3fb950.svg)](#testing)
+
+![moonseek demo](docs/demo-screenshot.png)
 
 ## Why moonseek
 
@@ -28,6 +34,23 @@ MoonBit's ecosystem has HTTP servers, crypto and database drivers — but no tan
 - **Crash-safe persistence**: versioned snapshot + CRC-32 checksum; atomic save (temp file → fsync → rename); torn/corrupt files are rejected, never silently loaded
 - **Portable**: pure MoonBit core (no FFI in the engine); native file store via `moonbitlang/async`; browser export via WasmGC + js-string builtins
 - **Document lifecycle**: add, replace (same id), delete
+
+## How it works
+
+```mermaid
+flowchart LR
+  T[text] --> A[Analyzer<br/>Latin words + CJK bigrams]
+  A --> I[Inverted index<br/>field → term → postings<br/>doc, freq, positions]
+  Q[query string] --> P[Lexer → parser<br/>term / phrase / prefix / AND OR NOT]
+  P --> E[Evaluator<br/>ascending doc arrays<br/>merge-based set ops]
+  I --> E
+  E --> K[Top-K selection<br/>score desc, id asc]
+  K --> H[hits]
+  I --> S[Snapshot MSK3<br/>CRC-32 frame]
+  I --> W[WAL<br/>torn-tail recovery]
+  I --> F[Facets<br/>filter + aggregation]
+  B[Browser<br/>WasmGC + js-string] -.-> I
+```
 
 ## Quick start
 
@@ -102,11 +125,11 @@ Stress test (`bench/stress`, 20,000 docs / 8.5 MB text / 23.8k terms, AMD Ryzen 
 | Operation | Time |
 |---|---|
 | Index build | ~6.7 s (≈3,000 docs/s) |
-| Selective term query (df ≈ 300) | **~0.02 ms** |
-| Prefix query | ~17 ms (dominated by scoring the matched terms) |
-| Saturated term (matches every doc) | ~13 ms |
-| Phrase query | ~18 ms |
-| Facet filter + aggregation (3k matches) | ~21 ms |
+| Selective term query (df ≈ 300) | **~0.01 ms** |
+| Prefix query | ~2.4 ms |
+| Saturated term (matches every doc) | **~2.5 ms** |
+| Phrase query | ~7.0 ms |
+| Facet filter + aggregation (3k matches) | ~12 ms |
 | Fuzzy lookup, 24k terms | linear ~100 ms → **BK-tree 0.05–12 ms** |
 | Snapshot 17 MB: serialize / load | ~2.4 s / ~1.7 s |
 
@@ -144,7 +167,7 @@ See [docs/architecture.md](docs/architecture.md) for design details and the snap
 ## Testing
 
 ```bash
-moon test                    # 217 tests (native), 203 (wasm-gc / js)
+moon test                    # 249 tests (native), 232 (wasm-gc / js)
 moon test --target wasm-gc
 moon test --target js
 moon bench --release         # benchmarks
@@ -164,7 +187,7 @@ Tests cover tokenization, boolean/phrase/prefix/fuzzy queries, BM25 ordering, sp
 - [x] Faceted search & aggregations
 - [x] BK-tree accelerated fuzzy matching
 - [x] Score explanation, sort orders, cursor pagination
-- [ ] Postings-iterator evaluator (avoid materializing per-query score maps)
+- [x] Merge-based evaluator over ascending doc arrays (no per-query score map)
 - [ ] Distributed sharded search (OSC2027)
 
 ## License

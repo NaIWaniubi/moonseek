@@ -197,7 +197,10 @@ pub fn Index::fuzzy_search(
 ) -> Array[Hit] raise QueryError {
   let merged : @hashmap.HashMap[Int32, Double] = @hashmap.HashMap([])
   for m in self.fuzzy_terms(term, max_distance~) {
-    for (doc, score) in self.eval_term(m.term, None).iter() {
+    let scored = self.eval_term(m.term, None)
+    for i in 0..<scored.docs.length() {
+      let doc = scored.docs[i]
+      let score = scored.scores[i]
       let best = merged.get_or_default(doc, 0.0)
       if score > best {
         merged.set(doc, score)

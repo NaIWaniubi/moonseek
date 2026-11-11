@@ -56,8 +56,24 @@ pub fn Index::explain(
     analyzer=self.analyzer,
     fields=self.field_names(),
   )
-  let scored = self.eval(parsed)
-  let total = match scored.get(doc_num) {
+  let scored = self.eval_sorted(parsed)
+  // The result is doc-ascending: binary search instead of materializing a map.
+  let mut lo = 0
+  let mut hi = scored.docs.length()
+  let mut found : Double? = None
+  while lo < hi {
+    let mid = (lo + hi) / 2
+    let d = scored.docs[mid]
+    if d == doc_num {
+      found = Some(scored.scores[mid])
+      break
+    } else if d < doc_num {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  let total = match found {
     Some(s) => s
     None => return None
   }
