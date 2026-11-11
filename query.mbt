@@ -355,6 +355,67 @@ pub fn parse_query(
 }
 
 ///|
+/// The (field, term) pairs a query would score, for a cluster coordinator that
+/// has to gather corpus-wide `df` before scoring.
+///
+/// Shape mirrors the evaluator: a bare term expands to one pair per declared
+/// field, `field:term` to one, and a phrase to its first term, because that is
+/// the term the evaluator scores it as. Prefix queries return None: their term
+/// set is whatever the local dictionary happens to contain, so two shards would
+/// gather statistics for different terms and neither result would be right.
+/// Callers that need global statistics must reject or rewrite prefix queries
+/// rather than silently produce a mixed ranking.
+pub fn scoring_terms(
+  index : Index,
+  query : Query,
+) -> Array[(String, String)]? {
+  let out : Array[(String, String)] = []
+  match collect_scoring_terms(index, query, out) {
+    true => Some(out)
+    false => None
+  }
+}
+
+///|
+fn collect_scoring_terms(
+  index : Index,
+  node : Query,
+  out : Array[(String, String)],
+) -> Bool {
+  match node {
+    Term(term, field) => {
+      match field {
+        Some(f) => out.push((f, term))
+        None =>
+          for f in index.field_names() {
+            out.push((f, term))
+          }
+      }
+      true
+    }
+    Phrase(terms, field, _) =>
+      if terms.is_empty() {
+        true
+      } else {
+        match field {
+          Some(f) => out.push((f, terms[0]))
+          None =>
+            for f in index.field_names() {
+              out.push((f, terms[0]))
+            }
+        }
+        true
+      }
+    Prefix(_, _) => false
+    And(left, right) | Or(left, right) =>
+      collect_scoring_terms(index, left, out) &&
+      collect_scoring_terms(index, right, out)
+    Not(left, _) => collect_scoring_terms(index, left, out)
+    MatchAll | MatchField(_) => true
+  }
+}
+
+///|
 /// Evaluate a query into ascending (doc, score) arrays.
 ///
 /// Posting lists are doc-sorted, so every operator is a linear merge instead
@@ -767,4 +828,17 @@ pub fn Index::search(
   )
   let scored = self.eval_sorted(parsed)
   self.collect_hits(scored, limit)
+}
+
+///|
+/// Number of live documents matching a query, without materializing hits.
+///
+/// `search(query, limit=0)` answers the same question but builds and sorts every
+/// `Hit` first. A shard reporting its match count needs the number and nothing
+/// else, and paying for the ranking made the cluster's per-query cost an order
+/// of magnitude larger than the search itself.
+pub fn Index::count(self : Index, query : String) -> Int32 raise QueryError {
+  let parsed = parse_query(query, analyzer=self.analyzer, fields=self.field_names())
+  let scored = self.eval_sorted(parsed)
+  scored.docs.length()
 }

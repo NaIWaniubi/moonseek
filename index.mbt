@@ -115,6 +115,95 @@ pub struct Index {
   /// Cleared on add. Building one tree per query was the dominant cost of
   /// fuzzy search on large vocabularies.
   priv bk_trees : @hashmap.HashMap[String, BkTree]
+  /// Numeric document values: internal doc number -> (field, value).
+  /// The numeric counterpart of facets: not analyzed, not scored, but
+  /// filterable, sortable and aggregatable. Kept separate from the inverted
+  /// index because range and statistical queries want numbers, not terms.
+  priv nums : @hashmap.HashMap[Int32, Array[(String, Double)]]
+  /// Dense per-field numeric columns, built lazily from `nums` and
+  /// invalidated on mutation. Aggregations scan a flat array instead of
+  /// probing a map per document.
+  priv num_cols : @hashmap.HashMap[String, Array[Double]]
+  /// Vector values per (field, doc) for kNN retrieval, and the cached HNSW
+  /// graph per field. Both are cleared on mutation, like the BK-trees.
+  priv vecs : @hashmap.HashMap[String, @hashmap.HashMap[Int32, Array[Double]]]
+  priv hnsw : @hashmap.HashMap[String, HnswGraph]
+  /// Vector dimensionality per field, fixed by the first vector indexed.
+  priv dim : @hashmap.HashMap[String, Int32]
+  /// Corpus statistics supplied from outside this index, for cluster search.
+  ///
+  /// A shard sees only its own slice of the corpus, so its local `N`, `df` and
+  /// `avgdl` differ from every other shard's, and the same document scores
+  /// differently depending on where it landed. A coordinator that wants one
+  /// consistent ranking gathers the statistics first and hands them down; this
+  /// field is where "down" lands. Unset (None) means "score with local
+  /// statistics", which is the single-node case and the default for cluster
+  /// search because it costs one round trip instead of two.
+  priv mut external_stats : ExternalStats?
+}
+
+///|
+/// Corpus-wide statistics, as a coordinator computes them.
+///
+/// Only the three numbers BM25 actually reads are carried: the live document
+/// count, the per-(field, term) document frequency, and the per-field average
+/// length. Anything else would be a statistic the scoring path does not use.
+pub(all) struct ExternalStats {
+  n : Int32
+  /// (field, term) -> document frequency across the whole corpus.
+  df : @hashmap.HashMap[(String, String), Int32]
+  /// field -> average field length across the whole corpus.
+  avgdl : @hashmap.HashMap[String, Double]
+} derive(Eq, Debug)
+
+///|
+pub extend ExternalStats with Eq::{equal, not_equal}
+
+///|
+pub extend ExternalStats with @debug.Debug::{to_repr}
+
+///|
+pub fn ExternalStats::new(
+  n : Int32,
+  df~ : Array[((String, String), Int32)] = [],
+  avgdl~ : Array[(String, Double)] = [],
+) -> ExternalStats {
+  let df_map : @hashmap.HashMap[(String, String), Int32] = @hashmap.HashMap([])
+  for pair in df {
+    df_map.set(pair.0, pair.1)
+  }
+  let avgdl_map : @hashmap.HashMap[String, Double] = @hashmap.HashMap([])
+  for pair in avgdl {
+    avgdl_map.set(pair.0, pair.1)
+  }
+  { n, df: df_map, avgdl: avgdl_map }
+}
+
+///|
+/// Install corpus-wide statistics for the next searches, or clear them with
+/// None. A coordinator sets them, runs the query, and clears them; leaving them
+/// installed would silently mis-score a later local query.
+pub fn Index::set_external_stats(self : Index, stats : ExternalStats?) -> Unit {
+  self.external_stats = stats
+}
+
+///|
+/// Whether external statistics are currently installed (diagnostics).
+pub fn Index::has_external_stats(self : Index) -> Bool {
+  match self.external_stats {
+    Some(_) => true
+    None => false
+  }
+}
+
+///|
+/// Document count that scoring should use: the external one when a coordinator
+/// supplied it, otherwise this index's own live count.
+fn Index::scoring_doc_count(self : Index) -> Int32 {
+  match self.external_stats {
+    Some(s) => s.n
+    None => self.doc_count()
+  }
 }
 
 ///|
@@ -155,6 +244,12 @@ pub fn Index::new(
     scratch_poses: [],
     lengths_dense: @hashmap.HashMap([]),
     bk_trees: @hashmap.HashMap([]),
+    nums: @hashmap.HashMap([]),
+    num_cols: @hashmap.HashMap([]),
+    vecs: @hashmap.HashMap([]),
+    hnsw: @hashmap.HashMap([]),
+    dim: @hashmap.HashMap([]),
+    external_stats: None,
   }
 }
 
@@ -200,6 +295,12 @@ pub fn Index::add(self : Index, doc : Document) -> Unit {
   }
   if !self.bk_trees.is_empty() {
     self.bk_trees.clear()
+  }
+  if !self.num_cols.is_empty() {
+    self.num_cols.clear()
+  }
+  if !self.hnsw.is_empty() {
+    self.hnsw.clear()
   }
   match self.doc_nums.get(doc.id) {
     Some(num) => self.delete_by_num(num)
@@ -299,6 +400,34 @@ pub fn Index::delete(self : Index, id : String) -> Bool {
 /// Look up the external id of an internal doc number.
 pub fn Index::doc_id(self : Index, num : Int32) -> String? {
   self.doc_ids.get(num)
+}
+
+///|
+/// Sum of analyzed token counts over every live document that carries `field`.
+/// The index already maintains this as part of per-field statistics, so a
+/// cluster coordinator can ask for it in O(1). Recomputing it by re-analyzing
+/// every document made the two-phase distributed query an order of magnitude
+/// slower than the search it was gathering statistics for.
+pub fn Index::field_length_total(self : Index, field : String) -> Int32 {
+  match self.stats.get(field) {
+    Some(stats) => stats.total_length
+    None => 0
+  }
+}
+
+///|
+/// Number of live documents that carry `field` (public view of the same count
+/// `avg_field_length` divides by).
+pub fn Index::field_doc_count(self : Index, field : String) -> Int32 {
+  self.field_live_count(field)
+}
+
+///|
+/// Token count of a string under this index's analyzer. Exposed because a
+/// cluster coordinator needs field lengths to compute a global `avgdl`, and it
+/// must count tokens the same way the index did.
+pub fn Index::tokens_in(self : Index, text : String) -> Int32 {
+  self.analyzer.analyze(text).length()
 }
 
 ///|
@@ -506,8 +635,19 @@ fn Index::bm25_context(
   field : String,
   term : String,
 ) -> Bm25Context {
-  let n = self.doc_count()
-  let df = self.doc_freq(field, term)
+  let n = self.scoring_doc_count()
+  let mut df = self.doc_freq(field, term)
+  let mut avgdl = self.avg_field_length(field)
+  match self.external_stats {
+    Some(stats) => {
+      // A term absent from the override map falls back to the local df, which
+      // is the only sane answer: the coordinator only sends terms it observed,
+      // and an unobserved term has df 0 locally too.
+      df = stats.df.get_or_default((field, term), df)
+      avgdl = stats.avgdl.get_or_default(field, avgdl)
+    }
+    None => ()
+  }
   let valid = df > 0 && n > 0
   let idf = if valid {
     @math.ln(
@@ -521,7 +661,7 @@ fn Index::bm25_context(
     b: self.bm25.b,
     df,
     idf,
-    avgdl: self.avg_field_length(field),
+    avgdl,
     weight: self.field_weight(field),
     lengths: self.field_lengths(field),
     valid,
