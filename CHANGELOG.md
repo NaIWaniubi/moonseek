@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.1 (2026-11-11)
+
+One fix, found by the new 200k-document benchmark: **tombstones made every query
+O(N)**. Deleting 10% of a 200,000-document corpus took a selective-term query
+from 0.021 ms to 101 ms, because the live-document count re-scanned a field's
+length table on every call and `bm25_context` calls it once per (field, term) per
+query. The table already holds live documents only, so the scan was redundant as
+well as quadratic. Now O(1); post-delete latency matches the clean case
+(0.015 ms vs 0.027 ms). See `fixes_wbtest.mbt` for the regression test and
+`docs/benchmark.md` for the 200k table.
+
 ## 0.7.0 (2026-11-11)
 
 From an embedded library to a search platform: a network service, a distributed
