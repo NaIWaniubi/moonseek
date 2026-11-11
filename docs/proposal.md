@@ -6,7 +6,7 @@
 - **仓库**：https://github.com/NaIWaniubi/moonseek （公开，Apache-2.0）
 - **包注册**：https://mooncakes.io/packages/NaIWaniubi/moonseek （0.1.0 已发布）
 - **参赛方向**：数据处理与数据库 / 工具库（基础软件生态空白填补）
-- **规模**：~4,000 行有效 MoonBit 代码（不含测试与依赖），217 项测试
+- **规模**：~5,600 行有效 MoonBit 代码（不含测试与依赖），242 项测试
 
 ## 解决什么问题
 
@@ -27,11 +27,12 @@ MoonBit 生态已有 HTTP 服务器、加密库、数据库驱动，但**缺少 
 
 ## 工程质量证据
 
-- **测试**：217 项（native）/ 203 项（wasm-gc、js），覆盖分词、布尔/短语/前缀/模糊查询、BM25 排序、分面过滤聚合、高亮偏移与转义、段合并、WAL 尾巴截断恢复、快照往返、位翻转/截断/坏版本检测、quickcheck 属性测试
+- **测试**：242 项（native）/ 225 项（wasm-gc、js），覆盖分词、布尔/短语/前缀/模糊查询、BM25 排序、分面过滤聚合、高亮偏移与转义、段合并、WAL 尾巴截断恢复、快照往返、位翻转/截断/坏版本检测、quickcheck 属性测试
 - **CI**：GitHub Actions，ubuntu×windows × wasm-gc×js×native 六矩阵全绿
 - **基准**（bench/stress，2 万文档 / 8.5MB 文本 / 2.38 万词项，release）：建索引 6.7s（≈3000 docs/s）；选择性词项查询 0.02ms；饱和词项 13ms；模糊查询 BK-tree 0.05–12ms（线性 85–150ms）；快照 17MB 序列化 2.4s / 加载 1.7s
 - **浏览器实测**（headless Chromium）：60 文档 25ms 建索引，中文/英文/字段/模糊查询、分面过滤、高亮、分数解释全部通过，零 JS 错误
-- **文档**：中英双语 README、架构设计文档（含快照格式规范）、可运行示例
+- **独立审查**：三路专家评审（正确性/持久化/API）产出 24 项发现，24 个独立复核确认 23 项属实，全部修复（字段限定语义、分数可对账、WAL 恢复策略、封装纪律），终审报告 docs/review-report.md
+- **文档**：中英双语 README、架构文档、性能白皮书（docs/benchmark.md）、17 维特性矩阵（docs/comparison.md vs tantivy/Lucene/bleve）、三层示例（basic/persistence/advanced）
 
 ## 演示
 
@@ -39,7 +40,7 @@ MoonBit 生态已有 HTTP 服务器、加密库、数据库驱动，但**缺少 
 
 ## 后续规划
 
-- 11–1 月（黑客松 Q2）：postings 迭代器求值器（避免每查询物化打分表）、更大规模真实语料压测
+- 11–1 月（黑客松 Q2）：postings 迭代器求值器（避免每查询物化打分表）、更大规模真实语料压测、分布式分片原型
 - 2027 春（OSC2027）：分布式分片查询 / SQL 风格过滤层（以启动日后新增工作参赛）
 
 ## AI 辅助声明
