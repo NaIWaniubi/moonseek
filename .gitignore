@@ -3,6 +3,7 @@ _build/
 target/
 target
 .mooncakes/
+.venv*/
 .moonagent/demo/web.wasm
 
 # internal dev artifacts

@@ -8,6 +8,7 @@ Usage: python test_registry_demo.py [base_url]
 """
 
 import json
+import os
 import sys
 
 from playwright.sync_api import sync_playwright
@@ -191,7 +192,14 @@ def main():
         if abl < 7:
             failures.append(f"ablation table incomplete ({abl} rows)")
 
-        page.screenshot(path="demo-screenshot.png", full_page=False)
+        # Write the screenshot next to the committed one, derived from this
+        # script's own location. A bare relative path dropped it in whatever
+        # directory the test happened to be run from.
+        page.screenshot(
+            path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              os.pardir, "demo", "demo-screenshot.png"),
+            full_page=False,
+        )
 
         if errors:
             print("PAGE ERRORS:", errors[:6])
