@@ -1,11 +1,22 @@
 #!/usr/bin/env node
 // Generate a corpus and split it into shards the way the coordinator would.
 //
-// The split must use the same hash the coordinator uses (FNV-1a over the id,
-// modulo the shard count) or the comparison between cluster and single-node
-// results would be measuring a different corpus.
+// The split must use the same placement rule the coordinator uses, or the
+// comparison between cluster and single-node results would be measuring a
+// different corpus, and a document written through the coordinator would land
+// on a shard the splitter never put it on.
 //
-// Usage: node tools/make-shard-corpus.mjs [--docs N] [--shards K] [--out DIR]
+// Two rules, matching `server/cluster.mbt`:
+//   * `--mode ring`   (default) consistent hashing with 128 virtual nodes
+//   * `--mode modulo` `hash(id) % shards`
+//
+// The hash is FNV-1a over the UTF-8 bytes, mixed through MurmurHash3's fmix32 —
+// exactly `hash_key` in cluster.mbt. Both details matter: hashing the UTF-16
+// code units (as an earlier version did) disagrees with this file for
+// non-ASCII ids, and plain FNV-1a without the finalizer makes sequential ids
+// land in an arithmetic progression, which skews the ring 29/21/50.
+//
+// Usage: node tools/make-shard-corpus.mjs [--docs N] [--shards K] [--out DIR] [--mode ring|modulo]
 
 import fs from "node:fs";
 import path from "node:path";
@@ -18,16 +29,56 @@ function arg(name, fallback) {
 const docs = Number(arg("docs", "3000"));
 const shards = Number(arg("shards", "3"));
 const outDir = arg("out", "demo/data/shards");
+const mode = arg("mode", "ring");
+const RING_VNODES = 128;
 
-// FNV-1a, byte-wise, exactly as cluster.mbt's shard_for does it.
-function shardFor(id, k) {
+// FNV-1a over the UTF-8 bytes, then MurmurHash3's finalizer. Math.imul, not
+// `hash * 16777619`: the product of two 32-bit values reaches 7.2e16, past
+// Number.MAX_SAFE_INTEGER, so a plain multiply silently rounds and the result
+// is not FNV-1a at all.
+function fnv1a(text) {
   let hash = 2166136261 >>> 0;
-  for (const ch of Buffer.from(id, "utf8")) {
+  for (const ch of Buffer.from(text, "utf8")) {
     hash = (hash ^ (ch & 0xff)) >>> 0;
-    hash = (hash * 16777619) >>> 0;
+    hash = Math.imul(hash, 16777619) >>> 0;
   }
-  return hash % k;
+  return hash >>> 0;
 }
+function fmix32(h) {
+  h = (h ^ (h >>> 16)) >>> 0;
+  h = Math.imul(h, 0x85ebca6b) >>> 0;
+  h = (h ^ (h >>> 13)) >>> 0;
+  h = Math.imul(h, 0xc2b2ae35) >>> 0;
+  h = (h ^ (h >>> 16)) >>> 0;
+  return h;
+}
+const hashKey = (s) => fmix32(fnv1a(s));
+
+function buildRing(k, vnodes = RING_VNODES) {
+  const points = [];
+  for (let s = 0; s < k; s++) {
+    for (let v = 0; v < vnodes; v++) {
+      points.push({ pos: hashKey(`shard:${s}#${v}`), shard: s });
+    }
+  }
+  points.sort((a, b) => (a.pos - b.pos) || (a.shard - b.shard));
+  return points;
+}
+
+function owner(points, id) {
+  const target = hashKey(id);
+  let lo = 0, hi = points.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (points[mid].pos < target) lo = mid + 1; else hi = mid;
+  }
+  return points[lo >= points.length ? 0 : lo].shard;
+}
+
+const ring = buildRing(shards);
+const place = mode === "modulo"
+  ? (id) => hashKey(id) % shards
+  : (id) => owner(ring, id);
 
 const nouns = ["parser", "compiler", "runtime", "scheduler", "cache", "codec",
   "router", "tracer", "allocator", "lexer", "vm", "gc", "socket", "timer",
@@ -73,7 +124,7 @@ for (let i = 0; i < docs; i++) {
     facets: { domain: [keywords[2]], license: [pick(["MIT", "Apache-2.0"])] },
     nums: { versions: 1 + Math.floor(rnd() * 30) },
   };
-  buckets[shardFor(id, shards)].push(JSON.stringify(doc));
+  buckets[place(id)].push(JSON.stringify(doc));
   bytes += JSON.stringify(doc).length;
 }
 
@@ -89,7 +140,24 @@ fs.writeFileSync(
   path.join(outDir, "all.jsonl"),
   buckets.flat().join("\n") + "\n",
 );
+// The shard ids, in order, so a test can query /_placement for each of them and
+// check the coordinator agrees with the file this tool just wrote. Without
+// this, a placement mismatch is invisible: the coordinator queries every shard
+// anyway, so a search still finds the document.
+const manifest = {
+  mode,
+  shards,
+  vnodes: mode === "ring" ? RING_VNODES : null,
+  counts,
+  // One id per shard, the first document filed there.
+  sample: buckets.map((b) => (b.length ? JSON.parse(b[0]).id : null)),
+};
+fs.writeFileSync(
+  path.join(outDir, "manifest.json"),
+  JSON.stringify(manifest, null, 2) + "\n",
+);
 console.log(
-  `${docs} documents (${(bytes / 1024).toFixed(0)} KB) -> ${shards} shards: ${counts.join(" / ")}`,
+  `${docs} documents (${(bytes / 1024).toFixed(0)} KB) -> ${shards} shards ` +
+  `[${mode}]: ${counts.join(" / ")}`,
 );
 console.log(`single-node copy: ${path.join(outDir, "all.jsonl")}`);

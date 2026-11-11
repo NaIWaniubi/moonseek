@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # End-to-end cluster test for CI: start three shards and a coordinator, index a
-# corpus, and assert the two claims the cluster makes.
+# corpus, and assert the claims the cluster makes.
 #
 #   1. `?dfs=true` reproduces a single node's ranking exactly.
 #   2. Killing a shard produces a partial answer with explicit shard accounting,
 #      not a failure and not a silent shortfall.
+#   3. The coordinator's placement agrees with the offline splitter that wrote
+#      the shard files.
+#   4. Adding a shard would move about a quarter of the documents under the ring
+#      and about three quarters under modulo.
 #
 # Usage: tools/test-cluster.sh <server-binary> [workspace]
 set -u
@@ -92,10 +96,64 @@ $QUERIES
 EOF
 [ "$fail" -eq 0 ] || exit 1
 
+# ---- claim 3: placement agrees with the offline splitter ------------------
+echo "== claim 3: coordinator placement agrees with the offline splitter =="
+ring=$(curl -s -m 5 http://127.0.0.1:7805/_ring)
+echo "ring: $ring"
+mode=$(echo "$ring" | python3 -c 'import sys,json;print(json.load(sys.stdin)["mode"])' 2>/dev/null)
+[ "$mode" = "ring" ] || { echo "FAIL: coordinator mode is '$mode', expected ring"; exit 1; }
+
+# manifest.json names one document the splitter filed on each shard. The
+# coordinator must put each of them back on that same shard; if it did not, a
+# write routed through the coordinator would land on a shard that does not hold
+# the document the splitter gave it.
+if [ -f "$CORPUS/manifest.json" ]; then
+  for k in 0 1 2; do
+    id=$(python3 -c "import json,sys;m=json.load(open(sys.argv[1]));print(m['sample'][$k])" "$CORPUS/manifest.json")
+    [ -n "$id" ] && [ "$id" != "None" ] || continue
+    got=$(curl -s -m 5 "http://127.0.0.1:7805/_placement?id=$id" \
+      | python3 -c 'import sys,json;print(json.load(sys.stdin)["shard"])' 2>/dev/null)
+    if [ "$got" = "$k" ]; then
+      echo "ok: $id -> shard $got"
+    else
+      echo "FAIL: splitter put $id on shard $k, coordinator says $got"
+      exit 1
+    fi
+  done
+else
+  echo "FAIL: $CORPUS/manifest.json missing (regenerate the corpus)"
+  exit 1
+fi
+
+# ---- claim 4: the ring reshuffles less than modulo ------------------------
+echo "== claim 4: a rebalance plan moves less under the ring than under modulo =="
+plan=$(curl -s -m 60 "http://127.0.0.1:7805/_plan?shards=4")
+echo "plan: $plan"
+eval "$(echo "$plan" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print("ids=%d ring_pct=%s mod_pct=%s ring_moved=%d mod_moved=%d" % (
+    d["ids"], round(d["ring"]["moved_pct"], 1), round(d["modulo"]["moved_pct"], 1),
+    d["ring"]["moved"], d["modulo"]["moved"]))
+' 2>/dev/null)"
+echo "over $ids ids: ring would move $ring_moved ($ring_pct%), modulo $mod_moved ($mod_pct%)"
+python3 - "$ids" "$ring_pct" "$mod_pct" <<'PY' || exit 1
+import sys
+ids, ring, mod = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
+if ids < 3000:
+    print("FAIL: plan covered only %d ids" % ids); sys.exit(1)
+if not (20.0 <= ring <= 30.0):
+    print("FAIL: ring moved %s%%, expected about 25%%" % ring); sys.exit(1)
+if not (65.0 <= mod <= 85.0):
+    print("FAIL: modulo moved %s%%, expected about 75%%" % mod); sys.exit(1)
+print("ok: ring %s%% vs modulo %s%% (ideal 25%%)" % (ring, mod))
+PY
+
 # ---- claim 2: killing a shard yields a partial answer with accounting ------
 echo "== claim 2: shard failure is reported, not hidden =="
 before=$(curl -s -m 20 "http://127.0.0.1:7805/search?q=parser&limit=10" \
   | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["total"],d["shards"]["ok"])')
+before_total=$(echo "$before" | awk '{print $1}')
 echo "before: total=$before"
 
 # Kill shard 1 by the PID recorded at startup. Matching on command-line
@@ -117,11 +175,16 @@ if [ -z "$ok" ]; then
 fi
 if [ "$ok" = "2" ] && [ "$failed" = "1" ]; then
   echo "ok: partial answer reported exactly (ok=2 failed=1)"
-  if [ "$total" -ge "2376" ]; then
-    echo "FAIL: total did not drop after losing a shard (total=$total)"
+  # The total must actually shrink. A number that is a lower bound presented as
+  # an exact count, or a total that ignores the dead shard, both look fine until
+  # the answer is wrong. Comparing against the pre-kill total rather than a
+  # hard-coded threshold keeps this valid when the corpus changes.
+  if [ -n "$total" ] && [ "$total" -lt "$before_total" ]; then
+    echo "ok: total dropped $before_total -> $total, so the answer is visibly partial"
+  else
+    echo "FAIL: total did not drop after losing a shard (before=$before_total after=$total)"
     exit 1
   fi
-  echo "ok: total dropped to $total, so the answer is visibly partial"
 else
   echo "FAIL: unexpected shard accounting ok=$ok failed=$failed"
   exit 1

@@ -31,6 +31,14 @@ struct ServerState {
   mut cluster : Array[ShardGroup]
   /// Candidate pool asked of each shard before the coordinator's top-k cut.
   mut pool_per_shard : Int32
+  /// How a coordinator decides which group owns a document. Defaults to the
+  /// consistent-hash ring; `modulo` is kept for the reshuffle comparison.
+  mut shard_mode : ShardMode
+  /// The ring for the current shard count, built once at startup. Rebuilding it
+  /// per write would be O(vnodes · shards) on every document.
+  mut ring : HashRing
+  /// Virtual nodes per shard, so the balance can be tuned from the command line.
+  mut vnodes : Int32
 }
 
 ///|
@@ -48,6 +56,22 @@ fn ServerState::new(schema : Array[@moonseek.FieldSchema]) -> ServerState {
     recent_next: 0,
     cluster: [],
     pool_per_shard: 200,
+    shard_mode: Ring,
+    ring: build_ring(0),
+    vnodes: RING_VNODES,
+  }
+}
+
+///|
+/// The shard group that owns a document, under the coordinator's placement
+/// rule. A single node (`cluster` empty) owns everything.
+fn ServerState::group_for(self : ServerState, id : String) -> Int32 {
+  if self.cluster.is_empty() {
+    return -1
+  }
+  match self.shard_mode {
+    Ring => self.ring.owner(id)
+    Modulo => shard_for(id, self.cluster.length())
   }
 }
 
@@ -108,6 +132,8 @@ async fn main {
   let mut shards_text = ""
   let mut pool_per_shard : Int32 = 200
   let mut shard_port : String? = None
+  let mut shard_mode_text = "ring"
+  let mut vnodes : Int32 = RING_VNODES
   let mut i = 1
   while i < argv.length() {
     let a = argv[i]
@@ -132,9 +158,15 @@ async fn main {
     } else if a == "--shard-port" && i + 1 < argv.length() {
       shard_port = Some(argv[i + 1])
       i += 2
+    } else if a == "--shard-mode" && i + 1 < argv.length() {
+      shard_mode_text = argv[i + 1]
+      i += 2
+    } else if a == "--vnodes" && i + 1 < argv.length() {
+      vnodes = @string.parse_int(argv[i + 1]) catch { _ => RING_VNODES }
+      i += 2
     } else if a == "--help" {
       println(
-        "moonseek-server [--addr host:port] [--index snap.msk] [--assets dir] [--schema name:w,...] [--shards h:p[|r],...] [--pool N] [--shard-port host:port]",
+        "moonseek-server [--addr host:port] [--index snap.msk] [--assets dir] [--schema name:w,...] [--shards h:p[|r],...] [--pool N] [--shard-port host:port] [--shard-mode ring|modulo] [--vnodes N]",
       )
       return ()
     } else {
@@ -174,10 +206,26 @@ async fn main {
   // A coordinator owns no documents: it holds a shard list and fans out. Both
   // roles run the same binary, so this is the only switch between them.
   if !shards_text.is_empty() {
+    let mode = match parse_shard_mode(shard_mode_text) {
+      Some(m) => m
+      None => {
+        println("bad --shard-mode \{shard_mode_text}: expected ring or modulo")
+        return ()
+      }
+    }
     state.cluster = parse_shards(shards_text)
     state.pool_per_shard = pool_per_shard
+    state.shard_mode = mode
+    state.vnodes = vnodes
+    state.ring = build_ring(state.cluster.length(), vnodes~)
     println(
-      "coordinating " + state.cluster.length().to_string() + " shard group(s)",
+      "coordinating " +
+      state.cluster.length().to_string() +
+      " shard group(s), placement " +
+      (if mode is Ring { "ring" } else { "modulo" }) +
+      ", " +
+      state.ring.points.length().to_string() +
+      " ring points",
     )
   }
   let assets : String? = assets_dir
@@ -206,9 +254,7 @@ async fn main {
       }
       println("shard listener on tcp://" + port)
       @async.with_task_group(async fn(group) {
-        let _ = group.spawn(async fn() {
-          run_shard_listener(state, shard_addr)
-        })
+        let _ = group.spawn(async fn() { run_shard_listener(state, shard_addr) })
         server.run_forever(async fn(req, reader, conn) {
           handle(state, assets, req, reader, conn)
         })
@@ -238,7 +284,9 @@ async fn run_shard_listener(state : ServerState, addr : @socket.Addr) -> Unit {
     let body = sock.read_exactly(length) catch { _ => return () }
     let text = @utf8.decode(body) catch { _ => return () }
     let answer = shard_handle(state, text.trim().to_owned())
-    sock.write(frame(@utf8.encode(answer))) catch { _ => () }
+    sock.write(frame(@utf8.encode(answer))) catch {
+      _ => ()
+    }
   })
 }
 
@@ -343,8 +391,81 @@ fn shard_handle(state : ServerState, request : String) -> String {
       // `df` and field lengths for the terms the coordinator named, so a
       // two-phase query carries only the statistics it will read.
       shard_stats(state, requested_terms(obj))
+    "ids" =>
+      // Every live document id this shard holds. The coordinator uses these to
+      // plan a rebalance over the real keys rather than a synthetic sample.
+      shard_ids(state)
     _ => "{\"error\":\"unknown op\"}"
   }
+}
+
+///|
+/// The live document ids in this shard, as `{"ids":[...],"docs":N}`.
+///
+/// Walks the index's slots rather than any per-field structure: a document with
+/// empty text in every field still has an id and still has to be moved by a
+/// rebalance plan, so it must be counted here.
+fn shard_ids(state : ServerState) -> String {
+  let items : Array[String] = []
+  for id in local_ids(state) {
+    items.push(@json.to_json(id).stringify())
+  }
+  "{\"ids\":[" +
+  items.join(",") +
+  "],\"docs\":" +
+  state.index.doc_count().to_string() +
+  "}"
+}
+
+///|
+/// Every live document id in this process's own index, in slot order.
+fn local_ids(state : ServerState) -> Array[String] {
+  let ids : Array[String] = []
+  for slot in 0..<state.index.slot_count() {
+    if state.index.is_deleted(slot) {
+      continue
+    }
+    match state.index.doc_id(slot) {
+      Some(id) => ids.push(id)
+      None => ()
+    }
+  }
+  ids
+}
+
+///|
+fn shard_mode_name(mode : ShardMode) -> String {
+  match mode {
+    Ring => "ring"
+    Modulo => "modulo"
+  }
+}
+
+///|
+/// A rebalance plan as JSON, with the movement fraction already computed: the
+/// raw counts are not comparable at a glance, and the fraction is the number
+/// that decides whether a grow-in-place is worth it.
+fn rebalance_to_json(plan : Rebalance) -> Json {
+  let fields : Map[String, Json] = Map([])
+  fields["moved"] = @json.to_json(plan.moved)
+  fields["total"] = @json.to_json(plan.total)
+  let pct = if plan.total == 0 {
+    0.0
+  } else {
+    plan.moved.to_double() / plan.total.to_double() * 100.0
+  }
+  fields["moved_pct"] = @json.to_json(pct)
+  let before : Array[Json] = []
+  for count in plan.before {
+    before.push(@json.to_json(count))
+  }
+  let after : Array[Json] = []
+  for count in plan.after {
+    after.push(@json.to_json(count))
+  }
+  fields["before"] = Json::array(before)
+  fields["after"] = Json::array(after)
+  Json::object(fields)
 }
 
 ///|
@@ -385,24 +506,26 @@ fn shard_search(state : ServerState, query : String, limit : Int32) -> String {
   // hit, which dominated the cluster's per-query latency until this became a
   // count-only path.
   let total = state.index.count(query) catch { _ => 0 }
-  "{\"hits\":[" + items.join(",") + "],\"docs\":" +
-  state.index.doc_count().to_string() + ",\"total\":" +
-  total.to_string() + "}"
+  "{\"hits\":[" +
+  items.join(",") +
+  "],\"docs\":" +
+  state.index.doc_count().to_string() +
+  ",\"total\":" +
+  total.to_string() +
+  "}"
 }
 
 ///|
 /// Corpus statistics for the named (field, term) pairs, plus per-field length
 /// sums and live counts so the coordinator can compute a global `avgdl`.
-fn shard_stats(
-  state : ServerState,
-  terms : Array[(String, String)],
-) -> String {
+fn shard_stats(state : ServerState, terms : Array[(String, String)]) -> String {
   let entries : Array[String] = []
   let fields_seen : Array[String] = []
   for (field, term) in terms {
     let key = stat_key(field, term)
     entries.push(
-      @json.to_json(key).stringify() + ":" +
+      @json.to_json(key).stringify() +
+      ":" +
       state.index.doc_freq(field, term).to_string(),
     )
     if !fields_seen.contains(field) {
@@ -416,19 +539,26 @@ fn shard_stats(
     // re-analyzed every document's text to recount tokens, which turned a
     // statistics round into a full re-index and cost ~45 ms per query.
     lengths.push(
-      @json.to_json(field).stringify() + ":" +
+      @json.to_json(field).stringify() +
+      ":" +
       state.index.field_length_total(field).to_string(),
     )
     counts.push(
-      @json.to_json(field).stringify() + ":" +
+      @json.to_json(field).stringify() +
+      ":" +
       state.index.field_doc_count(field).to_string(),
     )
   }
-  "{\"docs\":" + state.index.doc_count().to_string() + ",\"df\":{" +
-  entries.join(",") + "},\"field_lengths\":{" + lengths.join(",") +
-  "},\"field_counts\":{" + counts.join(",") + "}}"
+  "{\"docs\":" +
+  state.index.doc_count().to_string() +
+  ",\"df\":{" +
+  entries.join(",") +
+  "},\"field_lengths\":{" +
+  lengths.join(",") +
+  "},\"field_counts\":{" +
+  counts.join(",") +
+  "}}"
 }
-
 
 ///|
 /// Parse `name:weight,name:weight` into a schema.
@@ -445,7 +575,7 @@ fn parse_schema(text : String) -> Array[@moonseek.FieldSchema]? {
         let weight = @string.parse_double(trimmed[idx + 1:].to_owned()) catch {
           _ => return None
         }
-        out.push({ name, weight })
+        out.push({ name, weight, })
       }
       None => return None
     }
@@ -522,6 +652,111 @@ async fn handle(
       respond_json(conn, 200, "OK", text)
       return ()
     }
+    "/_ring" => {
+      // What the coordinator's placement actually is: the rule, the ring size,
+      // and how the ring's points split across shards. Point counts are not
+      // document counts, but a shard holding two thirds of the *points* is the
+      // first sign the hash is skewed.
+      let fields : Map[String, Json] = Map([])
+      let is_coordinator = !state.cluster.is_empty()
+      fields["role"] = @json.to_json(
+        if is_coordinator {
+          "coordinator"
+        } else {
+          "node"
+        },
+      )
+      fields["shards"] = @json.to_json(state.cluster.length())
+      fields["mode"] = @json.to_json(shard_mode_name(state.shard_mode))
+      fields["vnodes"] = @json.to_json(state.vnodes)
+      fields["ring_points"] = @json.to_json(state.ring.points.length())
+      let counts = Array::make(state.cluster.length(), 0)
+      for point in state.ring.points {
+        if point.1 >= 0 && point.1 < counts.length() {
+          counts[point.1] = counts[point.1] + 1
+        }
+      }
+      let per_shard : Array[Json] = []
+      let primaries : Array[Json] = []
+      for i in 0..<counts.length() {
+        per_shard.push(@json.to_json(counts[i]))
+        let entry : Map[String, Json] = Map([])
+        entry["primary"] = @json.to_json(state.cluster[i].primary)
+        entry["points"] = @json.to_json(counts[i])
+        primaries.push(Json::object(entry))
+      }
+      fields["points_per_shard"] = Json::array(per_shard)
+      fields["groups"] = Json::array(primaries)
+      respond_json(conn, 200, "OK", Json::object(fields).stringify())
+      return ()
+    }
+    "/_placement" => {
+      // Which shard group owns one document id. The client-visible half of the
+      // placement rule: a client can compute the same answer itself, and this
+      // is how that is checked rather than assumed.
+      let id = get_param(params, "id")
+      let owner = state.group_for(id)
+      let fields : Map[String, Json] = Map([])
+      fields["id"] = @json.to_json(id)
+      fields["shard"] = @json.to_json(owner)
+      fields["mode"] = @json.to_json(shard_mode_name(state.shard_mode))
+      fields["local"] = @json.to_json(owner < 0)
+      if owner >= 0 && owner < state.cluster.length() {
+        fields["primary"] = @json.to_json(state.cluster[owner].primary)
+      }
+      respond_json(conn, 200, "OK", Json::object(fields).stringify())
+      return ()
+    }
+    "/_plan" => {
+      // A rebalancing plan: how many documents would move if the cluster grew
+      // (or shrank) to `shards` groups, under both placement rules. Answers
+      // from the real document ids, gathered from the shards, not from a
+      // synthetic sample.
+      let target = int_param(params, "shards", 0)
+      if target <= 0 || target > 1024 {
+        return respond_json(
+          conn,
+          400,
+          "Bad Request",
+          error_json("bad_request", "?shards=N is required (1..1024)"),
+        )
+      }
+      let (ids, failed) = if state.cluster.is_empty() {
+        (local_ids(state), Array::make(0, ""))
+      } else {
+        let config : ClusterConfig = {
+          shards: state.cluster,
+          pool_per_shard: state.pool_per_shard,
+          timeout_ms: 4000,
+        }
+        cluster_all_ids(config)
+      }
+      let from_shards = if state.cluster.is_empty() {
+        1
+      } else {
+        state.cluster.length()
+      }
+      let ring = rebalance_plan(ids, from_shards, target, Ring)
+      let modulo = rebalance_plan(ids, from_shards, target, Modulo)
+      let fields : Map[String, Json] = Map([])
+      fields["ids"] = @json.to_json(ids.length())
+      fields["from_shards"] = @json.to_json(from_shards)
+      fields["to_shards"] = @json.to_json(target)
+      // Which rule the coordinator is actually using, so a client is not left
+      // guessing which of the two numbers below is in force.
+      fields["active_mode"] = @json.to_json(shard_mode_name(state.shard_mode))
+      fields["ring"] = rebalance_to_json(ring)
+      fields["modulo"] = rebalance_to_json(modulo)
+      if failed.length() > 0 {
+        let addrs : Array[Json] = []
+        for address in failed {
+          addrs.push(@json.to_json(address))
+        }
+        fields["failed_addresses"] = Json::array(addrs)
+      }
+      respond_json(conn, 200, "OK", Json::object(fields).stringify())
+      return ()
+    }
     "/_dfs" => {
       // Diagnostics for the two-phase path: what the coordinator gathered.
       if state.cluster.is_empty() {
@@ -554,7 +789,9 @@ async fn handle(
       fields["suggestion"] = @json.to_json(state.index.suggest(q).unwrap_or(""))
       let fuzzy : Array[Json] = []
       for m in state.index.fuzzy_terms(q, max_distance=2) {
-        fuzzy.push(Json::array([@json.to_json(m.term), @json.to_json(m.distance)]))
+        fuzzy.push(
+          Json::array([@json.to_json(m.term), @json.to_json(m.distance)]),
+        )
       }
       fields["fuzzy"] = Json::array(fuzzy)
       respond_json(conn, 200, "OK", Json::object(fields).stringify())
@@ -629,16 +866,15 @@ async fn handle(
         return ()
       }
     }
-    "/index/bulk" => {
+    "/index/bulk" =>
       if http_method is Post {
         let body = read_body(reader)
         respond_json(conn, 200, "OK", index_bulk(state, body))
         return ()
       }
-    }
     _ => ()
   }
-  if (serve_asset(assets, route, conn)) {
+  if serve_asset(assets, route, conn) {
     return ()
   }
   respond_json(
@@ -724,13 +960,15 @@ async fn serve_asset(
 /// Read a request body fully.
 async fn read_body(reader : &@io.Reader) -> String {
   let data = reader.read_all() catch { _ => return "" }
-  data.text() catch { _ => "" }
+  data.text() catch {
+    _ => ""
+  }
 }
 
 ///|
 async fn respond_json(
   conn : @http.ServerConnection,
-  code : Int,
+  code : Int32,
   reason : String,
   body : String,
 ) -> Unit {
@@ -845,10 +1083,12 @@ fn parse_query_string(text : String) -> Array[(String, String)] {
     }
     match pair.find("=") {
       Some(idx) =>
-        out.push((
-          percent_decode(pair[:idx].to_owned()),
-          percent_decode(pair[idx + 1:].to_owned()),
-        ))
+        out.push(
+          (
+            percent_decode(pair[:idx].to_owned()),
+            percent_decode(pair[idx + 1:].to_owned()),
+          ),
+        )
       None => out.push((percent_decode(pair.to_owned()), ""))
     }
   }
@@ -864,7 +1104,7 @@ fn percent_decode(text : String) -> String {
     return text
   }
   let chars = text.to_array()
-  let bytes : Array[Int] = []
+  let bytes : Array[Int32] = []
   let mut i = 0
   while i < chars.length() {
     let c = chars[i]
@@ -906,7 +1146,7 @@ fn percent_decode(text : String) -> String {
 }
 
 ///|
-fn hex_value(c : Char) -> Int? {
+fn hex_value(c : Char) -> Int32? {
   let n = c.to_int()
   if n >= 48 && n <= 57 {
     Some(n - 48)
@@ -942,12 +1182,18 @@ fn params_all(params : Array[(String, String)], key : String) -> Array[String] {
 }
 
 ///|
-fn int_param(params : Array[(String, String)], key : String, fallback : Int32) -> Int32 {
+fn int_param(
+  params : Array[(String, String)],
+  key : String,
+  fallback : Int32,
+) -> Int32 {
   let text = get_param(params, key)
   if text.is_empty() {
     return fallback
   }
-  @string.parse_int(text) catch { _ => fallback }
+  @string.parse_int(text) catch {
+    _ => fallback
+  }
 }
 
 ///|
@@ -960,7 +1206,9 @@ fn double_param(
   if text.is_empty() {
     return fallback
   }
-  @string.parse_double(text) catch { _ => fallback }
+  @string.parse_double(text) catch {
+    _ => fallback
+  }
 }
 
 ///|
@@ -978,7 +1226,7 @@ async fn do_search(
   state : ServerState,
   params : Array[(String, String)],
   body : Json?,
-) -> String raise {
+) -> String {
   let index = state.index
   let mut query = get_param(params, "q")
   let mut limit = int_param(params, "limit", 10)
@@ -1009,7 +1257,8 @@ async fn do_search(
   }
   for raw in params_all(params, "filter") {
     match raw.find(":") {
-      Some(idx) => push_filter(filters, raw[:idx].to_owned(), raw[idx + 1:].to_owned())
+      Some(idx) =>
+        push_filter(filters, raw[:idx].to_owned(), raw[idx + 1:].to_owned())
       None => ()
     }
   }
@@ -1159,13 +1408,7 @@ async fn do_search(
       fusion~,
     )
     return render_hybrid(
-      state,
-      fused,
-      query,
-      highlight_field,
-      snippet_chars,
-      started,
-      fusion,
+      state, fused, query, highlight_field, snippet_chars, started, fusion,
     )
   }
   let options : @moonseek.SearchOptions = {
@@ -1197,7 +1440,11 @@ async fn do_search(
   }
   fields["facets"] = Json::object(facet_obj)
   if !aggs.is_empty() {
-    let agg_results = index.aggregate(query, aggs, filters=simple_filters(filters))
+    let agg_results = index.aggregate(
+      query,
+      aggs,
+      filters=simple_filters(filters),
+    )
     let arr : Array[Json] = []
     for a in agg_results {
       arr.push(a.to_json())
@@ -1240,7 +1487,7 @@ async fn render_cluster(
   limit : Int32,
   started : UInt64,
   want_dfs : Bool,
-) -> String raise {
+) -> String {
   let config : ClusterConfig = {
     shards: state.cluster,
     pool_per_shard: state.pool_per_shard,
@@ -1344,7 +1591,7 @@ fn push_filter(
       return ()
     }
   }
-  filters.push({ field, values: [value] })
+  filters.push({ field, values: [value], })
 }
 
 ///|
@@ -1360,21 +1607,19 @@ fn parse_agg_shorthand(text : String) -> @moonseek.AggSpec? {
   match parts {
     [field, "terms"] => Some(@moonseek.TermsAgg(field, 10))
     [field, "terms", size] =>
-      Some(
-        @moonseek.TermsAgg(
-          field,
-          @string.parse_int(size) catch { _ => 10 },
-        ),
-      )
+      Some(@moonseek.TermsAgg(field, @string.parse_int(size) catch { _ => 10 }))
     [field, "stats"] => Some(@moonseek.StatsAgg(field))
     [field, "histogram", interval] =>
       Some(
         @moonseek.HistogramAgg(
           field,
-          @string.parse_double(interval) catch { _ => 1.0 },
+          @string.parse_double(interval) catch {
+            _ => 1.0
+          },
         ),
       )
-    [field, "percentiles"] => Some(@moonseek.PercentilesAgg(field, [50.0, 90.0, 99.0]))
+    [field, "percentiles"] =>
+      Some(@moonseek.PercentilesAgg(field, [50.0, 90.0, 99.0]))
     _ => None
   }
 }
@@ -1509,8 +1754,10 @@ fn render_hybrid(
   )
   let hits : Array[Json] = []
   for h in fused {
-    let hit : @moonseek.Hit = { id: h.id, score: h.score }
-    let json = hit_json(state, hit, query, highlight_field, snippet_chars, false)
+    let hit : @moonseek.Hit = { id: h.id, score: h.score, }
+    let json = hit_json(
+      state, hit, query, highlight_field, snippet_chars, false,
+    )
     match json {
       Object(map) => {
         map["lexical_rank"] = @json.to_json(h.lexical_rank)
@@ -1555,7 +1802,7 @@ fn apply_document(state : ServerState, body : String) -> String raise {
   for f in state.schema {
     doc_fields.push((f.name, values.get_or_default(f.name, "")))
   }
-  index.add({ id, fields: doc_fields })
+  index.add({ id, fields: doc_fields, })
   match obj.get("facets") {
     Some(Object(fs)) => {
       let facets : Array[(String, Array[String])] = []

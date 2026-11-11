@@ -46,7 +46,7 @@ pub(all) struct ClusterConfig {
   /// globally.
   pool_per_shard : Int32
   /// Milliseconds before a shard is considered unavailable.
-  timeout_ms : Int
+  timeout_ms : Int32
 } derive(Eq, Debug)
 
 ///|
@@ -56,20 +56,237 @@ pub extend ClusterConfig with Eq::{equal, not_equal}
 pub extend ClusterConfig with @debug.Debug::{to_repr}
 
 ///|
-/// Deterministic shard assignment: FNV-1a over the id. Deterministic because a
-/// document must return to the same shard on every write — otherwise a
-/// re-index would leave two copies on different shards and a search would
-/// return it twice.
+/// FNV-1a over the **UTF-8 bytes** of a string.
+///
+/// Byte-wise, not code-unit-wise: this hashes `@utf8.encode(text)`, so the
+/// offline splitter in `tools/make-shard-corpus.mjs` (which hashes
+/// `Buffer.from(id, "utf8")`) and this function agree for non-ASCII ids too.
+/// An earlier version hashed `String::to_array()`, which is UTF-16, so a CJK id
+/// would have hashed differently in the coordinator and in the splitter. That
+/// went unnoticed only because every generated id was ASCII, where the low byte
+/// of a UTF-16 unit equals the UTF-8 byte. There is a cross-language golden
+/// test for this (`hashing" in server/cluster_wbtest.mbt`).
+pub fn fnv1a(text : String) -> UInt32 {
+  let mut hash : UInt32 = 2166136261U
+  for b in @utf8.encode(text) {
+    hash = hash ^ (b.to_int().reinterpret_as_uint() & 0xFFU)
+    hash = hash * 16777619U
+  }
+  hash
+}
+
+///|
+/// MurmurHash3's 32-bit finalizer.
+fn fmix32(x : UInt32) -> UInt32 {
+  let mut h = x
+  h = h ^ (h >> 16)
+  h = h * 0x85EBCA6BU
+  h = h ^ (h >> 13)
+  h = h * 0xC2B2AE35U
+  h = h ^ (h >> 16)
+  h
+}
+
+///|
+/// The hash a cluster places a key with: FNV-1a mixed through `fmix32`.
+///
+/// FNV-1a on its own is **linear** in the input bytes — `pkg/1`, `pkg/2`, …
+/// differ only in the last byte, so their hashes sit in an arithmetic
+/// progression with step `16777619` and cluster. That is harmless for
+/// `hash % N`, which only needs the low bits, but it wrecks a hash ring: a ring
+/// whose *points* are built from such keys measured **29% / 21% / 50%** behind
+/// three shards. The Murmur3 finalizer breaks the linearity and the same ring
+/// measures **36% / 28% / 36%**, with real id sets landing within 5% of even.
+/// One multiply chain, and it is the reason the ring is usable at all.
+pub fn hash_key(text : String) -> UInt32 {
+  fmix32(fnv1a(text))
+}
+
+///|
+/// Deterministic shard assignment: the key hash modulo the shard count.
+/// Deterministic because a document must return to the same shard on every
+/// write — otherwise a re-index would leave two copies on different shards and
+/// a search would return it twice.
+///
+/// This is the *modulo* placement. It is kept because it is the honest
+/// baseline the ring is measured against: `hash % N` renumbers nearly every
+/// key when `N` changes. See `HashRing` and `rebalance_plan`.
 pub fn shard_for(id : String, shard_count : Int32) -> Int32 {
   if shard_count <= 0 {
     return 0
   }
-  let mut hash : UInt32 = 2166136261U
-  for c in id.to_array() {
-    hash = hash ^ (c.to_int().reinterpret_as_uint() & 0xFFU)
-    hash = hash * 16777619U
+  (hash_key(id) % shard_count.reinterpret_as_uint()).reinterpret_as_int()
+}
+
+///|
+/// Virtual nodes per shard on the ring.
+///
+/// Each shard claims many positions instead of one, which shrinks the arcs and
+/// evens out the load. One point per shard would put most of a three-shard ring
+/// behind whichever shard happened to land first; at 128 the measured imbalance
+/// is a few percent.
+pub const RING_VNODES : Int32 = 128
+
+///|
+/// A consistent-hash ring: one sorted array of `(position, shard)` points.
+///
+/// The whole reason it exists is the reshuffle cost. With `hash % N`, adding a
+/// shard changes the divisor for every key, so almost every document moves.
+/// With a ring, a key belongs to the first point at or after its position, so
+/// adding a shard only moves the arcs the new shard's points take over — about
+/// `1/N` of the corpus. `rebalance_plan` measures both, and docs/cluster.md
+/// quotes the numbers.
+pub(all) struct HashRing {
+  /// Ascending by position. Positions are unique in practice because the point
+  /// hash mixes in the shard index and the virtual-node index.
+  points : Array[(UInt32, Int32)]
+  shard_count : Int32
+} derive(Eq, Debug)
+
+///|
+pub extend HashRing with Eq::{equal, not_equal}
+
+///|
+pub extend HashRing with @debug.Debug::{to_repr}
+
+///|
+/// Build the ring for `shard_count` shards.
+///
+/// The point hash covers only `shard:<index>#<vn>` — the shard's *position in
+/// the list*, never its address. Moving a shard to another host, or renaming
+/// it, must not move a single document; only adding or removing a shard should.
+pub fn build_ring(
+  shard_count : Int32,
+  vnodes~ : Int32 = RING_VNODES,
+) -> HashRing {
+  let points : Array[(UInt32, Int32)] = []
+  if shard_count > 0 && vnodes > 0 {
+    for s in 0..<shard_count {
+      let prefix = "shard:" + s.to_string() + "#"
+      for v in 0..<vnodes {
+        points.push((hash_key(prefix + v.to_string()), s))
+      }
+    }
   }
-  (hash % shard_count.reinterpret_as_uint()).reinterpret_as_int()
+  points.sort_by(fn(a, b) {
+    let c = a.0.compare(b.0)
+    if c == 0 {
+      a.1.compare(b.1)
+    } else {
+      c
+    }
+  })
+  { points, shard_count, }
+}
+
+///|
+/// The shard that owns a key: the first ring point at or after the key's
+/// position, wrapping to the first point when the key falls past the last one.
+pub fn HashRing::owner(self : HashRing, id : String) -> Int32 {
+  if self.points.length() == 0 {
+    return 0
+  }
+  let target = hash_key(id)
+  // Lower bound: the first point whose position is >= the key.
+  let mut lo = 0
+  let mut hi = self.points.length()
+  while lo < hi {
+    let mid = (lo + hi) / 2
+    if self.points[mid].0 < target {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  let idx = if lo >= self.points.length() { 0 } else { lo }
+  self.points[idx].1
+}
+
+///|
+/// Which placement rule a coordinator uses.
+pub(all) enum ShardMode {
+  /// Consistent hashing: `HashRing::owner`.
+  Ring
+  /// `hash(id) % shards`. Kept for the reshuffle comparison.
+  Modulo
+} derive(Eq, Debug)
+
+///|
+pub extend ShardMode with Eq::{equal, not_equal}
+
+///|
+pub extend ShardMode with @debug.Debug::{to_repr}
+
+///|
+/// Parse `ring` / `modulo`, defaulting to the ring. An unknown word is an error
+/// rather than a silent fallback: a coordinator that quietly used a different
+/// rule than the operator asked for would place documents somewhere the
+/// operator's own tooling disagrees with.
+pub fn parse_shard_mode(text : String) -> ShardMode? {
+  match text.trim().to_lower() {
+    "ring" | "hashring" | "consistent" | "" => Some(Ring)
+    "modulo" | "mod" => Some(Modulo)
+    _ => None
+  }
+}
+
+///|
+/// Where a set of ids lands, before and after a change of shard count, and how
+/// much moved.
+pub(all) struct Rebalance {
+  before : Array[Int32]
+  after : Array[Int32]
+  /// Ids whose owning shard index changed.
+  moved : Int32
+  total : Int32
+} derive(Eq, Debug)
+
+///|
+pub extend Rebalance with Eq::{equal, not_equal}
+
+///|
+pub extend Rebalance with @debug.Debug::{to_repr}
+
+///|
+/// Plan a change of shard count: how the ids distribute now, how they would
+/// distribute afterwards, and the fraction that has to be copied.
+///
+/// This is the number that decides whether a cluster can grow without a
+/// rewrite, so it is computed from the real ids rather than estimated.
+pub fn rebalance_plan(
+  ids : Array[String],
+  from_shards : Int32,
+  to_shards : Int32,
+  mode : ShardMode,
+) -> Rebalance {
+  let before = Array::make(from_shards, 0)
+  let after = Array::make(to_shards, 0)
+  let mut moved = 0
+  let ring_before = build_ring(from_shards)
+  let ring_after = build_ring(to_shards)
+  for id in ids {
+    let b = match mode {
+      Ring => ring_before.owner(id)
+      Modulo => shard_for(id, from_shards)
+    }
+    let a = match mode {
+      Ring => ring_after.owner(id)
+      Modulo => shard_for(id, to_shards)
+    }
+    if b >= 0 && b < before.length() {
+      before[b] = before[b] + 1
+    }
+    if a >= 0 && a < after.length() {
+      after[a] = after[a] + 1
+    }
+    // Only a key's *index* matters for movement. Under the ring a key that
+    // stays on "shard 1" has not moved even though the ring was rebuilt, so
+    // comparing indices is the right test, not comparing arcs.
+    if a != b {
+      moved = moved + 1
+    }
+  }
+  { before, after, moved, total: ids.length(), }
 }
 
 ///|
@@ -100,7 +317,9 @@ async fn shard_call(addr_text : String, request : String) -> String? {
   // reading to EOF deadlocks: the client waits for the answer while the server
   // waits for a close that never comes. A 4-byte little-endian length makes
   // both sides independent.
-  sock.write(frame(payload)) catch { _ => return None }
+  sock.write(frame(payload)) catch {
+    _ => return None
+  }
   let reply_header = sock.read_exactly(4) catch { _ => return None }
   let length = unframe_length(reply_header)
   if length <= 0 {
@@ -155,7 +374,7 @@ fn parse_shard_hits(answer : String) -> ShardHits {
         Some(Number(n, ..)) => n.to_int()
         _ => 0
       }
-      { hits, total, ok: true }
+      { hits, total, ok: true, }
     }
     _ => failed_shard()
   }
@@ -163,7 +382,7 @@ fn parse_shard_hits(answer : String) -> ShardHits {
 
 ///|
 fn failed_shard() -> ShardHits {
-  { hits: [], total: 0, ok: false }
+  { hits: [], total: 0, ok: false, }
 }
 
 ///|
@@ -196,7 +415,8 @@ pub fn stats_clause(stats : @moonseek.ExternalStats?) -> String {
       let df_entries : Array[String] = []
       for (key, count) in s.df.iter() {
         df_entries.push(
-          @json.to_json(stat_key(key.0, key.1)).stringify() + ":" +
+          @json.to_json(stat_key(key.0, key.1)).stringify() +
+          ":" +
           count.to_string(),
         )
       }
@@ -206,8 +426,13 @@ pub fn stats_clause(stats : @moonseek.ExternalStats?) -> String {
           @json.to_json(field).stringify() + ":" + value.to_string(),
         )
       }
-      ",\"stats\":{\"n\":" + s.n.to_string() + ",\"df\":{" +
-      df_entries.join(",") + "},\"avgdl\":{" + avgdl_entries.join(",") + "}}"
+      ",\"stats\":{\"n\":" +
+      s.n.to_string() +
+      ",\"df\":{" +
+      df_entries.join(",") +
+      "},\"avgdl\":{" +
+      avgdl_entries.join(",") +
+      "}}"
     }
   }
 }
@@ -283,7 +508,11 @@ async fn cluster_search(
     }
   })
   let top : Array[(String, Double)] = []
-  let cap = if limit <= 0 || hits.length() < limit { hits.length() } else { limit }
+  let cap = if limit <= 0 || hits.length() < limit {
+    hits.length()
+  } else {
+    limit
+  }
   for i in 0..<cap {
     top.push(hits[i])
   }
@@ -316,8 +545,11 @@ async fn cluster_gather_stats(
   let term_json : Array[String] = []
   for (field, term) in terms {
     term_json.push(
-      "[" + @json.to_json(term).stringify() + "," +
-      @json.to_json(field).stringify() + "]",
+      "[" +
+      @json.to_json(term).stringify() +
+      "," +
+      @json.to_json(field).stringify() +
+      "]",
     )
   }
   let request = "{\"op\":\"stats\",\"terms\":[" + term_json.join(",") + "]}"
@@ -412,9 +644,70 @@ async fn cluster_gather_stats(
 }
 
 ///|
-/// The key form used between coordinator and shard.
+/// The key form used between coordinator and shard: `field\u{0}term`.
 pub fn stat_key(field : String, term : String) -> String {
   field + "\u{0}" + term
+}
+
+///|
+/// Collect every live document id from every shard.
+///
+/// Used by the rebalance planner. It reads the real keys rather than a sample,
+/// because "how much would move" is only worth reporting if it is the actual
+/// answer for this corpus. A failed shard contributes nothing and is reported,
+/// so a plan built on a partial corpus is visibly partial.
+async fn cluster_all_ids(
+  config : ClusterConfig,
+) -> (Array[String], Array[String]) {
+  let request = "{\"op\":\"ids\"}"
+  let answers : Array[(String?, String)] = Array::make(
+    config.shards.length(),
+    (None, ""),
+  )
+  @async.with_task_group(fn(group) {
+    for i in 0..<config.shards.length() {
+      let index = i
+      let shard = config.shards[index]
+      let _ = group.spawn(
+        async fn() {
+          let (answer, address) = call_group(shard, request)
+          answers[index] = (answer, address)
+        },
+        allow_failure=true,
+      )
+    }
+  })
+  let ids : Array[String] = []
+  let failed : Array[String] = []
+  for i in 0..<config.shards.length() {
+    let (answer, address) = answers[i]
+    match answer {
+      Some(text) => {
+        let parsed = match parse_json_or_none(text) {
+          Some(j) => j
+          None => {
+            failed.push(address)
+            continue
+          }
+        }
+        match parsed {
+          Object(fields) =>
+            match fields.get("ids") {
+              Some(Array(items)) =>
+                for item in items {
+                  if item is String(id) {
+                    ids.push(id)
+                  }
+                }
+              _ => failed.push(address)
+            }
+          _ => failed.push(address)
+        }
+      }
+      None => failed.push(address)
+    }
+  }
+  (ids, failed)
 }
 
 ///|
@@ -422,16 +715,15 @@ pub fn stat_key(field : String, term : String) -> String {
 /// must ask for exactly these or the global statistics will be incomplete and
 /// the two-phase ranking will differ from a single-node index in a way the
 /// tests cannot explain.
-pub fn query_terms(index : @moonseek.Index, query : String) -> Array[(String, String)]? {
+pub fn query_terms(
+  index : @moonseek.Index,
+  query : String,
+) -> Array[(String, String)]? {
   let fields : Array[String] = []
   for f in index.schema() {
     fields.push(f.name)
   }
-  let parsed = @moonseek.parse_query(
-    query,
-    analyzer=index.analyzer(),
-    fields~,
-  ) catch {
+  let parsed = @moonseek.parse_query(query, analyzer=index.analyzer(), fields~) catch {
     _ => return None
   }
   @moonseek.scoring_terms(index, parsed)
@@ -451,19 +743,20 @@ pub fn parse_shards(text : String) -> Array[ShardGroup] {
       parts.push(p.trim().to_owned())
     }
     match parts {
-      [primary] => out.push({ primary, replicas: [] })
+      [primary] => out.push({ primary, replicas: [], })
       [primary, ..] => {
         let replicas : Array[String] = []
         for i in 1..<parts.length() {
           replicas.push(parts[i])
         }
-        out.push({ primary, replicas })
+        out.push({ primary, replicas, })
       }
       [] => ()
     }
   }
   out
 }
+
 ///|
 /// Frame a payload with a 4-byte little-endian length prefix.
 ///
@@ -472,7 +765,7 @@ pub fn parse_shards(text : String) -> Array[ShardGroup] {
 /// `Bytes::from_fixedarray` is the supported path.
 pub fn frame(payload : Bytes) -> Bytes {
   let len = payload.length()
-  let head : FixedArray[Byte] = FixedArray::make(4, b' ')
+  let head : FixedArray[Byte] = FixedArray::make(4, b'\x00')
   head[0] = (len & 0xFF).to_byte()
   head[1] = ((len >> 8) & 0xFF).to_byte()
   head[2] = ((len >> 16) & 0xFF).to_byte()
@@ -482,7 +775,7 @@ pub fn frame(payload : Bytes) -> Bytes {
 
 ///|
 /// Decode a 4-byte little-endian length prefix.
-pub fn unframe_length(header : BytesView) -> Int {
+pub fn unframe_length(header : BytesView) -> Int32 {
   header[0].to_int() |
   (header[1].to_int() << 8) |
   (header[2].to_int() << 16) |
@@ -493,7 +786,9 @@ pub fn unframe_length(header : BytesView) -> Int {
 /// Parse JSON, collapsing a parse error into None: shard replies arrive over
 /// the network, so a malformed one is a handled case rather than a panic.
 fn parse_json_or_none(text : String) -> Json? {
-  Some(@json.parse(text)) catch { _ => None }
+  Some(@json.parse(text)) catch {
+    _ => None
+  }
 }
 
 ///|
@@ -518,7 +813,8 @@ pub fn stats_to_json(stats : @moonseek.ExternalStats?) -> String {
       let df_entries : Array[String] = []
       for (key, count) in s.df.iter() {
         df_entries.push(
-          @json.to_json(stat_key(key.0, key.1)).stringify() + ":" +
+          @json.to_json(stat_key(key.0, key.1)).stringify() +
+          ":" +
           count.to_string(),
         )
       }
@@ -528,8 +824,13 @@ pub fn stats_to_json(stats : @moonseek.ExternalStats?) -> String {
           @json.to_json(field).stringify() + ":" + value.to_string(),
         )
       }
-      "{\"n\":" + s.n.to_string() + ",\"df\":{" + df_entries.join(",") +
-      "},\"avgdl\":{" + avgdl_entries.join(",") + "}}"
+      "{\"n\":" +
+      s.n.to_string() +
+      ",\"df\":{" +
+      df_entries.join(",") +
+      "},\"avgdl\":{" +
+      avgdl_entries.join(",") +
+      "}}"
     }
   }
 }

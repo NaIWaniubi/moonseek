@@ -1,0 +1,15 @@
+{
+  "mode": "ring",
+  "shards": 3,
+  "vnodes": 128,
+  "counts": [
+    969,
+    1024,
+    1007
+  ],
+  "sample": [
+    "cli/pkg1",
+    "database/pkg2",
+    "cli/pkg0"
+  ]
+}
