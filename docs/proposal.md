@@ -6,7 +6,7 @@ moonseek —— 纯 MoonBit 嵌入式全文搜索引擎
 
 **2、项目简介**
 
-moonseek 是一个完全用 MoonBit 编写的嵌入式全文搜索引擎库。它把「倒排索引 + BM25 排序 + 免词典中文分词 + 崩溃安全持久化」做进一个零 FFI 依赖的纯 MoonBit 核心，同一套代码编译到 native、WebAssembly、JavaScript 三端。使用者把文档喂给库，即可获得关键词、短语、前缀、字段限定、模糊容错与分面过滤检索，以及服务端高亮、逐词项分数解释与 WAL 崩溃恢复；索引可整体序列化为一份带 CRC 校验的快照，支持原子保存与重载。项目已发布 mooncakes 包 v0.4.0（242 项测试全绿、八矩阵 CI 全绿）。
+moonseek 是一个完全用 MoonBit 编写的嵌入式全文搜索引擎库。它把「倒排索引 + BM25 排序 + 免词典中文分词 + 崩溃安全持久化」做进一个零 FFI 依赖的纯 MoonBit 核心，同一套代码编译到 native、WebAssembly、JavaScript 三端。使用者把文档喂给库，即可获得关键词、短语、前缀、字段限定、模糊容错与分面过滤检索，以及服务端高亮、逐词项分数解释与 WAL 崩溃恢复；索引可整体序列化为一份带 CRC 校验的快照，支持原子保存与重载。项目已发布 mooncakes 包 v0.5.1（249 项测试全绿、八矩阵 CI 全绿），并提供浏览器在线演示（GitHub Pages，WasmGC）。
 
 **3、项目方向，通用性说明**
 
@@ -37,4 +37,4 @@ moonseek 是一个完全用 MoonBit 编写的嵌入式全文搜索引擎库。�
 
 https://github.com/NaIWaniubi/moonseek
 
-仓库公开，含 37 个有效 commits（每个对应一次完整功能/修复/文档变更，附实测输出与测试；无空提交与拆分凑数）。仓库内含：双语 README、架构文档、性能白皮书、与 tantivy/Lucene/bleve 的 17 维特性矩阵、三层可运行示例、八矩阵 CI 配置、三路独立评审与修复报告（`docs/review-report.md`）。
+仓库公开，含 45+ 个有效 commits（每个对应一次完整功能/修复/文档变更，附实测输出与测试；无空提交与拆分凑数）。仓库内含：双语 README、架构文档、性能白皮书、与 tantivy/Lucene/bleve 的 17 维特性矩阵、三层可运行示例、八矩阵 CI 配置、三路独立评审与修复报告（`docs/review-report.md`）。

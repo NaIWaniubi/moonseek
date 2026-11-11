@@ -107,6 +107,23 @@ payload := varint version=3
 - Byte layer (portable): `"MWL1"` magic + framed entries (`type byte | payload | crc32`). `wal_decode` replays the complete prefix and stops at the first torn/corrupt tail — exactly "replay all complete entries" after a crash. Repeated headers (each append batch carries one) are skipped.
 - Native layer: `add_durable` appends one CRC-framed entry with `create_mode=OpenOrCreate, append=true, sync=Data` **then** applies in memory. `checkpoint` writes `segments.msk.tmp` → fsync → rename → truncate WAL. `open_or_create` loads the snapshot (corrupt = error) then replays the WAL; replay is idempotent (Add replaces by id, Delete is a tombstone), so a crash between rename and truncate is safe.
 
+## Evaluation (`query.mbt`, `rank.mbt`)
+
+Every posting list is doc-sorted, so a query's result is carried as two
+parallel ascending arrays (`DocScores`) rather than a `doc -> score` map:
+
+- `Term` reads its posting list once, scoring in place (`bm25_context` holds
+  the per-(field, term) constants and a dense field-length array).
+- `And` / `Or` / `Not` are merge joins over the arrays; `MatchAll` /
+  `MatchField` produce ascending doc ranges with score 0.
+- Ranking is a bounded top-K walk (`collect_hits`): a candidate is turned
+  into a `Hit` (id lookup included) only when it beats the current worst of
+  the top set, so a saturated query pays for ten string lookups, not twenty
+  thousand.
+
+The map-based evaluator is kept as a thin wrapper (`eval`) for `explain`,
+which needs random access by doc number.
+
 ## Facets (`facet.mbt`)
 
 Facets are exact-match keyword bags attached to an existing document (`set_facets`), stored per internal doc number and serialized in MSK3. `search_faceted` evaluates the query, filters by facet values (OR within a field, AND across fields), aggregates value counts over the *filtered* result set, and paginates with offset/limit. Facet values are not analyzed — `zh`/`en` stay exact strings, unlike text fields.

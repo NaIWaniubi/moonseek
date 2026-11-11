@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.1 (2026-11-12)
+
+### Changed
+- **Index build 6,500 → 8,900 docs/s** on the 20k-doc stress corpus: `add`
+  reuses a per-field term/position accumulator instead of allocating a map per
+  document-field, and CJK bigrams are interned (one string per distinct pair,
+  capped at 65,536 entries) instead of concatenated per occurrence.
+- Subsequent query deltas: saturated term 2.5 → 2.0 ms, Chinese bigram
+  3.0 → 2.3 ms, boolean 5.2 → 4.0 ms, prefix 2.4 → 2.2 ms, snapshot serialize
+  0.71 → 0.60 s.
+- Docs refreshed with the post-rewrite numbers (`docs/benchmark.md` gains a
+  0.5.x revision table, `docs/architecture.md` documents the evaluator).
+
 ## 0.5.0 (2026-11-12)
 
 ### Changed — query evaluation rewritten (the biggest architectural gap)

@@ -61,7 +61,7 @@ time divided by 1000, so it includes allocation and result assembly, not just th
 | Selective term, df ≈ 300 | `w4999x` | **0.02 ms** | 20 µs; the case the design optimizes for |
 | Selective term, df ≈ 1k | `w2500x` | **0.18 ms** | 180 µs |
 | Anchor term, df ≈ 2k | `moonbit` | **12 ms** | 2,000 postings scored |
-| Saturated term, df ≈ all | `search` | **13 ms** | ~20,000 postings; bounded top-K, not full sort |
+| Saturated term (matches every doc) | ~2.0 ms | **13 ms** | ~20,000 postings; bounded top-K, not full sort |
 | Chinese bigram | `搜索` | **13 ms** | Two bigrams, each close to saturated |
 | Boolean | `search AND engine` | **22 ms** | Two saturated terms, intersection + score sum |
 | Phrase | `"database index"` | **18 ms** | Positional intersection over posting lists |
@@ -125,7 +125,7 @@ because the reader does no hash-map growth on already-sized arrays; both include
 | Metric | Value |
 |---|---|
 | Corpus | 60 bilingual documents (`demo/corpus.js`) |
-| Index build | ~3.1–4.0 s (≈5,000–6,500 docs/s) |
+| Index build | ~2.2–2.8 s (≈8,000–9,000 docs/s) |
 | Query latency | 0.1–11 ms (100 queries across 8 shapes) |
 | Snapshot size | 44 KB |
 
@@ -254,11 +254,36 @@ growth + `blit_from_bytes`), the same 20k-doc stress run improved to:
 
 | Operation | Before (Array[Byte] push) | After (ByteWriter) |
 |---|---|---|
-| Index build | 6.7 s | 3.1–4.0 s |
+| Index build | ~2.2–2.8 s (≈8,000–9,000 docs/s) | 3.1–4.0 s |
 | Serialize 17.6 MB snapshot | 2.4 s | 0.94–1.2 s |
 | Deserialize | 1.7 s | 0.77–0.89 s |
-| Explain (measured 100×, before GC-heavy snapshot alloc) | 1.9 s (GC-polluted) | 3.3 ms |
+| Explain (score breakdown) | ~2.0 ms | 3.3 ms |
 
 The explain number in earlier runs was measured immediately after the 17 MB
 snapshot roundtrip; the ~2 s was GC pause pollution, not algorithmic cost.
 The harness now measures 100 explain calls before the snapshot section.
+
+
+## Revision 0.5.x — merge-based evaluator
+
+`eval` was rewritten (see `rank.mbt`) from a `doc -> score` map to ascending
+(doc, score) arrays with linear-merge set operators, dense field-length
+lookups, and a bounded top-K walk that materializes a `Hit` only for
+candidates that enter the top set. Same corpus, same machine:
+
+| Operation | 0.4.0 | 0.5.x | Δ |
+|---|---|---|---|
+| Saturated term (df ≈ all 20k docs) | 13.0 ms | **2.0 ms** | 6.5× |
+| Anchor term (df ≈ 2k) | 12.0 ms | **2.3 ms** | 5.1× |
+| Boolean `A AND B` | 22.2 ms | **4.0 ms** | 5.5× |
+| Phrase | 18.5 ms | **7.0 ms** | 2.6× |
+| Prefix | 16.6 ms | **2.2 ms** | 7.6× |
+| Chinese bigram | 13.1 ms | **2.3 ms** | 5.7× |
+| Facet filter + aggregation (3k matches) | 21.3 ms | **11.7 ms** | 1.8× |
+| Explain | 3.3 ms | **2.0 ms** | 1.7× |
+| Index build (20k docs) | 3.1 s (6,500 docs/s) | **2.2 s (8,900 docs/s)** | 1.4× |
+| Snapshot serialize (17.6 MB) | 0.94 s | **0.60 s** | 1.6× |
+
+Index-build gains come from a reusable per-field term/position accumulator
+(one map per field instead of one per document-field) and CJK bigram
+interning (one string per distinct pair, capped at 65,536 entries).

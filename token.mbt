@@ -15,6 +15,43 @@ pub extend Token with @debug.Debug::{to_repr}
 ///|
 
 ///|
+/// Interned two-character terms. CJK bigrams repeat heavily inside any real
+/// corpus, so building the same two-char string on every occurrence is pure
+/// allocation churn; this keeps one instance per distinct pair. Capped so a
+/// long-running process with diverse text cannot grow it without bound.
+let bigram_cache : @hashmap.HashMap[Int32, String] = @hashmap.HashMap([])
+
+///|
+const BIGRAM_CACHE_CAP : Int32 = 65536
+
+///|
+/// Pack two code units into one key (BMP only; astral chars pass through
+/// uninterned below).
+fn bigram_key(a : Char, b : Char) -> Int32 {
+  ((a.to_int() & 0xFFFF) << 16) | (b.to_int() & 0xFFFF)
+}
+
+///|
+/// The interned two-character term for a pair, or a fresh string when the
+/// pair is outside the BMP or the cache is at its cap.
+fn intern_bigram(a : Char, b : Char) -> String {
+  if a.to_int() > 0xFFFF || b.to_int() > 0xFFFF {
+    return a.to_string() + b.to_string()
+  }
+  let key = bigram_key(a, b)
+  match bigram_cache.get(key) {
+    Some(s) => s
+    None => {
+      let s = a.to_string() + b.to_string()
+      if bigram_cache.length() < BIGRAM_CACHE_CAP {
+        bigram_cache.set(key, s)
+      }
+      s
+    }
+  }
+}
+
+///|
 /// Default English stop words (Lucene's classic set).
 let default_stop_words : Array[String] = [
   "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into",
@@ -118,10 +155,7 @@ pub fn Analyzer::analyze(self : Analyzer, text : String) -> Array[Token] {
       } else if self.cjk_bigram {
         let mut j = start
         while j + 1 < i {
-          tokens.push({
-            term: chars[j].to_string() + chars[j + 1].to_string(),
-            position,
-          })
+          tokens.push({ term: intern_bigram(chars[j], chars[j + 1]), position, })
           position += 1
           j += 1
         }

@@ -100,6 +100,13 @@ pub struct Index {
   /// (the only operation that introduces new terms); prefix queries reuse it
   /// instead of re-sorting the whole vocabulary.
   priv terms_sorted : @hashmap.HashMap[String, Array[String]]
+  /// Scratch accumulator reused by `add` for term -> position gathering.
+  /// Allocating a fresh HashMap per (document, field) was the single largest
+  /// cost of building an index; the map is cleared and reused instead
+  /// (clearing a small map is far cheaper than constructing one).
+  priv scratch_pos : @hashmap.HashMap[String, Int32]
+  priv scratch_terms : Array[String]
+  priv scratch_poses : Array[Array[Int32]]
   /// Cached dense field-length arrays (doc number -> token count), built
   /// lazily from `stats` and invalidated whenever documents or tombstones
   /// change. Removes the last per-posting hash probe from BM25 scoring.
@@ -143,6 +150,9 @@ pub fn Index::new(
     stored: @hashmap.HashMap([]),
     facets: @hashmap.HashMap([]),
     terms_sorted: @hashmap.HashMap([]),
+    scratch_pos: @hashmap.HashMap([]),
+    scratch_terms: [],
+    scratch_poses: [],
     lengths_dense: @hashmap.HashMap([]),
     bk_trees: @hashmap.HashMap([]),
   }
@@ -208,14 +218,45 @@ pub fn Index::add(self : Index, doc : Document) -> Unit {
     let stats = self.stats[field_name]
     stats.lengths.set(num, tokens.length())
     stats.total_length += tokens.length()
-    // term -> positions within this field
-    let term_pos : @hashmap.HashMap[String, Array[Int32]] = @hashmap.HashMap([])
+    // term -> positions, gathered into the reusable scratch accumulator.
+    // terms/poses are cleared but their inner arrays are recycled by push.
+    // Keep the slot table (scratch_terms) across documents: slots are
+    // reassigned and their position arrays cleared, so only scratch_pos
+    // (the term -> slot map) needs clearing per field.
+    self.scratch_pos.clear()
+    let mut used = 0
     for token in tokens {
-      term_pos.get_or_init(token.term, () => []).push(token.position)
+      let idx = match self.scratch_pos.get(token.term) {
+        Some(i) => i
+        None => {
+          let i = used
+          self.scratch_pos.set(token.term, i)
+          if i < self.scratch_terms.length() {
+            self.scratch_terms[i] = token.term
+            // Reused slot: drop the previous document's positions.
+            self.scratch_poses[i].clear()
+          } else {
+            self.scratch_terms.push(token.term)
+            self.scratch_poses.push([])
+          }
+          used = i + 1
+          i
+        }
+      }
+      self.scratch_poses[idx].push(token.position)
     }
-    for (term, positions) in term_pos.iter() {
+    for i in 0..<used {
+      let term = self.scratch_terms[i]
+      let positions = self.scratch_poses[i]
+      // The posting keeps its own copy: the scratch buffer is reused by the
+      // next document. One copy per (doc, term) is unavoidable, but it is a
+      // plain blit instead of HashMap churn.
       let list = field_map.get_or_init(term, () => [])
-      list.push({ doc: num, freq: positions.length(), positions, })
+      list.push({
+        doc: num,
+        freq: positions.length(),
+        positions: positions.copy(),
+      })
     }
   }
 }
