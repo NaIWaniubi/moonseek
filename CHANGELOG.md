@@ -1,5 +1,94 @@
 # Changelog
 
+## 0.8.0 (2026-11-12)
+
+The distributed layer finished: it now grows without rewriting the corpus, takes
+writes, replicates them, and answers facets and aggregations over the whole corpus
+instead of returning them empty. Five bugs came out of building it, four of which
+had been invisible since 0.7.0.
+
+### Consistent hashing, and the three hashes that were wrong
+
+Placement was `hash(id) % shards`, which renumbers every key when the shard count
+changes. A hash ring with 128 virtual nodes per shard is now the default:
+**adding a fourth shard moves 24.2% of 3,000 real documents instead of 74.9%**
+(the ideal is 25%), and the ids land within 5% of even (969/1024/1007).
+
+Getting there exposed three silent bugs in the hash itself:
+
+* The JavaScript splitter computed `hash * 16777619` as a double. The product of
+  two 32-bit values reaches 7.2e16, past `Number.MAX_SAFE_INTEGER`, so it rounded
+  — it was never FNV-1a. Invisible because placement was never exercised.
+* The MoonBit hash ran over UTF-16 code units while the splitter hashed UTF-8
+  bytes. Those agree for ASCII, which every generated id was, and disagree for
+  Chinese ones.
+* FNV-1a is linear in the input bytes, so sequential ids sit in an arithmetic
+  progression and a ring built from such keys measured **29% / 21% / 50%** behind
+  three shards. MurmurHash3's `fmix32` finalizer brings it to 36% / 28% / 36%.
+
+New: `build_ring`, `HashRing::owner`, `rebalance_plan`, `hash_key`, `parse_shard_mode`,
+`--shard-mode`, `--vnodes`, and the endpoints `GET /_ring`, `GET /_placement?id=…`,
+`GET /_plan?shards=N`. A golden test pins the hash to the JavaScript reference for
+eight ids including two Chinese ones, and the e2e test checks the coordinator's
+placement against the offline splitter document by document.
+
+### Writes: the coordinator accepts them, and replicates
+
+Before this the coordinator could not be written to at all — `POST /index` applied
+the document to the coordinator's own empty index. Writes are now routed to the
+group that owns the id and sent to **every member of that group**, in parallel, and
+`POST /index/bulk` is grouped by owning shard so a shard receives only the
+documents it owns.
+
+`ok` in a write reply means *every* member applied it; a write acknowledged by one
+member of three is reported as not-ok with the addresses that missed it.
+
+Measured end-to-end: 3,000 documents written through the coordinator, **6 of 6
+members acknowledged**, primaries and replicas holding identical shares; killing a
+primary leaves total, ranking and shard accounting byte-identical.
+
+### Distributed facets and aggregations
+
+A coordinator now answers `facets` and `aggs` over the whole corpus. Terms sum per
+value and cap **after** merging (a value ranked `size+1` in one shard can be in the
+global top `size`); stats recombine counts and sums rather than averaging averages
+(measured: 16.0 vs 28.7); histograms order by bucket index, not label text;
+percentiles **ship raw values**, because the median of a union is not the average
+of the medians (measured: 6.5 vs 11.0). Two engine functions became public for
+this: `Index::agg_values` and `percentiles_of`.
+
+`tools/check-distributed-aggs.py` compares a coordinator against a single node with
+stated tolerances, and the cluster test runs it plain, filtered and over an
+empty result set.
+
+### Fixed
+
+* **The coordinator ignored filters for ranking and total.** Found by the
+  aggregation-equality test, which was not looking for it: filters reached the
+  aggregation path but never the search request, so a filtered query returned 2376
+  where a single node returned 1190 and ranked excluded documents.
+* `stat_key` was deleted by a bad edit and restored; `cluster.mbt` had a raw NUL
+  byte inside a byte literal, which broke text tooling.
+* The cluster e2e test's post-failure total check used a hard-coded corpus
+  threshold; it now compares against the pre-kill total.
+
+### Added
+
+* `tools/test-replication.sh` and a fourth CI job for the replication claim.
+* Nine unit tests for the merge rules, each pinning a rule that produces a
+  plausible number when it is wrong. 314 tests.
+* `docs/api.md` documents the three new endpoints and the coordinator's write
+  semantics; `docs/cluster.md` is rewritten around the ring, replication and the
+  merges, with fresh measurements.
+
+### Known
+
+`moon check --target wasm-gc|js` reports 16 deprecation warnings in `web/api.mbt`
+(`Json::as_array`/`as_string` are deprecated in favour of `is` patterns) and two
+unused-import hints in the root `moon.pkg` for non-native targets. They predate
+this release and are cosmetic; native is warning-free under `--deny-warn`. CI does
+not deny warnings.
+
 ## 0.7.1 (2026-11-11)
 
 One fix, found by the new 200k-document benchmark: **tombstones made every query

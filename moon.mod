@@ -3,7 +3,7 @@
 
 name = "NaIWaniubi/moonseek"
 
-version = "0.7.1"
+version = "0.8.0"
 
 readme = "README.md"
 
@@ -27,11 +27,14 @@ keywords = [
   "vector",
   "distributed",
   "aggregation",
+  "consistency",
+  "sharding",
+  "replication",
 ]
 
 preferred_target = "native"
 
-description = "Full-text search engine and service: inverted index, BM25, exact and sloppy phrases, dictionary-free Chinese tokenization, fuzzy search, highlighting, facets, numeric aggregations, HNSW vector search with hybrid fusion, an HTTP service, and a distributed coordinator with scatter-gather, global statistics and failover. One snapshot format across native/WASM/JS."
+description = "Full-text search engine and service: inverted index, BM25, exact and sloppy phrases, dictionary-free Chinese tokenization, fuzzy search, highlighting, facets, numeric aggregations, HNSW vector search with hybrid fusion, an HTTP service, and a distributed cluster with consistent hashing, scatter-gather on global statistics, write replication, failover, and cross-shard aggregations that equal a single node. One snapshot format across native/WASM/JS."
 
 import {
   "moonbitlang/async@0.22.4",

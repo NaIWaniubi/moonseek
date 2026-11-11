@@ -25,7 +25,7 @@ Errors always use the same shape, so a client never has to guess:
 Liveness. Never touches the index.
 
 ```json
-{ "status": "ok", "version": "0.7.0", "uptime_ms": 12043 }
+{ "status": "ok", "version": "0.8.0", "uptime_ms": 12043 }
 ```
 
 ## `GET /_stats`
@@ -47,6 +47,73 @@ Index and process statistics. Cheap enough to poll once a second.
   "memory_bytes": 4194304
 }
 ```
+
+## `GET /_ring`
+
+Placement introspection: which rule the process is using and how the ring's
+points divide across shards. Either role answers it; on a single node the ring
+is empty because there is nothing to place.
+
+```json
+{
+  "role": "coordinator",
+  "shards": 3,
+  "mode": "ring",
+  "vnodes": 128,
+  "ring_points": 384,
+  "points_per_shard": [128, 128, 128],
+  "groups": [
+    { "primary": "127.0.0.1:7901", "points": 128 },
+    { "primary": "127.0.0.1:7902", "points": 128 },
+    { "primary": "127.0.0.1:7903", "points": 128 }
+  ]
+}
+```
+
+Point counts are not document counts, but a shard holding most of the points is
+the first sign of a skewed hash.
+
+## `GET /_placement?id=…`
+
+Which shard group owns one document id. The client-visible half of the placement
+rule — a client can compute the same answer itself, which is how the two are
+checked against each other rather than assumed to agree.
+
+```json
+{
+  "id": "cli/pkg1",
+  "shard": 0,
+  "mode": "ring",
+  "local": false,
+  "primary": "127.0.0.1:7901"
+}
+```
+
+`local: true` (and no `primary`) means this process is not a coordinator, so it
+owns the document itself.
+
+## `GET /_plan?shards=N`
+
+A rebalancing plan: how many documents would move if the cluster had `N` shard
+groups, under both placement rules, computed from the **real** document ids
+gathered from the shards rather than from a sample.
+
+```json
+{
+  "ids": 3000,
+  "from_shards": 3,
+  "to_shards": 4,
+  "active_mode": "ring",
+  "ring":   { "moved": 762,  "total": 3000, "moved_pct": 25.4,
+              "before": [969, 1024, 1007], "after": [840, 738, 660, 762] },
+  "modulo": { "moved": 2273, "total": 3000, "moved_pct": 75.8,
+              "before": [1022, 987, 991], "after": [786, 726, 748, 740] }
+}
+```
+
+`active_mode` says which of the two numbers is in force. If a shard did not
+answer, its ids are missing and the shard is named in `failed_addresses`, so a
+plan built on part of the corpus says so.
 
 ## `GET /search`
 
@@ -98,11 +165,15 @@ Response:
     { "field": "versions", "kind": "percentiles",
       "percentiles": [[50, 1], [90, 5], [99, 21]] }
   ],
-  "clusters": { "shards_total": 4, "shards_ok": 4, "shards_failed": 0 }
+  "shards": { "total": 4, "ok": 4, "failed": 0, "failed_addresses": [] }
 }
 ```
 
-`clusters` is present only when the server is a cluster coordinator.
+`shards` is present only when the server is a cluster coordinator. On a
+coordinator `facets` and `aggs` are merged across shards and equal what a single
+node holding the whole corpus would return; `agg_failed_addresses` appears when a
+shard answered the search but not the aggregation, because a facet total from
+two of three shards is a smaller number presented as a count of the corpus.
 
 `facets` and `aggs` are different things and both are always present when
 requested. `facets` is the cheap path: for each requested field, the counts of
@@ -149,15 +220,43 @@ Add or replace one document. `202` on success.
 }
 ```
 
+On a **coordinator** the document is routed to the group that owns its id and
+sent to every member of that group. The reply says how many members applied it:
+
+```json
+{ "ok": true, "id": "pkg/name", "shard": 2, "acked": 3, "members": 3,
+  "primary": "127.0.0.1:7903" }
+```
+
+`ok` means **every** member applied it. A write acknowledged by one member of
+three is not durable and is not reported as a success: those replies carry
+`"ok": false`, the counts, and the addresses that missed it in
+`failed_addresses`.
+
 ## `POST /index/bulk`
 
 Newline-delimited JSON, one document per line, same shape as above. Returns
 `{ "indexed": 1000, "took_ms": 41.2 }`. This is the ingest path the benchmarks
 use.
 
+On a **coordinator** the batch is grouped by owning shard and each shard group
+receives one request carrying only the documents it owns — one round trip per
+shard rather than per document. A batch forwarded whole would have every shard
+index every document, and then several shards would answer for the same
+document. The reply adds `shards`, `members_ok` and `members`:
+
+```json
+{ "indexed": 3000, "failed": 0, "shards": 3, "members_ok": 6, "members": 6,
+  "took_ms": 152 }
+```
+
 ## `DELETE /index?id=…`
 
 Tombstones a document. Returns `{ "deleted": true }`.
+
+On a coordinator the delete is routed to the owning group and replicated the
+same way, so it does not report a deletion that only happened somewhere the
+search will not look.
 
 ## `GET /suggest?q=…`
 
