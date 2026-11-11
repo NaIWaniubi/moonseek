@@ -19,5 +19,6 @@ options(
     "store_test.mbt": [ "native" ],
     "wal_native.mbt": [ "native" ],
     "wal_native_test.mbt": [ "native" ],
+    "fixes_native_test.mbt": [ "native" ],
   },
 )
