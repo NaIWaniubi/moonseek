@@ -1,0 +1,6 @@
+import {
+  "NaIWaniubi/moonseek",
+  "moonbitlang/core/hashmap",
+}
+
+supported_targets = "+native"

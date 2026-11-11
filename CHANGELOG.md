@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.6.0 (2026-11-11)
+
+This release is about evidence rather than speed: real data, measured retrieval
+quality, and the one query feature the syntax was missing.
+
+### Added — sloppy phrase queries (`"a b"~N`)
+`Query::Phrase` carries a slop distance; the lexer parses a `~N` suffix on a
+quoted phrase (and on `field:"..."~N`). Slop widens the gaps allowed between
+neighbouring terms while keeping their order: `"database index"~3` matches
+"database ... index" with up to three intervening tokens.
+
+The matching algorithm is a **minimal-span walk**, not a per-start-position
+lookahead. The naive version reports one occurrence once per starting position
+that can reach it, inflating tf and therefore the BM25 score; `slop_test.mbt`
+pins the correct count (a document with three occurrences and slop 1 scores
+tf = 3, not 9). Slop 0 is bit-identical to the previous exact-phrase path, and
+the tests assert both that property and monotonicity in N.
+
+Measured cost on the 20k corpus: exact phrase 6.25 ms p50, `~3` slop 7.89 ms p50
+— a binary search per term per candidate window.
+
+### Added — real corpus, cross-target, in the browser
+- `tools/registry-corpus.mjs` turns the mooncakes registry index into
+  `demo/registry.json`: **3,698 packages / 22,837 versions**, with names,
+  author keywords, descriptions, dependency edges and facet values.
+- `tools/registry/main.mbt` builds that corpus into a `MSK3` snapshot with the
+  **native** binary (11,081 terms, 1.37 MB, ~8,000–11,000 docs/s).
+- The **wasm-gc** build loads those exact bytes. This exposed a real bug:
+  `Bytes` has no stable JS ABI, so `ms_load`/`ms_save` never worked from
+  JavaScript. New `ms_load_b64` / `ms_save_b64` (base64) are the working
+  transport, and a CI job now proves native→wasm snapshot compatibility.
+- New `ms_set_schema`, `ms_add_doc` (arbitrary fields), `ms_dump`,
+  `ms_search_faceted_fields` (the demo had hardcoded `cat`/`lang` facet names,
+  which silently returned no aggregations for the registry's `license`/`deps`/
+  `year` fields).
+
+### Added — retrieval-quality measurement
+`tools/eval` computes **NDCG@10 / MRR@10 / Recall@20** over 17 queries and six
+configurations, and writes `docs/quality.md`. Labels are **derived from corpus
+structure** (author keywords, declared dependency edges, package-name tokens)
+and the report says so in its first paragraph: these numbers are comparable
+across configurations, not to BEIR or MS MARCO.
+
+| configuration | NDCG@10 | MRR@10 | Recall@20 |
+|---|---:|---:|---:|
+| `bm25-weighted` (shipped) | **0.9045** | 1.0000 | 0.3376 |
+| `no-length-norm` (b = 0) | 0.9142 | 1.0000 | 0.3323 |
+| `bm25-uniform` | 0.8236 | 0.9314 | 0.2902 |
+| `metadata-only` | 0.7185 | 0.7941 | 0.3227 |
+| `desc-only` | 0.4771 | 0.5899 | 0.1421 |
+| `title-only` (≈ substring search) | 0.4082 | 0.4706 | 0.0953 |
+
+The honest reading: field weighting is worth 10% NDCG over uniform weights and
+122% over name-only search; **length normalization is worth -1.1% here**, i.e.
+within noise, and the report says that instead of claiming a win.
+
+### Changed — the demo is a product, not a mock
+`demo/index.html` rewritten. It searches the real registry (snapshot load
+~200 ms, median query 0.20 ms, p90 0.2–0.3 ms), indexes files you drag in
+(`.txt .md .json .csv .log .html`, with JSON flattened to its text), persists
+the whole index to IndexedDB as one snapshot blob and reloads it without
+re-parsing, and runs a live benchmark measuring latency percentiles plus a
+latency-vs-index-size curve. The ablation table is shown next to the live
+numbers.
+
+### Changed — benchmarks that do not flatter themselves
+- The stress harness now reports the **median of 4 build runs** (a single
+  sample swung 20–30% and a lucky one had been published as 8,900 docs/s; the
+  real figure is 6,400–7,800, and the withdrawal is documented in
+  `docs/benchmark.md`).
+- Query latency is **p50/p90 of 200 samples per shape** instead of one mean.
+- Two stress cases were found to be timing terms that do not exist in the
+  generated corpus (`w4999x`, `title:rust`) — i.e. an empty posting list. They
+  now pick terms by actual `doc_freq` and print it.
+- `docs/benchmark.md` rewritten end to end: the old version described the 0.4.x
+  evaluator (score-map materialization, 3,000 docs/s, 13 ms saturated terms),
+  none of which is true of the current build.
+
+### Fixed
+- `docs/benchmark.md` and the README claimed numbers from two architectures ago.
+
 ## 0.5.1 (2026-11-12)
 
 ### Changed

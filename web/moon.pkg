@@ -3,6 +3,8 @@ import {
   "moonbitlang/core/json",
   "moonbitlang/core/ref",
   "moonbitlang/core/debug",
+  "moonbitlang/core/string",
+  "moonbitlang/core/encoding/base64",
 }
 
 pkgtype(kind: "foreign_library")

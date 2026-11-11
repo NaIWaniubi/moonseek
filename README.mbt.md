@@ -4,12 +4,12 @@
 
 纯 MoonBit 实现的嵌入式全文搜索引擎：倒排索引、BM25、免词典中文分词、模糊搜索、分面过滤、服务端高亮、WAL 崩溃恢复，支持 native / WASM / JS 三端。
 
-**▶ Live demo: [naiwaniubi.github.io/moonseek](https://naiwaniubi.github.io/moonseek/)** — the engine running in your browser, no server, no network.
+**▶ Live demo: [naiwaniubi.github.io/moonseek](https://naiwaniubi.github.io/moonseek/)** — searches **all 3,698 packages on mooncakes.io** in your browser. No server, no network requests after load. Also: drop your own files in and index them live, and read the measured quality/ablation report.
 
 [![CI](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml/badge.svg)](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![mooncakes](https://img.shields.io/badge/mooncakes-v0.4.0-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
-[![tests](https://img.shields.io/badge/tests-249%20native%20%C2%B7%20232%20wasm--gc-3fb950.svg)](#testing)
+[![mooncakes](https://img.shields.io/badge/mooncakes-v0.6.0-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
+[![tests](https://img.shields.io/badge/tests-259%20native%20%C2%B7%20242%20wasm--gc-3fb950.svg)](#testing)
 
 ![moonseek demo](docs/demo-screenshot.png)
 
@@ -22,7 +22,7 @@ MoonBit's ecosystem has HTTP servers, crypto and database drivers — but no tan
 - **Inverted index** with per-field weights (e.g. title ×3, body ×1)
 - **BM25 ranking** with configurable `k1` / `b`
 - **Chinese + English tokenization**: Latin words with stop-word removal; CJK overlapping bigrams (Lucene CJKAnalyzer strategy) — no dictionary needed
-- **Rich query syntax**: `term`, `"exact phrase"`, `AND` / `OR` / `NOT`, `field:term`, `prefix*`, parentheses, implicit AND
+- **Rich query syntax**: `term`, `"exact phrase"`, `"a b"~3` (sloppy phrase: up to 3 tokens between terms), `AND` / `OR` / `NOT`, `field:term`, `prefix*`, parentheses, implicit AND
 - **Fuzzy search**: Levenshtein / Damerau-Levenshtein edit distance with early-exit bounded DP; **BK-tree** for sub-linear lookup (13–1780× faster than linear scan on a 24k-term vocabulary)
 - **Did-you-mean**: frequency-weighted spelling correction (`suggest`)
 - **Faceted search**: exact-match facet fields, AND/OR filters, per-facet value counts, offset pagination (`search_faceted`)
@@ -32,7 +32,8 @@ MoonBit's ecosystem has HTTP servers, crypto and database drivers — but no tan
 - **Segmented index**: immutable segments + tiered merge policy + cross-segment search with latest-version-wins (`SegmentedIndex`)
 - **Write-ahead log**: CRC-framed entries, torn-tail recovery, durable add + atomic checkpoint + crash-safe reopen (native)
 - **Crash-safe persistence**: versioned snapshot + CRC-32 checksum; atomic save (temp file → fsync → rename); torn/corrupt files are rejected, never silently loaded
-- **Portable**: pure MoonBit core (no FFI in the engine); native file store via `moonbitlang/async`; browser export via WasmGC + js-string builtins
+- **Portable**: pure MoonBit core (no FFI in the engine); native file store via `moonbitlang/async`; browser export via WasmGC + js-string builtins. **One snapshot format, two backends**: an index built by the native binary loads byte-for-byte into the browser's wasm-gc build
+- **Measured quality, not just latency**: NDCG@10 / MRR@10 / Recall@20 over 3,698 real packages with a 6-way ablation ([docs/quality.md](docs/quality.md))
 - **Document lifecycle**: add, replace (same id), delete
 
 ## How it works
@@ -105,35 +106,50 @@ cd demo && python -m http.server 8000
 # open http://localhost:8000 (Chrome / Edge with WasmGC + js-string builtins)
 ```
 
-The demo indexes 60 bilingual documents (MoonBit docs + Chinese classics + CS topics) in ~20 ms. Results use **server-side highlighting** (the WASM engine produces escaped HTML with CJK-aware `<mark>` spans), misspelled queries get **did-you-mean suggestions** and **fuzzy fallback**, and a live panel shows benchmark numbers and per-field term frequencies.
+The demo does three things, all in the browser:
+
+1. **Searches the real registry.** Every one of the **3,698 packages published on mooncakes.io** (22,837 versions) is indexed — package names, author-written keywords, descriptions, and dependency edges. The index is built by the *native* binary into a 1.37 MB `MSK3` snapshot and loaded by the *wasm-gc* build, which is the strongest evidence that the format is portable. Loading takes ~200 ms; the median query over a 12-query mix is **0.20 ms**.
+2. **Indexes your own files.** Drag in `.txt` / `.md` / `.json` / `.csv` / `.log` files (or paste text) and they are parsed, tokenized and searchable immediately, with the whole index persistable to IndexedDB as one snapshot blob and reloadable without re-parsing.
+3. **Shows its own quality.** A live benchmark measures query-latency percentiles and the latency-vs-index-size curve in your browser, next to the ablation table from `tools/eval`: the same corpus and queries under six scoring configurations, so you can see which mechanism is worth how much NDCG.
+
+Results use **server-side highlighting** (the WASM engine produces escaped HTML with CJK-aware `<mark>` spans), misspelled queries get **did-you-mean suggestions** and **fuzzy fallback**, and every hit can expand into its **BM25 score breakdown**.
 
 ## Performance
 
 `moon bench --target native --release`, 1000 synthetic documents (~80 tokens each), AMD Ryzen 7 7435H:
 
-Small corpus (`moon bench`, 1000 synthetic docs):
+Small corpus (`moon bench`, 1000 synthetic docs, mean +/- sigma):
 
 | Operation | Time |
 |---|---|
-| Index 1000 docs (with stored fields) | ~135 ms |
-| Term query (top-10) | ~2.4 ms |
-| Phrase query (top-10) | ~1.8 ms |
-| Snapshot save+load (with stored fields) | ~75 ms |
+| Index 1000 docs (with stored fields) | 85.8 ms +/- 6.2 |
+| Term query (top-10) | 262 us +/- 12 |
+| Phrase query (top-10) | 1.01 ms +/- 0.24 |
+| Snapshot save + load | 45.3 ms +/- 2.7 |
 
-Stress test (`bench/stress`, 20,000 docs / 8.5 MB text / 23.8k terms, AMD Ryzen 7 7435H, release):
+Stress test (`bench/stress`, 20,000 docs / 8.57 MB text / 23,782 terms, release). Build is the
+median of 4 timed runs; queries are p50 of 200 samples, `limit=10`:
 
 | Operation | Time |
 |---|---|
-| Index build | ~6.7 s (≈3,000 docs/s) |
-| Selective term query (df ≈ 300) | **~0.01 ms** |
-| Prefix query | ~2.4 ms |
-| Saturated term (matches every doc) | **~2.5 ms** |
-| Phrase query | ~7.0 ms |
-| Facet filter + aggregation (3k matches) | ~12 ms |
-| Fuzzy lookup, 24k terms | linear ~100 ms → **BK-tree 0.05–12 ms** |
-| Snapshot 17 MB: serialize / load | ~2.4 s / ~1.7 s |
+| Index build | 2.73 s -> **7,320 docs/s** (median of 4) |
+| Selective term (df 285) | **0.06 ms** |
+| Field-scoped term (df 732) | 0.13 ms |
+| Saturated term (df 4,021) | 2.14 ms |
+| Chinese bigram (df 4,113) | 2.19 ms |
+| Boolean query | 4.50 ms |
+| Exact phrase | 6.25 ms |
+| Sloppy phrase `"a b"~3` | 7.89 ms |
+| Prefix query | 2.13 ms |
+| Facet filter + aggregation (3,055 matches) | 14.0 ms |
+| Fuzzy lookup, 23.8k terms | linear 37-46 ms -> **BK-tree 0.07-2.7 ms** (17-491x) |
+| Snapshot 17.6 MB: serialize / load | 0.68 s / 0.75 s |
 
-Browser (WasmGC, 60 bilingual docs): index ~25 ms, query 0.1–11 ms, snapshot 44 KB.
+Browser (WasmGC, the 3,698-package registry snapshot): 206 KB binary, snapshot load ~200 ms, median
+query **0.20 ms**, p90 0.2-0.3 ms, snapshot export ~200-315 ms.
+
+Full methodology, per-shape ranges and an explicit list of what is *not* measured:
+[docs/benchmark.md](docs/benchmark.md).
 
 ## Architecture
 
@@ -167,7 +183,7 @@ See [docs/architecture.md](docs/architecture.md) for design details and the snap
 ## Testing
 
 ```bash
-moon test                    # 249 tests (native), 232 (wasm-gc / js)
+moon test                    # 259 tests (native), 242 (wasm-gc / js)
 moon test --target wasm-gc
 moon test --target js
 moon bench --release         # benchmarks

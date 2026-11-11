@@ -302,6 +302,13 @@ pub fn Index::doc_id(self : Index, num : Int32) -> String? {
 }
 
 ///|
+/// Number of internal document slots, including deleted ones. A stable upper
+/// bound for iterating `doc_id` over the index's history.
+pub fn Index::slot_count(self : Index) -> Int32 {
+  self.doc_ids.length()
+}
+
+///|
 /// Retrieve the stored original document by external id.
 /// Returns None if the id is unknown or the document was deleted.
 pub fn Index::get_document(self : Index, id : String) -> Document? {

@@ -95,6 +95,13 @@ fn us_to_ms(us : Double) -> Double {
 }
 
 ///|
+/// Three significant decimals, so sub-microsecond cases stay readable and
+/// millisecond cases are not swamped by noise digits.
+fn round3(x : Double) -> Double {
+  (x * 1000.0).round() / 1000.0
+}
+
+///|
 fn main {
   let n_docs : Int32 = 20000
   let n_vocab : Int32 = 5000
@@ -114,21 +121,51 @@ fn main {
     raw_bytes += d.fields[1].1.length()
   }
   println("raw text: ~" + (raw_bytes / 1024).to_string() + " KB")
-  // 1. Index build
-  let idx = @moonseek.Index::new([
+  // 1. Index build.
+  //
+  // Build time is measured over several runs and reported as the median:
+  // a single run on a desktop machine swings 20-30% with background load,
+  // and quoting the best of one sample is how benchmarks lie. The first run
+  // is discarded as a warm-up (allocator and instruction cache).
+  let runs = 5
+  let build_times : Array[Double] = []
+  let mut idx = @moonseek.Index::new([
     { name: "title", weight: 3.0, },
     { name: "body", weight: 1.0, },
   ])
-  let t0 = @bench.monotonic_clock_start()
-  for d in docs {
-    idx.add(d)
+  for run in 0..<runs {
+    idx = @moonseek.Index::new([
+      { name: "title", weight: 3.0, },
+      { name: "body", weight: 1.0, },
+    ])
+    let t = @bench.monotonic_clock_start()
+    for d in docs {
+      idx.add(d)
+    }
+    let us = @bench.monotonic_clock_end(t)
+    if run > 0 {
+      build_times.push(us)
+    }
   }
-  let build_us = @bench.monotonic_clock_end(t0)
-  println("index build: " + us_to_ms(build_us).to_string() + " ms")
+  build_times.sort()
+  let build_us = build_times[build_times.length() / 2]
+  let best_us = build_times[0]
+  let worst_us = build_times[build_times.length() - 1]
+  println(
+    "index build: " +
+    us_to_ms(build_us).to_string() +
+    " ms (median of " +
+    build_times.length().to_string() +
+    ", range " +
+    us_to_ms(best_us).to_string() +
+    "-" +
+    us_to_ms(worst_us).to_string() +
+    ")",
+  )
   println(
     "  throughput: " +
     (n_docs.to_double() / (build_us / 1.0e6)).to_int().to_string() +
-    " docs/s",
+    " docs/s (median)",
   )
   println(
     "  terms: " +
@@ -139,33 +176,58 @@ fn main {
     (idx.to_bytes().length() / 1024).to_string() +
     " KB",
   )
-  // 2. Query latency: selective (df small) vs saturated (df ~ all docs)
-  println("=== query latency (1000 iterations each) ===")
+  // 2. Query latency: selective (df small) vs saturated (df ~ all docs).
+  //
+  // A mean over 1000 iterations is dominated by the cache-warm majority and
+  // hides the tail a user actually notices. Each case reports p50 and p90 of
+  // 200 timed samples (limit=10, the UI's page size).
+  println("=== query latency (p50 / p90 of 200 samples, limit=10) ===")
+  // Selectivity cases pick real terms from the built index by their actual
+  // document frequency. Hardcoding names was wrong: the Zipf mapping caps at
+  // vocab_size - 1, so "w4999x" never exists and the case silently measured
+  // an empty posting list.
   let cases : Array[(String, String)] = [
-    ("selective term (df~300)", "w4999x"),
-    ("selective term (df~1k)", "w2500x"),
-    ("anchor term (df~2k)", "moonbit"),
-    ("saturated term (df~all)", "search"),
-    ("chinese bigram", "搜索"),
+    ("selective term (df " + idx.doc_freq("body", "w4998x").to_string() + ")", "w4998x"),
+    ("mid term (df " + idx.doc_freq("body", "w2500x").to_string() + ")", "w2500x"),
+    ("anchor term (df " + idx.doc_freq("body", "moonbit").to_string() + ")", "moonbit"),
+    ("saturated term (df " + idx.doc_freq("body", "search").to_string() + ")", "search"),
+    ("chinese bigram (df " + idx.doc_freq("body", "搜索").to_string() + ")", "搜索"),
     ("boolean", "search AND engine"),
     ("phrase", "\"database index\""),
-    ("field-scoped", "title:rust"),
+    ("sloppy phrase ~3", "\"database index\"~3"),
+    (
+      "field-scoped (title, df " +
+      idx.doc_freq("title", "moonbit").to_string() +
+      ")",
+      "title:moonbit",
+    ),
     ("prefix", "seg*"),
   ]
   for (label, q) in cases {
-    let t = @bench.monotonic_clock_start()
+    // Warm up so the first sample is not a cold-cache outlier.
+    for _ in 0..<10 {
+      let _ = idx.search(q, limit=10) catch { _ => [] }
+    }
+    let samples : Array[Double] = []
     let mut sink = 0
-    for _ in 0..<1000 {
+    for _ in 0..<200 {
+      let t = @bench.monotonic_clock_start()
       let hits = idx.search(q, limit=10) catch { _ => [] }
+      let e = @bench.monotonic_clock_end(t)
+      samples.push(us_to_ms(e))
       sink += hits.length()
     }
-    let e = @bench.monotonic_clock_end(t)
+    samples.sort()
+    let p50 = samples[samples.length() * 50 / 100]
+    let p90 = samples[samples.length() * 90 / 100]
     println(
       "  " +
       label +
       ": " +
-      us_to_ms(e / 1000.0).to_string() +
-      " ms/query (hits " +
+      round3(p50).to_string() +
+      " / " +
+      round3(p90).to_string() +
+      " ms (hits " +
       sink.to_string() +
       ")",
     )

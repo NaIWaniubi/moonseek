@@ -30,7 +30,7 @@ fn collect_highlight_nodes(query : Query) -> Array[HighlightNode] {
   fn walk(node : Query) -> Unit {
     match node {
       Term(term, _) => out.push(HTerm(term))
-      Phrase(terms, _) => out.push(HPhrase(terms))
+      Phrase(terms, _, _) => out.push(HPhrase(terms))
       Prefix(prefix, _) => out.push(HPrefix(prefix))
       And(left, right) | Or(left, right) => {
         walk(left)

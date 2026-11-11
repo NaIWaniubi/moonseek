@@ -7,3 +7,7 @@ target
 
 # internal dev artifacts
 .team/
+
+# generated API surface of the dev-only tool packages
+# (the library package still commits its .mbti so the published ABI is reviewable)
+tools/*/pkg.generated.mbti

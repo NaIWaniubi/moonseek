@@ -1,0 +1,25 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "NaIWaniubi/moonseek/tools/reglib"
+
+import {
+  "NaIWaniubi/moonseek",
+}
+
+// Values
+pub fn build_registry_index(Array[Json], schema? : Array[@moonseek.FieldSchema], bm25? : @moonseek.Bm25Params) -> (@moonseek.Index, Int32)
+
+pub fn num_of(Json, String) -> Double
+
+pub fn registry_schema() -> Array[@moonseek.FieldSchema]
+
+pub fn str_of(Json, String) -> String
+
+pub fn strings_of(Json, String) -> Array[String]
+
+// Errors
+
+// Types and methods
+
+// Type aliases
+
+// Traits

@@ -1,0 +1,15 @@
+import {
+  "NaIWaniubi/moonseek",
+  "NaIWaniubi/moonseek/tools/reglib",
+  "moonbitlang/core/json",
+  "moonbitlang/core/env",
+  "moonbitlang/core/hashmap",
+  "moonbitlang/core/math",
+  "moonbitlang/core/encoding/utf8",
+  "moonbitlang/async/fs",
+  "moonbitlang/async",
+}
+
+supported_targets = "+native"
+
+pkgtype(kind: "executable")

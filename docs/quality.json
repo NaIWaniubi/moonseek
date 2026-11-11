@@ -1,0 +1,65 @@
+{
+  "queries": [
+    "parser",
+    "wasm",
+    "json",
+    "cli",
+    "http",
+    "async",
+    "gui",
+    "database",
+    "regexp",
+    "serialization",
+    "compiler",
+    "benchmark",
+    "moonbitlang/async",
+    "moonbitlang/x",
+    "cli/core",
+    "moon",
+    "mbt"
+  ],
+  "results": [
+    {
+      "config": "bm25-weighted",
+      "ndcg@10": 0.9044764056184239,
+      "mrr@10": 1,
+      "recall@20": 0.33761719346028046,
+      "ms_per_query": 0.6470588235294118
+    },
+    {
+      "config": "bm25-uniform",
+      "ndcg@10": 0.8236189479927346,
+      "mrr@10": 0.9313725490196079,
+      "recall@20": 0.29022414208294334,
+      "ms_per_query": 0.7058823529411765
+    },
+    {
+      "config": "desc-only",
+      "ndcg@10": 0.47711975334463286,
+      "mrr@10": 0.5898692810457516,
+      "recall@20": 0.14208031250557843,
+      "ms_per_query": 0.17647058823529413
+    },
+    {
+      "config": "title-only",
+      "ndcg@10": 0.40822041438001416,
+      "mrr@10": 0.47058823529411764,
+      "recall@20": 0.09526476988987265,
+      "ms_per_query": 0.058823529411764705
+    },
+    {
+      "config": "metadata-only",
+      "ndcg@10": 0.7185285622113132,
+      "mrr@10": 0.7941176470588235,
+      "recall@20": 0.32266943342451593,
+      "ms_per_query": 0.17647058823529413
+    },
+    {
+      "config": "no-length-norm",
+      "ndcg@10": 0.9142201629985115,
+      "mrr@10": 1,
+      "recall@20": 0.332300897872734,
+      "ms_per_query": 0.6470588235294118
+    }
+  ]
+}

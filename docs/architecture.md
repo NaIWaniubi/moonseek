@@ -124,9 +124,38 @@ parallel ascending arrays (`DocScores`) rather than a `doc -> score` map:
 The map-based evaluator is kept as a thin wrapper (`eval`) for `explain`,
 which needs random access by doc number.
 
+### Phrase matching: exact and sloppy
+
+`Query::Phrase(terms, field, slop)` carries its gap budget, fixed at parse time.
+The lexer turns `"a b"~3` into `PhraseSlop("a b", 3)`, including in the
+`field:"..."~3` form, so the parser never sees a stray `~3` token.
+
+Slop 0 keeps the original fast path: for every position of term 0, term *k*
+must sit exactly *k* further on (a position-set probe). Slop > 0 switches to a
+**minimal-span walk** (`sloppy_phrase_count`): for each candidate start it
+binary-searches each later term's next position, requiring it to be strictly
+after the previous one and no more than `slop` tokens beyond it. A window that
+ends where a previous window already ended is not counted twice.
+
+That de-duplication is the whole point. The obvious implementation — "for each
+position of term 0, count every in-range position of term 1" — reports one
+occurrence once per starting position that can reach it, which inflates tf and
+therefore the BM25 score. `slop_test.mbt` pins it: a document containing
+`alpha x beta` three times scores tf = 3 at slop 1, not 9.
+
+With `n` terms and slop `s`, the allowed span is `(n - 1) + s`, so slop 0 is
+exactly the exact-phrase case — the tests assert both that equivalence and
+monotonicity in `s` (a larger budget is a strict superset, and never admits a
+reversed term order).
+
 ## Facets (`facet.mbt`)
 
 Facets are exact-match keyword bags attached to an existing document (`set_facets`), stored per internal doc number and serialized in MSK3. `search_faceted` evaluates the query, filters by facet values (OR within a field, AND across fields), aggregates value counts over the *filtered* result set, and paginates with offset/limit. Facet values are not analyzed — `zh`/`en` stay exact strings, unlike text fields.
+
+The facet field names are a parameter (`SearchOptions.facet_fields`), not a
+constant. The browser API exposes them as `ms_search_faceted_fields` after an
+earlier version hardcoded two names and silently returned empty aggregations
+for any corpus that used different ones.
 
 ## BK-tree (`bktree.mbt`)
 
@@ -135,7 +164,7 @@ A metric tree over the vocabulary: each node stores a term; children are keyed b
 ## Ranking control & explanation (`explain.mbt`)
 
 - `SortOrder` selects score/id ordering; `search_after` pages by `(score, id)` cursor, which is stable across concurrent writes unlike offset pagination.
-- `explain(query, id)` mirrors the evaluator: a phrase contributes its first term (phrase frequency folded in), a prefix expands to matching dictionary terms, `Not`'s right branch contributes nothing. df/idf are computed once per (field, term), and the document's posting is found by binary search since postings are doc-sorted.
+- `explain(query, id)` mirrors the evaluator: a phrase contributes its first term (phrase frequency folded in, using the phrase's own slop when counting), a prefix expands to matching dictionary terms, `Not`'s right branch contributes nothing. df/idf are computed once per (field, term), and the document's posting is found by binary search since postings are doc-sorted. It costs about as much as the query it explains — a diagnostic, not a per-hit path.
 
 ## Performance notes
 

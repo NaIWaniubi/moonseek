@@ -245,6 +245,22 @@ pub fn ms_search_faceted(
   limit : Int32,
   offset : Int32,
 ) -> String {
+  ms_search_faceted_fields(query, filters_json, limit, offset, "cat lang")
+}
+
+///|
+/// Faceted search with caller-chosen facet fields (space-separated names).
+/// The demo indexes a package registry, whose facets are license/deps/year,
+/// not the toy corpus's cat/lang — hardcoding the field names made facet
+/// aggregation silently return nothing.
+#export_name("ms_search_faceted_fields")
+pub fn ms_search_faceted_fields(
+  query : String,
+  filters_json : String,
+  limit : Int32,
+  offset : Int32,
+  facet_fields : String,
+) -> String {
   match engine.val {
     Some(index) => {
       let filters : Array[@moonseek.FacetFilter] = []
@@ -268,11 +284,17 @@ pub fn ms_search_faceted(
           None => ()
         }
       }
+      let fields : Array[String] = []
+      for name in facet_fields.split(" ") {
+        if !name.is_empty() {
+          fields.push(name.to_owned())
+        }
+      }
       let options : @moonseek.SearchOptions = {
         limit,
         offset,
         filters,
-        facet_fields: ["cat", "lang"],
+        facet_fields: fields,
       }
       let result = index.search_faceted(query, options~) catch {
         e => return error_json(e.to_string())
@@ -356,5 +378,138 @@ pub fn ms_term_stats(field : String, limit : Int32) -> String {
       Json::array(items).stringify()
     }
     None => "[]"
+  }
+}
+
+///|
+/// Snapshot the current index as a base64 string.
+///
+/// `Bytes` has no stable JS ABI (a `Bytes` argument or return value fails to
+/// cross the boundary), so the browser transport is base64 text. This is also
+/// what lets a snapshot written by the *native* build load into the *wasm*
+/// build: the MSK3 byte format is the same, only the wrapper differs.
+#export_name("ms_save_b64")
+pub fn ms_save_b64() -> String {
+  match engine.val {
+    Some(index) => @base64.encode(index.to_bytes())
+    None => ""
+  }
+}
+
+///|
+/// Load an index from a base64 snapshot. Returns "" on success, or an error
+/// message (bad base64, bad magic, checksum mismatch, truncation).
+#export_name("ms_load_b64")
+pub fn ms_load_b64(text : String) -> String {
+  let bytes = @base64.decode(text) catch {
+    e => return "bad base64: " + @debug.to_string(e)
+  }
+  try {
+    let index = @moonseek.Index::from_bytes(bytes)
+    engine.val = Some(index)
+    ""
+  } catch {
+    e => e.to_string()
+  }
+}
+
+///|
+/// Export the index as a JSON array of the stored documents, so a browser
+/// session can be handed to another tool without re-typing anything.
+/// Each entry is {id, title, body}; only live documents appear.
+#export_name("ms_dump")
+pub fn ms_dump() -> String {
+  match engine.val {
+    Some(index) => {
+      let items : Array[Json] = []
+      for num in 0..<index.slot_count() {
+        if index.is_deleted(num) {
+          continue
+        }
+        let id = match index.doc_id(num) {
+          Some(id) => id
+          None => continue
+        }
+        let obj : Map[String, Json] = Map([])
+        obj["id"] = @json.to_json(id)
+        obj["title"] = @json.to_json(index.get_field(id, "title").unwrap_or(""))
+        obj["body"] = @json.to_json(index.get_field(id, "body").unwrap_or(""))
+        items.push(Json::object(obj))
+      }
+      Json::array(items).stringify()
+    }
+    None => "[]"
+  }
+}
+
+///|
+/// Count of live documents carrying a value in `field` — used by the demo to
+/// size its progress bars without re-parsing the whole dump.
+#export_name("ms_live_count")
+pub fn ms_live_count() -> Int32 {
+  match engine.val {
+    Some(index) => index.doc_count()
+    None => 0
+  }
+}
+
+///|
+/// Set the field schema. Must be called before any document is added; the
+/// demo uses it to switch from the toy title/body schema to the package
+/// registry's four-field schema. Returns "" on success.
+#export_name("ms_set_schema")
+pub fn ms_set_schema(spec : String) -> String {
+  // spec is "name:weight name:weight ..." — a compact, unambiguous wire form
+  // that avoids JSON parsing on the hot path of a page load.
+  let schema : Array[@moonseek.FieldSchema] = []
+  for part in spec.split(" ") {
+    if part.is_empty() {
+      continue
+    }
+    match part.find(":") {
+      Some(i) => {
+        let name = part[:i].to_owned()
+        let weight = @string.parse_double(part[i + 1:].to_owned()) catch {
+          _ => return "bad weight in schema spec: " + part.to_owned()
+        }
+        schema.push({ name, weight })
+      }
+      None => return "bad schema entry (expected name:weight): " + part.to_owned()
+    }
+  }
+  if schema.is_empty() {
+    return "empty schema"
+  }
+  engine.val = Some(@moonseek.Index::new(schema))
+  ""
+}
+
+///|
+/// Add a document with an arbitrary set of fields.
+/// `fields_json` is [["title","..."],["keywords","..."]].
+#export_name("ms_add_doc")
+pub fn ms_add_doc(id : String, fields_json : String) -> String {
+  match engine.val {
+    Some(index) => {
+      let parsed = @json.parse(fields_json) catch {
+        e => return "bad field json: " + @debug.to_string(e)
+      }
+      let fields : Array[(String, String)] = []
+      match parsed.as_array() {
+        Some(items) =>
+          for item in items {
+            if item.as_array() is Some(pair) && pair.length() == 2 {
+              match (pair[0].as_string(), pair[1].as_string()) {
+                (Some(name), Some(value)) => fields.push((name, value))
+                _ => ()
+              }
+            }
+          }
+        None => return "fields_json is not an array"
+      }
+      index.add({ id, fields })
+      ""
+    }
+    None => "index not initialized"
   }
 }

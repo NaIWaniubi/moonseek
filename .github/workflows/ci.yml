@@ -60,3 +60,28 @@ jobs:
         run: |
           moon update
           moon bench --target native --release
+
+  # The registry corpus and the quality report are generated artifacts. This
+  # job regenerates both from source and fails if the committed report or
+  # snapshot is stale, so the published numbers cannot silently rot.
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up MoonBit
+        run: |
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
+          echo "$HOME/.moon/bin" >> $GITHUB_PATH
+      - name: Rebuild the corpus and the quality report
+        run: |
+          moon update
+          moon run tools/registry --target native --release -- demo/registry.json /tmp/registry.msk
+          moon run tools/eval --target native --release -- demo/registry.json /tmp/quality.md --json /tmp/quality.json
+      - name: Committed report must match the measurement
+        run: python3 tools/check-quality-docs.py docs/quality.md /tmp/quality.md
+      - name: Native snapshot must load in the wasm build
+        run: |
+          # Cross-target check: a snapshot written by native must be readable by
+          # the wasm build, which is the claim the browser demo rests on.
+          moon build --target wasm-gc --release
+          node tools/smoke-wasm-snapshot.mjs _build/wasm-gc/release/build/web/web.wasm /tmp/registry.msk

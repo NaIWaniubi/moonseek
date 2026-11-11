@@ -87,7 +87,7 @@ pub fn Index::explain(
   // would list contributions that are not in the total.
   let details : Array[ScoreDetail] = []
   let leaves = explain_leaves(self, parsed)
-  for (term, field, phrase) in leaves {
+  for (term, field, phrase, slop) in leaves {
     let fields = match field {
       Some(f) => [f]
       None => self.field_names()
@@ -119,7 +119,7 @@ pub fn Index::explain(
             // the raw posting frequency would overstate tf and make the
             // detail unreproducible against eval_phrase's score.
             let tf = match phrase {
-              Some(terms) => self.phrase_count(terms, field, doc_num)
+              Some(terms) => self.phrase_count(terms, field, doc_num, slop)
               None => posting.freq
             }
             let scored : Posting = {
@@ -259,7 +259,7 @@ pub fn explain_terms(index : Index, query : Query) -> Array[String] {
   let leaves = explain_leaves(index, query)
   let out : Array[String] = []
   let seen : @hashmap.HashMap[String, Unit] = @hashmap.HashMap([])
-  for (term, _, _) in leaves {
+  for (term, _, _, _) in leaves {
     if !seen.contains(term) {
       seen.set(term, ())
       out.push(term)
@@ -269,10 +269,11 @@ pub fn explain_terms(index : Index, query : Query) -> Array[String] {
 }
 
 ///|
-/// One scored leaf: (term, field restriction, phrase terms?). `field` is
-/// None for an all-fields leaf; `phrase_terms` is Some(all terms) when the
-/// leaf's frequency is the phrase count rather than the posting frequency.
-type ExplainLeaf = (String, String?, Array[String]?)
+/// One scored leaf: (term, field restriction, phrase terms?, slop). `field`
+/// is None for an all-fields leaf; `phrase_terms` is Some(all terms) when the
+/// leaf's frequency is the phrase count rather than the posting frequency,
+/// and `slop` is that phrase's allowed gap (0 for an exact phrase).
+type ExplainLeaf = (String, String?, Array[String]?, Int32)
 
 ///|
 /// The evaluator's scoring leaves with their field scoping, mirroring
@@ -282,18 +283,23 @@ type ExplainLeaf = (String, String?, Array[String]?)
 fn explain_leaves(index : Index, query : Query) -> Array[ExplainLeaf] {
   let out : Array[ExplainLeaf] = []
   let seen : @hashmap.HashMap[(String, String?), Unit] = @hashmap.HashMap([])
-  fn push(term : String, field : String?, phrase : Array[String]?) -> Unit {
+  fn push(
+    term : String,
+    field : String?,
+    phrase : Array[String]?,
+    slop : Int32,
+  ) -> Unit {
     let key = (term, field)
     if !seen.contains(key) {
       seen.set(key, ())
-      out.push((term, field, phrase))
+      out.push((term, field, phrase, slop))
     }
   }
 
   fn walk(node : Query) -> Unit {
     match node {
-      Term(term, field) => push(term, field, None)
-      Phrase(terms, field) =>
+      Term(term, field) => push(term, field, None, 0)
+      Phrase(terms, field, slop) =>
         if terms.length() > 0 {
           push(
             terms[0],
@@ -303,6 +309,7 @@ fn explain_leaves(index : Index, query : Query) -> Array[ExplainLeaf] {
             } else {
               None
             },
+            slop,
           )
         }
       Prefix(prefix, field) => {
@@ -313,7 +320,7 @@ fn explain_leaves(index : Index, query : Query) -> Array[ExplainLeaf] {
         for f in fields {
           for term in index.terms_of(f) {
             if term.has_prefix(prefix) {
-              push(term, Some(f), None)
+              push(term, Some(f), None, 0)
             }
           }
         }
