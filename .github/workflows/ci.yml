@@ -85,3 +85,22 @@ jobs:
           # the wasm build, which is the claim the browser demo rests on.
           moon build --target wasm-gc --release
           node tools/smoke-wasm-snapshot.mjs _build/wasm-gc/release/build/web/web.wasm /tmp/registry.msk
+
+  # The cluster's two claims are end-to-end behaviours, not unit-testable
+  # properties: run real shards, index a real corpus, and check that two-phase
+  # scoring reproduces a single node and that a killed shard is reported.
+  cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up MoonBit
+        run: |
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
+          echo "$HOME/.moon/bin" >> $GITHUB_PATH
+      - name: Build the server
+        run: |
+          moon update
+          moon build server --target native --release
+      - name: Cluster end-to-end
+        run: |
+          bash tools/test-cluster.sh _build/native/release/build/server/server.exe .

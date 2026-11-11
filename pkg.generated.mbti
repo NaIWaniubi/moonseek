@@ -3,9 +3,12 @@ package "NaIWaniubi/moonseek"
 
 import {
   "moonbitlang/core/debug",
+  "moonbitlang/core/hashmap",
 }
 
 // Values
+pub fn build_hnsw(Array[(Int32, Array[Double])], Int32, m? : Int32, ef_construction? : Int32, seed? : UInt64) -> HnswGraph
+
 pub fn crc32(Bytes) -> UInt32
 
 pub fn damerau_levenshtein(String, String) -> Int32
@@ -14,11 +17,15 @@ pub fn damerau_levenshtein_bounded(String, String, Int32) -> Int32
 
 pub fn explain_terms(Index, Query) -> Array[String]
 
+pub fn is_missing_number(Double) -> Bool
+
 pub fn levenshtein(String, String) -> Int32
 
 pub fn parse_query(String, analyzer? : Analyzer, fields? : Array[String]) -> Query raise QueryError
 
 pub fn query_terms(Query) -> Array[String]
+
+pub fn scoring_terms(Index, Query) -> Array[(String, String)]?
 
 pub fn tokenize(String) -> Array[Token]
 
@@ -75,6 +82,28 @@ pub fn StoreError::to_string(Self) -> String
 pub impl Show for StoreError
 
 // Types and methods
+pub(all) struct AggResult {
+  field : String
+  kind : String
+  buckets : Array[(String, Double)]
+  stats : StatSummary?
+  percentiles : Array[(Double, Double)]
+} derive(Eq, @debug.Debug)
+pub fn AggResult::equal(Self, Self) -> Bool
+pub fn AggResult::not_equal(Self, Self) -> Bool
+pub fn AggResult::to_json(Self) -> Json
+pub fn AggResult::to_repr(Self) -> @debug.Repr
+
+pub(all) enum AggSpec {
+  TermsAgg(String, Int32)
+  StatsAgg(String)
+  HistogramAgg(String, Double)
+  PercentilesAgg(String, Array[Double])
+} derive(Eq, @debug.Debug)
+pub fn AggSpec::equal(Self, Self) -> Bool
+pub fn AggSpec::not_equal(Self, Self) -> Bool
+pub fn AggSpec::to_repr(Self) -> @debug.Repr
+
 pub(all) struct Analyzer {
   lowercase : Bool
   remove_stop_words : Bool
@@ -151,6 +180,16 @@ pub fn Explanation::not_equal(Self, Self) -> Bool
 pub fn Explanation::to_json(Self) -> Json
 pub fn Explanation::to_repr(Self) -> @debug.Repr
 
+pub(all) struct ExternalStats {
+  n : Int32
+  df : @hashmap.HashMap[(String, String), Int32]
+  avgdl : @hashmap.HashMap[String, Double]
+} derive(Eq, @debug.Debug)
+pub fn ExternalStats::equal(Self, Self) -> Bool
+pub fn ExternalStats::new(Int32, df? : Array[((String, String), Int32)], avgdl? : Array[(String, Double)]) -> Self
+pub fn ExternalStats::not_equal(Self, Self) -> Bool
+pub fn ExternalStats::to_repr(Self) -> @debug.Repr
+
 pub(all) struct FacetCount {
   value : String
   count : Int32
@@ -189,6 +228,14 @@ pub fn FieldSchema::to_repr(Self) -> @debug.Repr
 
 type FieldStats
 
+pub(all) enum Fusion {
+  Rrf
+  Weighted(Double)
+} derive(Eq, @debug.Debug)
+pub fn Fusion::equal(Self, Self) -> Bool
+pub fn Fusion::not_equal(Self, Self) -> Bool
+pub fn Fusion::to_repr(Self) -> @debug.Repr
+
 pub(all) struct FuzzyMatch {
   term : String
   distance : Int32
@@ -214,6 +261,34 @@ pub fn Hit::not_equal(Self, Self) -> Bool
 pub fn Hit::to_json(Self) -> Json
 pub fn Hit::to_repr(Self) -> @debug.Repr
 
+pub struct HnswGraph {
+  layer0 : Array[Array[Int32]]
+  upper : Array[Array[Array[Int32]]]
+  mut entry : Int32
+  mut top_layer : Int32
+  mut len : Int32
+  m : Int32
+  m0 : Int32
+  ef_construction : Int32
+  dim : Int32
+  // private fields
+}
+pub fn HnswGraph::max_layer(Self) -> Int32
+pub fn HnswGraph::search(Self, HnswPoints, Array[Double], Int32, ef? : Int32) -> Array[(Int32, Double)]
+pub fn HnswGraph::size(Self) -> Int32
+
+type HnswPoints
+
+pub(all) struct HybridHit {
+  id : String
+  score : Double
+  lexical_rank : Int32
+  vector_rank : Int32
+} derive(Eq, @debug.Debug)
+pub fn HybridHit::equal(Self, Self) -> Bool
+pub fn HybridHit::not_equal(Self, Self) -> Bool
+pub fn HybridHit::to_repr(Self) -> @debug.Repr
+
 pub struct Index {
   schema : Array[FieldSchema]
   analyzer : Analyzer
@@ -221,16 +296,20 @@ pub struct Index {
   // private fields
 }
 pub fn Index::add(Self, Document) -> Unit
+pub fn Index::aggregate(Self, String, Array[AggSpec], filters? : Array[(String, Array[String])]) -> Array[AggResult] raise QueryError
 pub fn Index::all_live_scores(Self, DocScores, (Int32) -> Bool) -> DocScores
 pub fn Index::analyzer(Self) -> Analyzer
 pub fn Index::bk_tree(Self, field? : String?) -> BkTree
 pub fn Index::bm25(Self) -> Bm25Params
 pub fn Index::collect_hits(Self, DocScores, Int32) -> Array[Hit]
+pub fn Index::count(Self, String) -> Int32 raise QueryError
 pub fn Index::delete(Self, String) -> Bool
 pub fn Index::doc_count(Self) -> Int32
 pub fn Index::doc_freq(Self, String, String) -> Int32
 pub fn Index::doc_id(Self, Int32) -> String?
 pub fn Index::explain(Self, String, String) -> Explanation? raise QueryError
+pub fn Index::field_doc_count(Self, String) -> Int32
+pub fn Index::field_length_total(Self, String) -> Int32
 pub fn Index::field_lengths(Self, String) -> Array[Int32]
 pub fn Index::from_bytes(Bytes) -> Self raise CodecError
 pub fn Index::fuzzy_search(Self, String, max_distance? : Int32, limit? : Int32) -> Array[Hit] raise QueryError
@@ -239,12 +318,21 @@ pub fn Index::fuzzy_terms_fast(Self, String, max_distance? : Int32, field? : Str
 pub fn Index::get_document(Self, String) -> Document?
 pub fn Index::get_facets(Self, String) -> Array[(String, Array[String])]
 pub fn Index::get_field(Self, String, String) -> String?
+pub fn Index::has_external_stats(Self) -> Bool
 pub fn Index::highlight(Self, String, String, String, pre_tag? : String, post_tag? : String) -> String raise QueryError
 pub fn Index::highlight_spans(Self, String, String, String) -> Array[HighlightSpan] raise QueryError
+pub fn Index::hnsw_graph(Self, String) -> HnswGraph
+pub fn Index::hybrid_search(Self, String, Array[Double], String, limit? : Int32, candidate_pool? : Int32, fusion? : Fusion, ef? : Int32) -> Array[HybridHit] raise QueryError
 pub fn Index::is_deleted(Self, Int32) -> Bool
+pub fn Index::knn(Self, String, Array[Double], Int32, ef? : Int32) -> Array[(String, Double)]
+pub fn Index::knn_exact(Self, String, Array[Double], Int32) -> Array[(Int32, Double)]
+pub fn Index::knn_recall(Self, String, Array[Array[Double]], Int32, ef? : Int32) -> Double
 pub async fn Index::load(String) -> Self raise StoreError
 pub async fn Index::load_or_create(String, Array[FieldSchema]) -> Self raise StoreError
 pub fn Index::new(Array[FieldSchema], analyzer? : Analyzer, bm25? : Bm25Params) -> Self
+pub fn Index::num_column(Self, String) -> Array[Double]
+pub fn Index::num_of(Self, String, String) -> Double?
+pub fn Index::numeric_fields(Self) -> Array[String]
 pub fn Index::postings_of(Self, String, String) -> Array[Posting]
 pub async fn Index::save(Self, String) -> Unit raise StoreError
 pub fn Index::schema(Self) -> Array[FieldSchema]
@@ -252,13 +340,19 @@ pub fn Index::search(Self, String, limit? : Int32) -> Array[Hit] raise QueryErro
 pub fn Index::search_after(Self, String, after_score~ : Double, after_id~ : String, limit? : Int32) -> Array[Hit] raise QueryError
 pub fn Index::search_faceted(Self, String, options? : SearchOptions) -> FacetedResult raise QueryError
 pub fn Index::search_sorted(Self, String, limit? : Int32, sort? : SortOrder) -> Array[Hit] raise QueryError
+pub fn Index::set_external_stats(Self, ExternalStats?) -> Unit
 pub fn Index::set_facets(Self, String, Array[(String, Array[String])]) -> Bool
+pub fn Index::set_num(Self, String, String, Double) -> Bool
+pub fn Index::set_vector(Self, String, String, Array[Double]) -> Bool
 pub fn Index::slot_count(Self) -> Int32
 pub fn Index::snippet(Self, String, String, String, max_chars? : Int32, pre_tag? : String, post_tag? : String) -> String raise QueryError
 pub fn Index::suggest(Self, String, max_distance? : Int32) -> String?
 pub fn Index::term_count(Self) -> Int32
 pub fn Index::terms_of(Self, String) -> Array[String]
 pub fn Index::to_bytes(Self) -> Bytes
+pub fn Index::tokens_in(Self, String) -> Int32
+pub fn Index::vector_count(Self, String) -> Int32
+pub fn Index::vector_dim(Self, String) -> Int32
 
 pub(all) struct Posting {
   doc : Int32
@@ -361,6 +455,18 @@ pub(all) enum SortOrder {
 pub fn SortOrder::equal(Self, Self) -> Bool
 pub fn SortOrder::not_equal(Self, Self) -> Bool
 pub fn SortOrder::to_repr(Self) -> @debug.Repr
+
+pub(all) struct StatSummary {
+  count : Int32
+  min : Double
+  max : Double
+  avg : Double
+  sum : Double
+} derive(Eq, @debug.Debug)
+pub fn StatSummary::equal(Self, Self) -> Bool
+pub fn StatSummary::not_equal(Self, Self) -> Bool
+pub fn StatSummary::to_json(Self) -> Json
+pub fn StatSummary::to_repr(Self) -> @debug.Repr
 
 pub(all) struct Token {
   term : String

@@ -11,3 +11,5 @@ target
 # generated API surface of the dev-only tool packages
 # (the library package still commits its .mbti so the published ABI is reviewable)
 tools/*/pkg.generated.mbti
+server/pkg.generated.mbti
+bench/*/pkg.generated.mbti

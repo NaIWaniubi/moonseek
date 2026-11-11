@@ -1,6 +1,6 @@
 # moonseek
 
-**Embedded full-text search engine in pure MoonBit.** Inverted index, BM25 ranking, dictionary-free Chinese tokenization, fuzzy search, faceted filtering, server-side highlighting, crash-safe WAL — runs on native, WebAssembly and JavaScript.
+**Search engine, service and cluster in pure MoonBit.** Inverted index, BM25, dictionary-free Chinese tokenization, fuzzy search, facets, numeric aggregations, HNSW vector search, hybrid fusion — plus an HTTP search service and a distributed coordinator with scatter-gather, globally consistent scoring and replica failover. Runs on native, WebAssembly and JavaScript.
 
 纯 MoonBit 实现的嵌入式全文搜索引擎：倒排索引、BM25、免词典中文分词、模糊搜索、分面过滤、服务端高亮、WAL 崩溃恢复，支持 native / WASM / JS 三端。
 
@@ -34,6 +34,10 @@ MoonBit's ecosystem has HTTP servers, crypto and database drivers — but no tan
 - **Crash-safe persistence**: versioned snapshot + CRC-32 checksum; atomic save (temp file → fsync → rename); torn/corrupt files are rejected, never silently loaded
 - **Portable**: pure MoonBit core (no FFI in the engine); native file store via `moonbitlang/async`; browser export via WasmGC + js-string builtins. **One snapshot format, two backends**: an index built by the native binary loads byte-for-byte into the browser's wasm-gc build
 - **Measured quality, not just latency**: NDCG@10 / MRR@10 / Recall@20 over 3,698 real packages with a 6-way ablation ([docs/quality.md](docs/quality.md))
+- **HTTP service**: a REST search API (`docs/api.md`) with bulk ingest, facets, aggregations, highlighting, `explain`, suggest and vector queries. The console in `console/` drives it
+- **Distributed mode**: one binary is a node, a shard or a coordinator. Scatter-gather across shards, **globally consistent scoring** (`?dfs=true` reproduced a single node's ranking exactly, 8/8 queries, zero score difference), replica failover, and partial answers that name the shards that failed ([docs/cluster.md](docs/cluster.md))
+- **Vector search**: pure-MoonBit HNSW with **measured recall** against brute force (0.996@ef=32, 0.999@ef=64 on 1,000 random 32-d points), plus hybrid BM25 × kNN fusion by reciprocal rank
+- **Numeric aggregations**: terms, stats, histogram and percentiles over a result set, with numeric doc values alongside facets
 - **Document lifecycle**: add, replace (same id), delete
 
 ## How it works
@@ -52,6 +56,33 @@ flowchart LR
   I --> F[Facets<br/>filter + aggregation]
   B[Browser<br/>WasmGC + js-string] -.-> I
 ```
+
+## Three ways to run it
+
+**1. Embedded** — the library, as above. `moon add NaIWaniubi/moonseek`.
+
+**2. As a service** — one process, an HTTP search API and the console:
+
+```bash
+moon build server --target native --release
+./_build/native/release/build/server/server.exe --addr 127.0.0.1:7700 --assets console
+curl -X POST localhost:7700/index/bulk --data-binary @docs.jsonl
+curl "localhost:7700/search?q=parser&facets=license"
+```
+
+**3. As a cluster** — three shards and a coordinator that owns no data:
+
+```bash
+for k in 0 1 2; do
+  ./server.exe --addr 127.0.0.1:$((7801+k)) --shard-port 127.0.0.1:$((7901+k)) &
+done
+./server.exe --addr 127.0.0.1:7805 --shards "127.0.0.1:7901,127.0.0.1:7902,127.0.0.1:7903"
+# ?dfs=true makes the ranking identical to a single node holding the whole corpus
+curl "localhost:7805/search?q=parser&dfs=true"
+```
+
+`tools/check-cluster.mjs` runs the cluster-vs-single-node comparison and prints
+the identity and latency tables in [docs/cluster.md](docs/cluster.md).
 
 ## Quick start
 
@@ -183,7 +214,7 @@ See [docs/architecture.md](docs/architecture.md) for design details and the snap
 ## Testing
 
 ```bash
-moon test                    # 259 tests (native), 242 (wasm-gc / js)
+moon test                    # 299 tests (native)
 moon test --target wasm-gc
 moon test --target js
 moon bench --release         # benchmarks

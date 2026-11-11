@@ -1,5 +1,104 @@
 # Changelog
 
+## 0.7.0 (2026-11-11)
+
+From an embedded library to a search platform: a network service, a distributed
+mode, vector retrieval, and the aggregations a search UI needs.
+
+### Added — moonseek-server: a real search service
+`server/main.mbt` implements the contract in `docs/api.md`, frozen before the
+implementation. Endpoints: `GET/POST /search` (filters, facets, aggregations,
+highlighting, snippets, `explain`, vector `knn` + fusion), `POST /index`,
+`POST /index/bulk` (newline-delimited JSON), `DELETE /index`, `GET /_stats`,
+`GET /_healthz`, `GET /suggest`, `GET /terms`, `GET /explain`, `GET /_dfs`, and
+static console assets with a path-traversal guard. Errors share one shape
+(`{"error","code"}`) so a client never has to guess.
+
+The service is a thin layer: everything that decides a result happens in the
+library, so the two cannot drift apart.
+
+### Added — distributed mode
+One binary runs as a single node, a shard, or a coordinator
+(`--shards`, `--shard-port`, `--pool`). Shards answer a small length-prefixed
+JSON protocol over TCP; the coordinator owns no index, fans queries out to every
+shard in parallel, merges per-shard top-k, and reports shard health.
+
+Two scoring modes, both measured (`docs/cluster.md`):
+
+| mode | round trips | ranking on 3 shards vs one node |
+|---|---|---|
+| local statistics (default) | 1 | 0/8 queries identical, score deltas to 0.82 |
+| `?dfs=true` | 2 | **8/8 identical, max score difference 0** |
+
+Globally consistent scoring installs corpus-wide `df`/`avgdl`/`N` on each shard
+for one query (`Index::set_external_stats`). Prefix queries are refused with an
+explicit note rather than mixed into a ranking they cannot support.
+
+Measured steady state (30 queries × 8 shapes): single node p50 4.7 ms; 3 shards
+local p50 6.7 ms; 3 shards `dfs` p50 6.9 ms.
+
+Failover: a replicated group (`primary|replica`) survived its primary being
+killed with the result unchanged (same total, `ok: 3, failed: 0`); an
+unreplicated shard's death produced a partial answer with `ok: 2, failed: 1` and
+the dead address named, while the coordinator kept serving.
+
+### Added — vector retrieval (HNSW) and hybrid search
+Pure-MoonBit HNSW: deterministic level assignment from a seed, greedy descent
+plus a bounded beam, and neighbour pruning by distance. Measured recall against
+brute force on random 32- and 64-dimensional data: ef=8 → 0.90, ef=32 → 0.996,
+ef=64 → 0.999 (1,000 points); ef=256 → 1.0 (5,000 points).
+
+`Index::hybrid_search` fuses BM25 and kNN with reciprocal rank fusion (default)
+or a normalized weighted blend, reporting each hit's rank in both rankings.
+
+Three real bugs were found and fixed while making this honest:
+
+* **Pruning by insertion order split the graph.** Keeping the first `M` edges
+  meant a full node never accepted a newcomer, so nodes inserted late got no
+  inbound edges and layer-0 search reached 46 of 1,000 nodes — recall@10 was
+  0.016 at every beam width. Pruning by distance fixed it.
+* **The frontier cursor skipped better candidates** that were inserted *before*
+  it during expansion, silently costing recall (0.999 → 0.982).
+* **Distance computation probed a hash map per candidate and copied a vector per
+  neighbour comparison**, making construction 74 s for 5,000×64. A flat point
+  buffer with a stride, plus a doc-to-doc distance that allocates nothing,
+  brought it to 31 s; a generation-stamped visited array replaced one hash map
+  per beam-search call.
+
+Graph construction on random uniform high-dimensional data is expensive because
+distance gaps are small; real embeddings have far lower intrinsic dimension. The
+31 s figure is for the adversarial case, and is documented rather than hidden.
+
+### Added — numeric document values and aggregations
+`set_num` attaches numbers to documents (the numeric counterpart of facets):
+not analyzed, not scored, but filterable and aggregatable. `aggregate` runs
+`TermsAgg`, `StatsAgg`, `HistogramAgg` and `PercentilesAgg` over exactly the
+result set the caller returned hits from — aggregating over a different set is
+how a search UI ends up lying about its own facets.
+
+Buckets use a real floor division, so -0.5 and +0.5 land in different buckets
+(truncation toward zero put them together). "No value" is a NaN sentinel tested
+with `v == v`, not 0.0, because 0.0 is a legitimate value and treating absence
+as zero corrupts every average.
+
+### Fixed
+* **Every latency in the service was reported 1000× too small**: `@env.now()` is
+  milliseconds and several call sites divided by 1000 again. `took_ms` was
+  returning seconds.
+* **The default highlight field was hardcoded to `body`**, so every hit on any
+  other schema came back with an empty snippet. It now follows the schema's
+  lowest-weighted field.
+* **A shard's match count cost a second full ranking** (`search(limit=0)` builds
+  and sorts every hit). New `Index::count` counts matches without materializing
+  them; the cluster's per-query cost dropped from 92–272 ms to 43–96 ms.
+* **The statistics round re-analyzed every document** to recount field lengths,
+  costing ~45 ms per query. It now reads the index's own per-field totals in
+  O(1).
+* **The coordinator died with its shard**: `spawn` defaults to
+  `allow_failure=false`, so a shard's failure cancelled the whole task group.
+* **The stats request was not JSON** (`"term":"field"` inside an array), so every
+  shard answered `bad json` while the coordinator reported success.
+
 ## 0.6.0 (2026-11-11)
 
 This release is about evidence rather than speed: real data, measured retrieval

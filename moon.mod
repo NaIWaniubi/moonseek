@@ -3,7 +3,7 @@
 
 name = "NaIWaniubi/moonseek"
 
-version = "0.6.0"
+version = "0.7.0"
 
 readme = "README.md"
 
@@ -23,11 +23,15 @@ keywords = [
   "wal",
   "phrase",
   "wasm-gc",
+  "hnsw",
+  "vector",
+  "distributed",
+  "aggregation",
 ]
 
 preferred_target = "native"
 
-description = "Embedded full-text search engine: inverted index, BM25 ranking, exact and sloppy phrases, dictionary-free Chinese tokenization, fuzzy search (BK-tree), did-you-mean, highlighting, faceted filtering, score explanation, segmented index with WAL crash recovery. One snapshot format across native/WASM/JS."
+description = "Full-text search engine and service: inverted index, BM25, exact and sloppy phrases, dictionary-free Chinese tokenization, fuzzy search, highlighting, facets, numeric aggregations, HNSW vector search with hybrid fusion, an HTTP service, and a distributed coordinator with scatter-gather, global statistics and failover. One snapshot format across native/WASM/JS."
 
 import {
   "moonbitlang/async@0.22.4",
