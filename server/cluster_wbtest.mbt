@@ -525,3 +525,102 @@ test "doc_id_of reads an id without applying the document" {
   assert_eq(doc_id_of("{\"id\":7}"), None)
   assert_eq(doc_id_of("not json"), None)
 }
+
+///|
+/// Sort orders on the wire.
+///
+/// The parser has to *reject* what it does not understand. A silent fall back to
+/// score order is the exact failure this parameter was documented to fix: a
+/// client asks for a field order, gets score order, and has no way to tell.
+
+///|
+test "sort specs parse with the documented defaults per field" {
+  // Score and numbers descend by default (a "top N" is the largest); ids ascend
+  // (a listing is A to Z).
+  assert_true(parse_sort("score", "") is Some(@moonseek.ScoreDesc))
+  assert_true(parse_sort("", "") is Some(@moonseek.ScoreDesc))
+  assert_true(parse_sort("id", "") is Some(@moonseek.IdAsc))
+  assert_true(parse_sort("num:year", "") is Some(@moonseek.NumDesc("year")))
+  // Explicit order wins in both directions.
+  assert_true(parse_sort("score", "asc") is Some(@moonseek.ScoreAsc))
+  assert_true(parse_sort("id", "desc") is Some(@moonseek.IdDesc))
+  assert_true(parse_sort("num:year", "asc") is Some(@moonseek.NumAsc("year")))
+  // Case and whitespace are tolerated.
+  assert_true(
+    parse_sort(" NUM:Year ", " DESC ") is Some(@moonseek.NumDesc("year")),
+  )
+}
+
+///|
+test "an unrecognized sort is rejected rather than ignored" {
+  assert_true(parse_sort("year", "") is None)
+  assert_true(parse_sort("num:", "") is None)
+  assert_true(parse_sort("num", "") is None)
+  assert_true(parse_sort("score", "sideways") is None)
+  assert_true(parse_sort("score", "ascending") is None)
+  // A name that merely starts with the prefix is not a number sort.
+  assert_true(parse_sort("number:year", "") is None)
+}
+
+///|
+test "sort names round-trip through the wire form" {
+  let cases : Array[@moonseek.SortOrder] = [
+    @moonseek.ScoreDesc,
+    @moonseek.ScoreAsc,
+    @moonseek.IdAsc,
+    @moonseek.IdDesc,
+    @moonseek.NumAsc("year"),
+    @moonseek.NumDesc("versions"),
+  ]
+  for sort in cases {
+    let by = sort_by_name(sort)
+    let order = sort_order_name(sort)
+    // Parsing the wire form must give back the same order, or a coordinator
+    // would ask the shards for one order and merge as if it were another.
+    match parse_sort(by, order) {
+      Some(parsed) => assert_eq(parsed, sort)
+      None => abort("wire form did not parse: " + by + " " + order)
+    }
+  }
+}
+
+///|
+test "the merge comparator mirrors the engine's ordering rules" {
+  let older : ShardHit = { id: "a", score: 1.0, key: 5.0, }
+  let newer : ShardHit = { id: "b", score: 1.0, key: 9.0, }
+  // Descending by the key, even though a has the lower score.
+  assert_true(compare_shard_hits(@moonseek.NumDesc("k"), newer, older) < 0)
+  assert_true(compare_shard_hits(@moonseek.NumAsc("k"), newer, older) > 0)
+  // The sign flips between the two directions for a pair that both have.
+  assert_eq(
+    compare_shard_hits(@moonseek.NumDesc("k"), older, newer),
+    -compare_shard_hits(@moonseek.NumDesc("k"), newer, older),
+  )
+  // A missing key sorts last in both directions.
+  let undated : ShardHit = { id: "c", score: 1.0, key: missing_key(), }
+  assert_true(compare_shard_hits(@moonseek.NumDesc("k"), older, undated) < 0)
+  assert_true(compare_shard_hits(@moonseek.NumAsc("k"), older, undated) < 0)
+  assert_true(compare_shard_hits(@moonseek.NumAsc("k"), undated, older) > 0)
+  // Score order ignores the key entirely. Equal scores (these two) break by id,
+  // so the comparison is a tie-break rather than a real ordering: "a" first.
+  assert_true(compare_shard_hits(@moonseek.ScoreDesc, older, newer) < 0)
+  assert_true(compare_shard_hits(@moonseek.ScoreDesc, newer, older) > 0)
+}
+
+///|
+test "a shard reply carries the sort key and tolerates its absence" {
+  let with_key = parse_shard_hits(
+    "{\"hits\":[[\"x\",1.5,7],[\"y\",0.5,null]],\"total\":2}",
+  )
+  assert_true(with_key.ok)
+  assert_eq(with_key.hits.length(), 2)
+  assert_eq(with_key.hits[0].id, "x")
+  assert_eq(with_key.hits[0].key, 7.0)
+  // An explicit null and a missing third element both mean "no value", which is
+  // what an older shard sends.
+  assert_true(@moonseek.is_missing_number(with_key.hits[1].key))
+  let old_shape = parse_shard_hits("{\"hits\":[[\"z\",2.0]],\"total\":1}")
+  assert_eq(old_shape.hits[0].id, "z")
+  assert_eq(old_shape.hits[0].score, 2.0)
+  assert_true(@moonseek.is_missing_number(old_shape.hits[0].key))
+}

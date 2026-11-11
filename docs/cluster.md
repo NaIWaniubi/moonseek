@@ -145,7 +145,7 @@ header, one JSON reply, then close.
 | `index` | `{"op":"index","body":"<document json>"}` | what `POST /index` returns |
 | `bulk` | `{"op":"bulk","body":"<ndjson>"}` | what `POST /index/bulk` returns |
 | `delete` | `{"op":"delete","id":"…"}` | what `DELETE /index` returns |
-| `search` | `{"op":"search","query":…,"limit":N,"filters":[…][,"stats":{…}]}` | `{"hits":[["id",score],…],"docs":N,"total":M}` |
+| `search` | `{"op":"search","query":…,"limit":N,"filters":[…],"sort":…,"order":…[,"stats":{…}]}` | `{"hits":[["id",score,key],…],"docs":N,"total":M}` |
 | `stats` | `{"op":"stats","terms":[["term","field"],…]}` | per-term `df`, per-field length sums and counts |
 | `agg` | `{"op":"agg","query":…,"specs":[…],"filters":[…],"values":[…]}` | per-shard aggregation results, plus raw values |
 
@@ -282,6 +282,30 @@ where a single node returned 1190 — and ranked documents the filter excluded. 
 filters now travel with the search request and the shard applies them through
 `search_faceted`, which also returns the filtered match count.
 
+## Sorting across shards
+
+`GET /search` takes `sort=score|id|num:<field>` with `order=asc|desc`
+(see [docs/api.md](api.md)). Two things make a sorted cluster query exact rather
+than plausible:
+
+* Each shard is asked for its own top `pool` **under the requested order**, not
+  its score-top-pool. A shard that returned score-candidates while the query
+  sorted by a field would hand the coordinator a pool that does not contain the
+  global top — the same argument as `pool >= limit` for the score order.
+* The shards ship the numeric sort **key** with each hit. The coordinator never
+  sees the documents, so without the key it could merge *a* sorted list but not
+  *the* sorted list: it would be comparing ids while reporting a field order.
+
+Measured (`tools/test-cluster.sh`, claim 6): three queries × six orders — score
+ascending and descending, id ascending and descending, and a numeric field
+ascending and descending — for **18/18 identical hit lists** against a single
+node. An unknown sort is a `400` rather than a silent fall back to score order.
+
+A sort by `id` or by a numeric field is exact in the **default** mode, because
+it never reads a score and so does not depend on which statistics scored the
+matches. A `score` sort is exact only with `dfs=true`; without it the shard
+orders differ from a single node's for the reason the table above measures.
+
 ## Failover
 
 Two mechanisms, both measured.
@@ -323,6 +347,5 @@ the *coordinator* down along with the shard. Scatter-gather spawns with
 5. **`knn`/hybrid retrieval is not fanned out.** Fusing two rankings that live on
    different shards needs per-shard vectors and a second merge, which is a
    different design.
-6. **Cross-shard `sort: num:<field>` is not implemented.** Sorting applies within a
-   shard's candidate pool only, so a globally correct sort by a numeric field is
-   not claimed.
+6. **Sorting is by score, id, or one numeric field.** There is no multi-key
+   sort, no sort by a facet value, and no per-shard `sort` override.

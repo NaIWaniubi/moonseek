@@ -159,3 +159,108 @@ test "search_after: full traversal covers all docs" {
   }
   assert_eq(collected.length(), 3)
 }
+
+///|
+/// Numeric sort orders.
+///
+/// The case worth a test is the document with no value for the field: treating
+/// it as zero would make "sort by year descending" file every undated document
+/// between the oldest and the newest, which looks like data rather than a bug.
+///
+/// Note the helper: the package already has an `ids_of` that **sorts** its
+/// result, for order-insensitive set comparisons. Reusing it here would hide
+/// the very thing these tests are about, which is why this one keeps the order
+/// it was given.
+
+///|
+fn ordered_ids(hits : Array[@moonseek.Hit]) -> Array[String] {
+  let out : Array[String] = []
+  for h in hits {
+    out.push(h.id)
+  }
+  out
+}
+
+///|
+fn numeric_sort_fixture() -> @moonseek.Index {
+  let idx = @moonseek.Index::new([{ name: "body", weight: 1.0, }])
+  let data : Array[(String, Double)] = [("a", 5.0), ("b", 1.0), ("c", 9.0)]
+  for (id, year) in data {
+    idx.add({ id, fields: [("body", "hit")], })
+    let _ = idx.set_num(id, "year", year)
+  }
+  // No value for `year` at all.
+  idx.add({ id: "d", fields: [("body", "hit")], })
+  idx
+}
+
+///|
+test "numeric sort orders by value with the value-less documents last" {
+  let idx = numeric_sort_fixture()
+  let desc = ordered_ids(
+    idx.search_sorted("hit", limit=0, sort=@moonseek.SortOrder::NumDesc("year")),
+  )
+  assert_eq(desc, ["c", "a", "b", "d"])
+  let asc = ordered_ids(
+    idx.search_sorted("hit", limit=0, sort=@moonseek.SortOrder::NumAsc("year")),
+  )
+  assert_eq(asc, ["b", "a", "c", "d"])
+  // The value-less document is last in both directions, so it cannot be the
+  // result of treating "no value" as zero.
+  assert_eq(desc[desc.length() - 1], "d")
+  assert_eq(asc[asc.length() - 1], "d")
+  // A field nothing declares orders entirely by the id tie-break rather than
+  // failing: "sort by a field with no values" is a valid, if useless, request.
+  assert_eq(
+    ordered_ids(
+      idx.search_sorted(
+        "hit",
+        limit=0,
+        sort=@moonseek.SortOrder::NumAsc("nope"),
+      ),
+    ),
+    ["a", "b", "c", "d"],
+  )
+}
+
+///|
+test "numeric sort ties break by id in both directions" {
+  let idx = @moonseek.Index::new([{ name: "body", weight: 1.0, }])
+  for id in ["b", "a", "c"] {
+    idx.add({ id, fields: [("body", "hit")], })
+    let _ = idx.set_num(id, "n", 7.0)
+  }
+  // The id tie-break is ascending even under a descending numeric order: a
+  // stable, documented order rather than whatever the sort happened to do.
+  assert_eq(
+    ordered_ids(
+      idx.search_sorted("hit", limit=0, sort=@moonseek.SortOrder::NumAsc("n")),
+    ),
+    ["a", "b", "c"],
+  )
+  assert_eq(
+    ordered_ids(
+      idx.search_sorted("hit", limit=0, sort=@moonseek.SortOrder::NumDesc("n")),
+    ),
+    ["a", "b", "c"],
+  )
+}
+
+///|
+test "compare_numeric is antisymmetric and puts missing last both ways" {
+  let idx = numeric_sort_fixture()
+  for forward in [true, false] {
+    // a=5, b=1: the sign flips with the direction...
+    let ab = @moonseek.compare_numeric(idx, "year", "a", "b", forward~)
+    let ba = @moonseek.compare_numeric(idx, "year", "b", "a", forward~)
+    assert_eq(ab, -ba)
+    assert_true(ab != 0)
+    // ...but "d has no value" does not: missing is last in both directions.
+    assert_true(@moonseek.compare_numeric(idx, "year", "a", "d", forward~) < 0)
+    assert_true(@moonseek.compare_numeric(idx, "year", "d", "a", forward~) > 0)
+  }
+  // A document compared with itself is always equal.
+  assert_true(
+    @moonseek.compare_numeric(idx, "year", "a", "a", forward=true) == 0,
+  )
+}

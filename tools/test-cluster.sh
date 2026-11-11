@@ -165,6 +165,78 @@ python3 "$(dirname "$0")/check-distributed-aggs.py" \
   http://127.0.0.1:7805 http://127.0.0.1:7804 \
   '/search?q=zzzznomatch&limit=5&facets=domain&agg=versions:stats&agg=versions:percentiles' || exit 1
 
+# ---- claim 6: a sorted query matches a single node -------------------------
+echo "== claim 6: sorted queries match a single node =="
+python3 - "$(dirname "$0")" <<'PY' || exit 1
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+# (by, order) pairs. `num:` reads the corpus's `versions` numeric field, and is
+# the one that needs the shards to ship the value: a coordinator that merged on
+# ids while claiming to sort by a field would return the same *set* in an order
+# that looks plausible.
+SORTS = [("score", "desc"), ("score", "asc"), ("id", "asc"), ("id", "desc"),
+         ("num:versions", "asc"), ("num:versions", "desc")]
+QUERIES = ["parser", "socket cache", "tensor"]
+
+failures = []
+
+
+def fetch(port, query, by, order):
+    # A score sort compares scores, so it needs the two-phase global statistics
+    # or the coordinator ranks with per-shard numbers and honestly returns a
+    # different order (that difference is what claim 1 measures). A sort by id or
+    # by a numeric field does not read the score at all, so it is compared in the
+    # default mode: its correctness must not depend on the scoring statistics.
+    extra = "&dfs=true" if by == "score" else ""
+    url = ("http://127.0.0.1:%d/search?q=%s&limit=10&sort=%s&order=%s%s"
+           % (port, urllib.parse.quote(query), urllib.parse.quote(by), order,
+              extra))
+    with urllib.request.urlopen(url, timeout=30) as response:
+        return json.load(response)
+
+
+for query in QUERIES:
+    for by, order in SORTS:
+        coord = fetch(7805, query, by, order)
+        single = fetch(7804, query, by, order)
+        if coord.get("sort") != by or coord.get("order") != order:
+            failures.append("%s/%s: coordinator reported sort=%s order=%s"
+                            % (query, by, coord.get("sort"), coord.get("order")))
+            continue
+        if coord.get("total") != single.get("total"):
+            failures.append("%s %s %s: total %s != %s"
+                            % (query, by, order, coord.get("total"),
+                               single.get("total")))
+        ci = [h["id"] for h in coord["hits"]]
+        si = [h["id"] for h in single["hits"]]
+        if ci != si:
+            failures.append("%s %s %s: coord %s | single %s"
+                            % (query, by, order, ci, si))
+        else:
+            print("  ok: %-14s %s %s -> %s" % (query, by, order,
+                                               ", ".join(ci[:3]) + " ..."))
+
+if failures:
+    for failure in failures:
+        print("FAIL: %s" % failure)
+    sys.exit(1)
+print("SORTED QUERIES MATCH THE SINGLE NODE")
+PY
+
+# A sort the service does not understand must be refused, not silently replaced
+# by score order: the parameter is documented, so accepting and ignoring it is
+# worse than rejecting it.
+code=$(curl -s -o /dev/null -w '%{http_code}' -m 10   "http://127.0.0.1:7805/search?q=parser&sort=year")
+if [ "$code" = "400" ]; then
+  echo "ok: an unknown sort is a 400"
+else
+  echo "FAIL: unknown sort returned $code, expected 400"
+  exit 1
+fi
+
 # ---- claim 2: killing a shard yields a partial answer with accounting ------
 echo "== claim 2: shard failure is reported, not hidden =="
 before=$(curl -s -m 20 "http://127.0.0.1:7805/search?q=parser&limit=10" \

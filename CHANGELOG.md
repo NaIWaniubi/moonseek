@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.9.0 (2026-11-12)
+
+`sort` was documented in `docs/api.md` from the first release and **never wired
+into the service**. A client that sent `sort=num:year&order=desc` got a
+score-ordered response and no indication that its request had been ignored —
+the worst of the three possible outcomes, because the contract said otherwise.
+
+### Added
+
+* `GET/POST /search` takes `sort=score|id|num:<field>` and `order=asc|desc`. The
+  response echoes the order actually applied as `sort`/`order`, and a numeric
+  sort also reports each hit's `sort_key`, so a client can check the order it got
+  instead of trusting it.
+* **An unrecognized sort is a `400`**, not a silent fall back to score order.
+* `SortOrder` gains `NumAsc(String)` / `NumDesc(String)`; `compare_numeric` is
+  public so the service, a shard and a client can all order identically. (Adding
+  enum variants is why this is 0.9.0 and not 0.8.1: an exhaustive `match` on
+  `SortOrder` stops compiling, which is the point.)
+* Documents with no value for the sort field sort **last in both directions** —
+  a missing value is not a small number, and treating it as zero would file
+  every undated document between the oldest and the newest.
+
+### Cross-shard
+
+A coordinator now gets its exact global order for all three sort kinds. Each
+shard is asked for its top `pool` **under the requested order** (a shard that
+returned score-candidates while the query sorted by a field would hand the
+coordinator a pool without the global top), and the shards ship the numeric key,
+because the coordinator never sees the documents. The shard protocol's `search`
+reply is now `[id, score, key]`; the two-element form is still accepted, so
+adjacent versions can talk.
+
+Measured: three queries × six orders (score/id/numeric × asc/desc) give
+**18/18 identical hit lists** against a single node. A sort by id or by a numeric
+field is exact in the default mode because it never reads a score; a score sort
+is exact only under `dfs=true`, which is the difference the cluster document has
+measured since 0.7.0.
+
+### Fixed
+
+* The library's `search_sorted` gained the two new orders, and the service's
+  single-node path now sorts the **whole match set before paginating**. Sorting
+  only the returned page would order ten score-ranked hits by the field, which is
+  a different answer from the field-ordered page.
+
+### Tests
+
+322 native (up from 314), 275 wasm-gc / 275 js. New: four library tests for
+numeric ordering (including the value-less and tie-break cases), five wire-level
+tests for parsing and the merge comparator, and claim 6 in `tools/test-cluster.sh`.
+
 ## 0.8.0 (2026-11-12)
 
 The distributed layer finished: it now grows without rewriting the corpus, takes

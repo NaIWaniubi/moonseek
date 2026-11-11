@@ -154,6 +154,11 @@ pub fn Index::explain(
 
 ///|
 /// Sort order for search results.
+///
+/// `NumAsc`/`NumDesc` order by a numeric document value. Documents with no
+/// value for the field sort **last in both directions**: a missing value is not
+/// a small number, and putting the value-less documents first in a descending
+/// sort would make "newest first" begin with the ones that have no date.
 pub(all) enum SortOrder {
   /// Descending BM25 score (default).
   ScoreDesc
@@ -163,6 +168,10 @@ pub(all) enum SortOrder {
   IdAsc
   /// Descending document id.
   IdDesc
+  /// Ascending numeric value of the named field.
+  NumAsc(String)
+  /// Descending numeric value of the named field.
+  NumDesc(String)
 } derive(Eq, Debug)
 
 ///|
@@ -209,12 +218,48 @@ pub fn Index::search_sorted(
       }
       IdAsc => a.id.lexical_compare(b.id)
       IdDesc => b.id.lexical_compare(a.id)
+      NumAsc(field) => compare_numeric(self, field, a.id, b.id, forward=true)
+      NumDesc(field) => compare_numeric(self, field, a.id, b.id, forward=false)
     }
   })
   if limit > 0 && hits.length() > limit {
     hits[:limit].to_owned()
   } else {
     hits
+  }
+}
+
+///|
+/// Order two documents by a numeric value, with the value-less ones last in
+/// whichever direction the sort runs.
+///
+/// Returns a comparison in the *requested* order (so the caller can pass it
+/// straight to `sort_by`), which is why the sign is applied inside.
+pub fn compare_numeric(
+  index : Index,
+  field : String,
+  left : String,
+  right : String,
+  forward~ : Bool,
+) -> Int32 {
+  let a = index.num_of(left, field)
+  let b = index.num_of(right, field)
+  match (a, b) {
+    // Missing sorts last in both directions, so it cannot be done by negating
+    // the comparison: the "missing" case is symmetric while the value case is
+    // not.
+    (None, None) => left.lexical_compare(right)
+    (None, Some(_)) => 1
+    (Some(_), None) => -1
+    (Some(x), Some(y)) => {
+      let cmp = x.compare(y)
+      let directed = if forward { cmp } else { -cmp }
+      if directed == 0 {
+        left.lexical_compare(right)
+      } else {
+        directed
+      }
+    }
   }
 }
 

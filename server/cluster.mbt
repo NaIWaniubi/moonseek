@@ -231,6 +231,79 @@ pub fn parse_shard_mode(text : String) -> ShardMode? {
 }
 
 ///|
+/// `score` | `id` | `num:<field>` -- the `by` half of a sort order, as
+/// `docs/api.md` documents it.
+///
+/// The default direction follows the field: score and numbers descend (a "top
+/// N" is nearly always the largest) and ids ascend (an alphabetical listing is
+/// nearly always A to Z). `order` overrides it.
+pub fn parse_sort(by : String, order : String) -> @moonseek.SortOrder? {
+  let trimmed = by.trim().to_lower()
+  let ascending = match order.trim().to_lower() {
+    "asc" => Some(true)
+    "desc" => Some(false)
+    "" => None
+    _ => return None
+  }
+  match trimmed {
+    "" | "score" =>
+      Some(
+        if ascending.unwrap_or(false) {
+          @moonseek.ScoreAsc
+        } else {
+          @moonseek.ScoreDesc
+        },
+      )
+    "id" =>
+      Some(
+        if ascending.unwrap_or(true) {
+          @moonseek.IdAsc
+        } else {
+          @moonseek.IdDesc
+        },
+      )
+    _ => {
+      // A typo must be an error rather than a silent fall back to score order:
+      // silently sorting by something other than what was asked is the whole
+      // failure this feature exists to remove.
+      if trimmed.length() <= 4 || trimmed[:4] != "num:" {
+        return None
+      }
+      let field = trimmed[4:].to_owned()
+      if field.is_empty() {
+        return None
+      }
+      Some(
+        if ascending.unwrap_or(false) {
+          @moonseek.NumAsc(field)
+        } else {
+          @moonseek.NumDesc(field)
+        },
+      )
+    }
+  }
+}
+
+///|
+/// The `by` half of a sort, for the wire.
+pub fn sort_by_name(sort : @moonseek.SortOrder) -> String {
+  match sort {
+    ScoreDesc | ScoreAsc => "score"
+    IdAsc | IdDesc => "id"
+    NumAsc(field) | NumDesc(field) => "num:" + field
+  }
+}
+
+///|
+/// The `order` half of a sort, for the wire.
+pub fn sort_order_name(sort : @moonseek.SortOrder) -> String {
+  match sort {
+    ScoreDesc | IdDesc | NumDesc(_) => "desc"
+    ScoreAsc | IdAsc | NumAsc(_) => "asc"
+  }
+}
+
+///|
 /// Where a set of ids lands, before and after a change of shard count, and how
 /// much moved.
 pub(all) struct Rebalance {
@@ -290,10 +363,30 @@ pub fn rebalance_plan(
 }
 
 ///|
+/// One candidate a shard returned.
+///
+/// `key` is the value of the field the query sorts by, and is the engine's NaN
+/// sentinel when the document has no value for it. It has to travel: a
+/// coordinator merging a numeric sort never sees the documents, so without the
+/// key it could merge *a* sorted list but not *the* sorted list — it would be
+/// comparing ids while claiming to sort by a field.
+pub(all) struct ShardHit {
+  id : String
+  score : Double
+  key : Double
+} derive(Eq, Debug)
+
+///|
+pub extend ShardHit with Eq::{equal, not_equal}
+
+///|
+pub extend ShardHit with @debug.Debug::{to_repr}
+
+///|
 /// One shard's answer to a search.
 struct ShardHits {
-  /// (id, score) pairs, already sorted by the shard.
-  hits : Array[(String, Double)]
+  /// Candidates, already in the order the shard was asked for.
+  hits : Array[ShardHit]
   /// Total matches, for the merged `total`.
   total : Int32
   /// Whether the shard answered at all.
@@ -355,14 +448,27 @@ fn parse_shard_hits(answer : String) -> ShardHits {
   }
   match json {
     Object(fields) => {
-      let hits : Array[(String, Double)] = []
+      let hits : Array[ShardHit] = []
       match fields.get("hits") {
         Some(Array(items)) =>
           for item in items {
             match item {
+              // `[id, score]` or `[id, score, key]`. The two-element form is
+              // still accepted so a shard and a coordinator from adjacent
+              // versions can talk; a missing key means "no value", which is
+              // what it means anyway.
+              Array(triple) if triple.length() == 3 =>
+                match (triple[0], triple[1], triple[2]) {
+                  (String(id), Number(score, ..), Number(key, ..)) =>
+                    hits.push({ id, score, key, })
+                  (String(id), Number(score, ..), Null) =>
+                    hits.push({ id, score, key: missing_key(), })
+                  _ => ()
+                }
               Array(pair) if pair.length() == 2 =>
                 match (pair[0], pair[1]) {
-                  (String(id), Number(score, ..)) => hits.push((id, score))
+                  (String(id), Number(score, ..)) =>
+                    hits.push({ id, score, key: missing_key(), })
                   _ => ()
                 }
               _ => ()
@@ -386,10 +492,75 @@ fn failed_shard() -> ShardHits {
 }
 
 ///|
+/// The "no value for the sort field" key. The engine's own sentinel: a quiet
+/// NaN, tested with `is_missing_number`, which is `v != v`.
+fn missing_key() -> Double {
+  0x7FF8000000000001L.reinterpret_as_double()
+}
+
+///|
+/// Order two candidates under a requested sort.
+///
+/// This has to mirror the engine's own comparison exactly, including the tie
+/// break by id, or a cluster query would return the same *set* as a single node
+/// in a different order — which is the failure that looks like success.
+fn compare_shard_hits(
+  sort : @moonseek.SortOrder,
+  a : ShardHit,
+  b : ShardHit,
+) -> Int32 {
+  match sort {
+    ScoreDesc => {
+      let cmp = b.score.compare(a.score)
+      if cmp == 0 {
+        a.id.lexical_compare(b.id)
+      } else {
+        cmp
+      }
+    }
+    ScoreAsc => {
+      let cmp = a.score.compare(b.score)
+      if cmp == 0 {
+        a.id.lexical_compare(b.id)
+      } else {
+        cmp
+      }
+    }
+    IdAsc => a.id.lexical_compare(b.id)
+    IdDesc => b.id.lexical_compare(a.id)
+    NumAsc(_) => compare_keys(a, b, forward=true)
+    NumDesc(_) => compare_keys(a, b, forward=false)
+  }
+}
+
+///|
+/// Compare two candidates by their sort key, with the value-less ones last in
+/// both directions — the same rule `Index::search_sorted` uses, because the two
+/// answers have to agree.
+fn compare_keys(a : ShardHit, b : ShardHit, forward~ : Bool) -> Int32 {
+  let a_missing = @moonseek.is_missing_number(a.key)
+  let b_missing = @moonseek.is_missing_number(b.key)
+  match (a_missing, b_missing) {
+    (true, true) => a.id.lexical_compare(b.id)
+    (true, false) => 1
+    (false, true) => -1
+    (false, false) => {
+      let cmp = a.key.compare(b.key)
+      let directed = if forward { cmp } else { -cmp }
+      if directed == 0 {
+        a.id.lexical_compare(b.id)
+      } else {
+        directed
+      }
+    }
+  }
+}
+
+///|
 /// The merged answer a coordinator returns.
 pub(all) struct ClusterResult {
   /// Global top-k after merging the shards' candidates.
-  hits : Array[(String, Double)]
+  hits : Array[ShardHit]
   /// Sum of the shards' match counts.
   total : Int32
   shards_total : Int32
@@ -450,6 +621,7 @@ async fn cluster_search(
   limit : Int32,
   stats : @moonseek.ExternalStats?,
   filters : Array[(String, Array[String])],
+  sort : @moonseek.SortOrder,
 ) -> ClusterResult {
   let pool = if config.pool_per_shard < limit {
     limit
@@ -465,6 +637,10 @@ async fn cluster_search(
     pool.to_string() +
     ",\"filters\":" +
     filters_json(filters) +
+    ",\"sort\":" +
+    @json.to_json(sort_by_name(sort)).stringify() +
+    ",\"order\":" +
+    @json.to_json(sort_order_name(sort)).stringify() +
     stats_clause(stats) +
     "}"
   let answers : Array[(String?, String)] = Array::make(
@@ -484,7 +660,7 @@ async fn cluster_search(
       )
     }
   })
-  let hits : Array[(String, Double)] = []
+  let hits : Array[ShardHit] = []
   let failed : Array[String] = []
   let mut total = 0
   let mut ok = 0
@@ -504,15 +680,11 @@ async fn cluster_search(
       failed.push(address)
     }
   }
-  hits.sort_by(fn(a, b) {
-    let cmp = b.1.compare(a.1)
-    if cmp == 0 {
-      a.0.lexical_compare(b.0)
-    } else {
-      cmp
-    }
-  })
-  let top : Array[(String, Double)] = []
+  // Each shard returned its own top `pool` under this order, so merging and
+  // cutting to `limit` gives the global top `limit` — the same argument as the
+  // score order, applied to whatever order was asked for.
+  hits.sort_by(fn(a, b) { compare_shard_hits(sort, a, b) })
+  let top : Array[ShardHit] = []
   let cap = if limit <= 0 || hits.length() < limit {
     hits.length()
   } else {

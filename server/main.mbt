@@ -404,13 +404,16 @@ fn shard_handle(state : ServerState, request : String) -> String {
       // them straight back out. Leaving them installed would mis-score a later
       // local query, which is the kind of bug that only shows up under load.
       let filters = requested_filters(obj)
+      let sort = requested_sort(obj) catch {
+        e => return error_json("bad_request", e.to_string())
+      }
       match stats_from_request(obj) {
         Some(stats) => {
           state.index.set_external_stats(Some(stats))
           defer state.index.set_external_stats(None)
-          shard_search(state, query, limit, filters)
+          shard_search(state, query, limit, filters, sort)
         }
-        None => shard_search(state, query, limit, filters)
+        None => shard_search(state, query, limit, filters, sort)
       }
     }
     "stats" =>
@@ -521,6 +524,70 @@ fn local_ids(state : ServerState) -> Array[String] {
     }
   }
   ids
+}
+
+///|
+/// Order two hits under a requested sort.
+///
+/// The service uses this on a single node and a shard uses it to order its own
+/// candidate pool, so a cluster query and a single-node query produce the same
+/// order rather than merely the same set.
+fn compare_hits(
+  index : @moonseek.Index,
+  sort : @moonseek.SortOrder,
+  a : @moonseek.Hit,
+  b : @moonseek.Hit,
+) -> Int32 {
+  match sort {
+    ScoreDesc => {
+      let cmp = b.score.compare(a.score)
+      if cmp == 0 {
+        a.id.lexical_compare(b.id)
+      } else {
+        cmp
+      }
+    }
+    ScoreAsc => {
+      let cmp = a.score.compare(b.score)
+      if cmp == 0 {
+        a.id.lexical_compare(b.id)
+      } else {
+        cmp
+      }
+    }
+    IdAsc => a.id.lexical_compare(b.id)
+    IdDesc => b.id.lexical_compare(a.id)
+    NumAsc(field) =>
+      @moonseek.compare_numeric(index, field, a.id, b.id, forward=true)
+    NumDesc(field) =>
+      @moonseek.compare_numeric(index, field, a.id, b.id, forward=false)
+  }
+}
+
+///|
+/// The `[offset, offset + limit)` window of a hit list. `limit <= 0` means
+/// "everything from the offset", which is how the rest of the service reads a
+/// zero limit.
+fn hit_page(
+  hits : Array[@moonseek.Hit],
+  offset : Int32,
+  limit : Int32,
+) -> Array[@moonseek.Hit] {
+  let start = if offset < 0 || offset > hits.length() {
+    hits.length()
+  } else {
+    offset
+  }
+  let end = if limit <= 0 || start + limit > hits.length() {
+    hits.length()
+  } else {
+    start + limit
+  }
+  let out : Array[@moonseek.Hit] = []
+  for i in start..<end {
+    out.push(hits[i])
+  }
+  out
 }
 
 ///|
@@ -777,6 +844,24 @@ fn requested_filters(obj : Map[String, Json]) -> Array[(String, Array[String])] 
 }
 
 ///|
+/// The sort a shard request carries. Absent means score-descending, so an older
+/// coordinator that sends no sort still gets today's behaviour.
+fn requested_sort(obj : Map[String, Json]) -> @moonseek.SortOrder raise {
+  let by = match obj.get("sort") {
+    Some(String(s)) => s
+    _ => ""
+  }
+  let order = match obj.get("order") {
+    Some(String(s)) => s
+    _ => ""
+  }
+  match parse_sort(by, order) {
+    Some(sort) => sort
+    None => raise Failure::Failure("bad sort: " + by + " " + order)
+  }
+}
+
+///|
 /// Plain (field, values) pairs into the engine's filter type: values within one
 /// field are "either", different fields are "and".
 fn to_facet_filters(
@@ -797,14 +882,19 @@ fn shard_search(
   query : String,
   limit : Int32,
   filters : Array[(String, Array[String])],
+  sort : @moonseek.SortOrder,
 ) -> String {
   // `search_faceted` rather than `search`: the filters have to be applied here,
   // on the node that holds the documents — a coordinator that applied them
   // locally would be filtering an index it does not have. This call also
   // returns the filtered match count, where a separate `count` call would count
   // the unfiltered matches and report a total larger than the hits it returned.
+  // Ask for every match, order them here, then take the pool. Ordering before
+  // the cut is what makes the coordinator's merge correct: a shard that returned
+  // its score-top-pool while the query sorts by a field would hand the
+  // coordinator a pool that does not contain the global top.
   let options : @moonseek.SearchOptions = {
-    limit,
+    limit: 0,
     offset: 0,
     filters: to_facet_filters(filters),
     facet_fields: [],
@@ -812,10 +902,29 @@ fn shard_search(
   let result = state.index.search_faceted(query, options~) catch {
     e => return error_json("bad_request", e.to_string())
   }
+  let ordered = result.hits
+  ordered.sort_by(fn(a, b) { compare_hits(state.index, sort, a, b) })
   let items : Array[String] = []
-  for h in result.hits {
+  for h in hit_page(ordered, 0, limit) {
+    // The third element is the sort key, and only a numeric sort needs it: the
+    // coordinator cannot read a document's field, so without it a cross-shard
+    // numeric sort would compare ids while claiming to sort by the field.
+    let key = match sort {
+      NumAsc(field) | NumDesc(field) =>
+        match state.index.num_of(h.id, field) {
+          Some(v) => v.to_string()
+          None => "null"
+        }
+      _ => "null"
+    }
     items.push(
-      "[" + @json.to_json(h.id).stringify() + "," + h.score.to_string() + "]",
+      "[" +
+      @json.to_json(h.id).stringify() +
+      "," +
+      h.score.to_string() +
+      "," +
+      key +
+      "]",
     )
   }
   "{\"hits\":[" +
@@ -1328,7 +1437,7 @@ fn error_json(code : String, msg : String) -> String {
 fn health_json(state : ServerState) -> String {
   let fields : Map[String, Json] = Map([])
   fields["status"] = @json.to_json("ok")
-  fields["version"] = @json.to_json("0.8.0")
+  fields["version"] = @json.to_json("0.9.0")
   fields["uptime_ms"] = @json.to_json(
     (@env.now() - state.started_ms).to_int().to_double(),
   )
@@ -1582,6 +1691,8 @@ async fn do_search(
   let mut knn_field = ""
   let mut knn_k : Int32 = 100
   let mut fusion = @moonseek.Rrf
+  let mut sort_text = get_param(params, "sort")
+  let mut order_text = get_param(params, "order")
   // Query-string forms first; the body overrides where both are present.
   let facet_text = get_param(params, "facets")
   if !facet_text.is_empty() {
@@ -1694,6 +1805,26 @@ async fn do_search(
         }
         _ => ()
       }
+      // `sort` is either a string (`"score"`) or the documented object form
+      // (`{"by": "num:year", "order": "desc"}`).
+      match fields.get("sort") {
+        Some(String(by)) => sort_text = by
+        Some(Object(spec)) => {
+          match spec.get("by") {
+            Some(String(by)) => sort_text = by
+            _ => ()
+          }
+          match spec.get("order") {
+            Some(String(order)) => order_text = order
+            _ => ()
+          }
+        }
+        _ => ()
+      }
+      match fields.get("order") {
+        Some(String(order)) => order_text = order
+        _ => ()
+      }
       match fields.get("fusion") {
         Some(String(s)) =>
           fusion = if s == "weighted" {
@@ -1705,6 +1836,13 @@ async fn do_search(
       }
     }
     _ => ()
+  }
+  // An unrecognized sort is a 400, not a silent fall back to score order. The
+  // documentation promised this parameter, so accepting it and ignoring it
+  // would be the worst outcome of the three.
+  let sort = match parse_sort(sort_text, order_text) {
+    Some(sort) => sort
+    None => raise Failure::Failure("bad sort: " + sort_text + " " + order_text)
   }
   if limit > MAX_LIMIT {
     limit = MAX_LIMIT
@@ -1739,6 +1877,7 @@ async fn do_search(
       facet_fields,
       aggs,
       simple_filters(filters),
+      sort,
     )
   }
   if !knn_vector.is_empty() && !knn_field.is_empty() {
@@ -1756,25 +1895,49 @@ async fn do_search(
       state, fused, query, highlight_field, snippet_chars, started, fusion,
     )
   }
+  // A requested sort is applied over the whole match set and *then* paginated.
+  // Sorting only the current page would order ten score-ranked hits by the
+  // field, which is a different answer from the field-ordered page.
+  let sorting = !(sort is ScoreDesc)
   let options : @moonseek.SearchOptions = {
-    limit,
-    offset,
+    limit: if sorting {
+      0
+    } else {
+      limit
+    },
+    offset: if sorting {
+      0
+    } else {
+      offset
+    },
     filters,
     facet_fields,
   }
   let result = index.search_faceted(query, options~)
+  let page = if sorting {
+    let ordered = result.hits
+    ordered.sort_by(fn(a, b) { compare_hits(index, sort, a, b) })
+    hit_page(ordered, offset, limit)
+  } else {
+    result.hits
+  }
   let took = (@env.now() - started).to_double()
   let fields : Map[String, Json] = Map([])
   fields["query"] = @json.to_json(query)
   fields["total"] = @json.to_json(result.total)
   fields["took_ms"] = @json.to_json(took)
   let hits : Array[Json] = []
-  for hit in result.hits {
+  for hit in page {
     hits.push(
       hit_json(state, hit, query, highlight_field, snippet_chars, want_explain),
     )
   }
   fields["hits"] = Json::array(hits)
+  // Report the order that was actually applied, not the one that was asked for:
+  // a client that guessed the parameter name should be able to see that it took
+  // effect.
+  fields["sort"] = @json.to_json(sort_by_name(sort))
+  fields["order"] = @json.to_json(sort_order_name(sort))
   let facet_obj : Map[String, Json] = Map([])
   for (field, counts) in result.facets {
     let arr : Array[Json] = []
@@ -1835,6 +1998,7 @@ async fn render_cluster(
   facet_fields : Array[String],
   aggs : Array[@moonseek.AggSpec],
   filters : Array[(String, Array[String])],
+  sort : @moonseek.SortOrder,
 ) -> String {
   let config : ClusterConfig = {
     shards: state.cluster,
@@ -1869,7 +2033,7 @@ async fn render_cluster(
   } else {
     None
   }
-  let result = cluster_search(config, query, limit, stats, filters)
+  let result = cluster_search(config, query, limit, stats, filters, sort)
   let took = (@env.now() - started).to_double()
   let fields : Map[String, Json] = Map([])
   fields["query"] = @json.to_json(query)
@@ -1880,13 +2044,24 @@ async fn render_cluster(
     fields["dfs_note"] = @json.to_json(dfs_note)
   }
   let hits : Array[Json] = []
-  for (id, score) in result.hits {
+  for hit in result.hits {
     let entry : Map[String, Json] = Map([])
-    entry["id"] = @json.to_json(id)
-    entry["score"] = @json.to_json(score)
+    entry["id"] = @json.to_json(hit.id)
+    entry["score"] = @json.to_json(hit.score)
+    // The sort key is reported for a numeric sort, so a client can verify the
+    // order it got instead of trusting it.
+    match sort {
+      NumAsc(_) | NumDesc(_) =>
+        if !@moonseek.is_missing_number(hit.key) {
+          entry["sort_key"] = @json.to_json(hit.key)
+        }
+      _ => ()
+    }
     hits.push(Json::object(entry))
   }
   fields["hits"] = Json::array(hits)
+  fields["sort"] = @json.to_json(sort_by_name(sort))
+  fields["order"] = @json.to_json(sort_order_name(sort))
   // Facets and aggregations are computed over the whole corpus, not over the
   // coordinator's own empty index. A facet is an uncapped terms aggregation
   // over the filtered result set, so both go through the same fan-out and the

@@ -26,7 +26,7 @@ MoonBit's ecosystem has HTTP servers, crypto and database drivers — but no tan
 - **Fuzzy search**: Levenshtein / Damerau-Levenshtein edit distance with early-exit bounded DP; **BK-tree** for sub-linear lookup (13–1780× faster than linear scan on a 24k-term vocabulary)
 - **Did-you-mean**: frequency-weighted spelling correction (`suggest`)
 - **Faceted search**: exact-match facet fields, AND/OR filters, per-facet value counts, offset pagination (`search_faceted`)
-- **Ranking control**: configurable sort (`search_sorted`), cursor pagination (`search_after`), per-term BM25 breakdown (`explain`)
+- **Ranking control**: configurable sort — score, id, or a numeric field, in either direction, over HTTP as `sort=num:year&order=desc` and in the library as `search_sorted`; cursor pagination (`search_after`); per-term BM25 breakdown (`explain`). A cross-shard numeric sort is exact: the shards ship the key
 - **Server-side highlighting**: `highlight` / `snippet` with HTML escaping, CJK-aware codepoint spans, overlap merging, densest-window extraction
 - **Stored fields**: original texts kept in the index, retrievable via `get_document` / `get_field`, survive snapshots
 - **Segmented index**: immutable segments + tiered merge policy + cross-segment search with latest-version-wins (`SegmentedIndex`)

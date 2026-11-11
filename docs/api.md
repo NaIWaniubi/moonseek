@@ -131,6 +131,8 @@ plan built on part of the corpus says so.
 | `knn_k` | 100 | how many neighbours the vector index contributes |
 | `fusion` | `rrf` | `rrf` or `weighted` |
 | `alpha` | 0.5 | weight for BM25 in `weighted` fusion |
+| `sort` | `score` | `score`, `id`, or `num:<field>` (a numeric doc value) |
+| `order` | per `sort` | `asc` or `desc`; see below |
 
 Response:
 
@@ -205,7 +207,30 @@ string. Body:
 }
 ```
 
-`sort.by` is `score`, `id`, or `num:<field>` (a numeric doc value).
+`sort.by` is `score`, `id`, or `num:<field>` (a numeric doc value). The
+response echoes the order that was applied, as `"sort"` and `"order"`.
+
+**Defaults.** `order` defaults per `sort`: `score` and `num:` descend (a "top N"
+is nearly always the largest), `id` ascends (a listing is nearly always A to Z).
+Overriding it is always allowed.
+
+**An unrecognized sort is a `400`**, not a silent fall back to score order. The
+parameter is documented, so accepting it and ignoring it would be worse than
+refusing it.
+
+**Documents with no value for the field sort last in both directions.** A missing
+value is not a small number: treating it as zero would file every undated
+document between the oldest and the newest, which looks like data rather than a
+bug. For a numeric sort each hit also carries its `sort_key`, and a value-less
+hit omits it.
+
+**On a coordinator**, each shard returns its own top-`pool` *under the requested
+order*, so the merge yields the global top `limit`. The shards ship the numeric
+key, because a coordinator that merged on ids while claiming to sort by a field
+would return the same set in an order that merely looks plausible. A sort by
+`id` or by a numeric field is exact in the default (local statistics) mode,
+since it never reads a score; a `score` sort is exact only with `dfs=true`, for
+the reason [docs/cluster.md](cluster.md) measures.
 
 ## `POST /index`
 
