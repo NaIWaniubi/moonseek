@@ -719,6 +719,48 @@ pub fn Index::set_vector(
 }
 
 ///|
+/// Field names that carry at least one vector, sorted. The vector counterpart
+/// of `numeric_fields`, and what migration iterates so it cannot miss a field
+/// it did not know about.
+pub fn Index::vector_fields(self : Index) -> Array[String] {
+  let out : Array[String] = []
+  for (field, per_field) in self.vecs.iter() {
+    if per_field.length() > 0 {
+      out.push(field)
+    }
+  }
+  out.sort_by(fn(a, b) { a.lexical_compare(b) })
+  out
+}
+
+///|
+/// The vector attached to a document for a field, or None. The counterpart to
+/// `set_vector`.
+///
+/// It exists for migration. A rebalance that moved a document's text but not
+/// its vector would leave the destination answering text queries and silently
+/// missing vector ones — a search that returns fewer hits than before, with no
+/// error anywhere.
+pub fn Index::get_vector(
+  self : Index,
+  id : String,
+  field : String,
+) -> Array[Double]? {
+  let num = match self.doc_nums.get(id) {
+    Some(n) if !self.deleted.contains(n) => n
+    _ => return None
+  }
+  match self.vecs.get(field) {
+    Some(per_field) =>
+      match per_field.get(num) {
+        Some(vector) => Some(vector)
+        None => None
+      }
+    None => None
+  }
+}
+
+///|
 /// Vectors of a field over live documents, ascending by doc number.
 fn Index::live_vectors(
   self : Index,

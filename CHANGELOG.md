@@ -1,5 +1,80 @@
 # Changelog
 
+## 1.0.0 (2026-11-12)
+
+The distributed layer is finished in the sense that it can now be *operated*:
+a cluster grows without a reindex, a member that missed writes is brought back,
+and several coordinators can share the load. Every claim below is an end-to-end
+test with its own CI job, and the "what is not implemented" list in
+`docs/cluster.md` was rewritten around what is genuinely still missing rather
+than around what happened to be built.
+
+### Growing a cluster
+
+`POST /_rebalance?from=N` moves the documents the new ring assigns elsewhere.
+
+Measured on 3,000 documents (`tools/test-rebalance.sh`): the planner predicted
+**762 moves (25.4%)**, the executor moved **762**, and the four shards ended at
+**840/738/660/762** — *exactly* the distribution the plan had predicted, holding
+3,000 documents between them. Afterwards `/_plan?shards=4` reports **0 to move**
+and a second rebalance moves nothing: that pair is what makes a partial or
+repeated run safe instead of a way to lose or duplicate documents.
+
+Two decisions carry it:
+
+* **Write, acknowledge, then delete.** Each document is written to its new owner
+  and acknowledged by *every* member of that group before it is removed from its
+  source. A document in two places is recoverable by re-running; one deleted from
+  its source before its destination had it is gone. Anything not fully
+  acknowledged is counted in `deferred` and left alone.
+* **Migration uses the client's own wire format.** Documents are rebuilt from the
+  index into the same JSON `POST /index` accepts, vectors included. A rebalance
+  that moved a document's text but not its vector would leave the destination
+  answering text queries and silently missing vector ones — so `Index::get_vector`
+  and `Index::vector_fields` now exist, and the round trip is a property of the
+  format rather than of the migration code.
+
+### Repairing a member
+
+`POST /_repair` brings every member back in line with its group's primary, in
+**both** directions: a member missing a document gets it, and a member holding one
+the primary does not have loses it. Repairing one direction only would leave a
+replica reporting a different total from its primary — the state failover must not
+be in.
+
+Measured (`tools/test-repair.sh`): a replica is down while the cluster takes 3,000
+writes (honestly reported as `members_ok: 5, members: 6` with the dead address
+named, not as a success), comes back holding **0** against its primary's 1,007,
+then `/_repair` copies **exactly those 1,007** and all three groups agree. A
+document written directly to that replica is removed by the next repair, and
+killing the group's primary afterwards leaves the cluster's answer byte-identical.
+
+### Several coordinators
+
+Two coordinators started with the same `--shards` answer three queries identically
+and identically to a single node under `dfs=true`; killing one leaves the other
+serving. The coordinator owns no state, so this is what the design already
+implied — but it is now measured, and what is *not* solved (automatic agreement on
+the shard map) is stated rather than implied.
+
+### Added
+
+* Shard ops `export`, `has`, `delete_many`, and the `bulk` form that repair and
+  migration use.
+* Engine: `Index::get_vector`, `Index::vector_fields`.
+* Five unit tests pinning the planner and the executor to the same selection rule,
+  and to the ring arrays summing to the corpus. 325 tests.
+* Two CI jobs (`rebalance`, `repair`) and claim 7 in the cluster test.
+
+### Fixed
+
+* `member` is a **reserved keyword** in MoonBit, like `local` and `method`; the
+  repair code used it as a variable and a parameter name.
+* `tools/test-repair.sh` killed the primary through `pgrep`, which does not exist
+  in Git Bash — the failover step passed vacuously until it used the PID recorded
+  at startup.
+
+
 ## 0.9.0 (2026-11-12)
 
 `sort` was documented in `docs/api.md` from the first release and **never wired

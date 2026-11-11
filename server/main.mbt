@@ -375,6 +375,16 @@ fn shard_handle(state : ServerState, request : String) -> String {
       }
       index_bulk(state, body)
     }
+    "delete_many" => {
+      let mut deleted = 0
+      for id in requested_ids(obj) {
+        if state.index.delete(id) {
+          deleted = deleted + 1
+        }
+      }
+      state.deleted_docs += deleted.to_int64()
+      "{\"ok\":true,\"deleted\":" + deleted.to_string() + "}"
+    }
     "delete" => {
       let id = match obj.get("id") {
         Some(String(s)) => s
@@ -426,12 +436,134 @@ fn shard_handle(state : ServerState, request : String) -> String {
       // be summed, stats have to be recombined rather than averaged, and
       // percentiles need the raw values shipped.
       shard_aggregate(state, obj)
+    "export" => shard_export(state, obj)
+    "has" => shard_has(state, obj)
     "ids" =>
       // Every live document id this shard holds. The coordinator uses these to
       // plan a rebalance over the real keys rather than a synthetic sample.
       shard_ids(state)
     _ => "{\"error\":\"unknown op\"}"
   }
+}
+
+///|
+/// The `["id1","id2"]` list a migration or repair request carries.
+fn requested_ids(obj : Map[String, Json]) -> Array[String] {
+  let out : Array[String] = []
+  match obj.get("ids") {
+    Some(Array(items)) =>
+      for item in items {
+        if item is String(id) {
+          out.push(id)
+        }
+      }
+    _ => ()
+  }
+  out
+}
+
+///|
+/// One document as the JSON `POST /index` accepts, rebuilt from the index.
+///
+/// Migration and repair go through the very same wire format a client uses, so
+/// a moved document cannot be a special case with its own bugs: if the export
+/// is faithful enough to be re-ingested, then "the migrated cluster equals the
+/// original" is a property of the format rather than a claim about the
+/// migration code. The test does exactly that round trip.
+///
+/// Vectors are included. A rebalance that moved a document's text but not its
+/// vector would leave the destination answering text queries and silently
+/// missing vector ones.
+fn document_json(state : ServerState, id : String) -> String? {
+  let index = state.index
+  let doc = match index.get_document(id) {
+    Some(d) => d
+    None => return None
+  }
+  let fields : Map[String, Json] = Map([])
+  for (name, value) in doc.fields {
+    fields[name] = @json.to_json(value)
+  }
+  let out : Map[String, Json] = Map([])
+  out["id"] = @json.to_json(id)
+  out["fields"] = Json::object(fields)
+  let facets : Map[String, Json] = Map([])
+  for (name, values) in index.get_facets(id) {
+    let arr : Array[Json] = []
+    for v in values {
+      arr.push(@json.to_json(v))
+    }
+    facets[name] = Json::array(arr)
+  }
+  if facets.length() > 0 {
+    out["facets"] = Json::object(facets)
+  }
+  let nums : Map[String, Json] = Map([])
+  for name in index.numeric_fields() {
+    match index.num_of(id, name) {
+      Some(value) => nums[name] = @json.to_json(value)
+      None => ()
+    }
+  }
+  if nums.length() > 0 {
+    out["nums"] = Json::object(nums)
+  }
+  let vectors : Map[String, Json] = Map([])
+  for name in index.vector_fields() {
+    match index.get_vector(id, name) {
+      Some(vector) => {
+        let arr : Array[Json] = []
+        for v in vector {
+          arr.push(@json.to_json(v))
+        }
+        vectors[name] = Json::array(arr)
+      }
+      None => ()
+    }
+  }
+  if vectors.length() > 0 {
+    out["vector"] = Json::object(vectors)
+  }
+  Some(Json::object(out).stringify())
+}
+
+///|
+/// `{"op":"export","ids":[…]}` — documents in the shape `POST /index` takes.
+/// Ids this shard does not have come back under `missing` rather than being
+/// dropped, because a migration that silently loses a document is the failure
+/// the whole planner exists to prevent.
+fn shard_export(state : ServerState, obj : Map[String, Json]) -> String {
+  let docs : Array[String] = []
+  let missing : Array[String] = []
+  for id in requested_ids(obj) {
+    match document_json(state, id) {
+      Some(text) => docs.push(text)
+      None => missing.push(@json.to_json(id).stringify())
+    }
+  }
+  "{\"docs\":[" + docs.join(",") + "],\"missing\":[" + missing.join(",") + "]}"
+}
+
+///|
+/// `{"op":"has","ids":[…]}` — which of these ids this shard is missing.
+///
+/// This is what makes repair cheap. Asking a member for the ids it lacks
+/// costs one small request; asking it for its whole id list and diffing costs a
+/// request whose size grows with the corpus, which is the wrong shape for
+/// something that runs after every failure.
+fn shard_has(state : ServerState, obj : Map[String, Json]) -> String {
+  let ids = requested_ids(obj)
+  let missing : Array[String] = []
+  for id in ids {
+    if state.index.get_document(id) is None {
+      missing.push(@json.to_json(id).stringify())
+    }
+  }
+  "{\"missing\":[" +
+  missing.join(",") +
+  "],\"checked\":" +
+  ids.length().to_string() +
+  "}"
 }
 
 ///|
@@ -596,6 +728,36 @@ fn shard_mode_name(mode : ShardMode) -> String {
     Ring => "ring"
     Modulo => "modulo"
   }
+}
+
+///|
+/// What a migration or a repair did.
+///
+/// `ok` means nothing failed, not that something moved: a `_repair` on a healthy
+/// cluster correctly reports `ok: true` with everything at zero, and a rebalance
+/// whose plan needed no moves reports zero moved. A caller that wants to know
+/// whether work happened should read `moved`.
+fn move_report_json(
+  report : MoveReport,
+  op : String,
+  state : ServerState,
+) -> String {
+  let fields : Map[String, Json] = Map([])
+  fields["op"] = @json.to_json(op)
+  fields["ok"] = @json.to_json(report.failed.length() == 0)
+  fields["moved"] = @json.to_json(report.moved)
+  fields["replicated"] = @json.to_json(report.replicated)
+  fields["deferred"] = @json.to_json(report.deferred)
+  fields["missing_at_source"] = @json.to_json(report.missing_at_source)
+  fields["shards"] = @json.to_json(state.cluster.length())
+  if report.failed.length() > 0 {
+    let arr : Array[Json] = []
+    for address in report.failed {
+      arr.push(@json.to_json(address))
+    }
+    fields["failed_addresses"] = Json::array(arr)
+  }
+  Json::object(fields).stringify()
 }
 
 ///|
@@ -1178,6 +1340,79 @@ async fn handle(
       respond_json(conn, 200, "OK", Json::object(fields).stringify())
       return ()
     }
+    "/_rebalance" =>
+      // Move the documents the new ring assigns elsewhere. `from` is the shard
+      // count the data is currently placed by: the operator adds the group to
+      // --shards and restarts the coordinator first, so the process cannot infer
+      // it. Without that parameter the coordinator would happily compute a plan
+      // that says nothing needs to move.
+      if http_method is Post {
+        if state.cluster.is_empty() {
+          return respond_json(
+            conn,
+            400,
+            "Bad Request",
+            error_json("bad_request", "not a coordinator"),
+          )
+        }
+        let from_shards = int_param(params, "from", 0)
+        if from_shards <= 0 || from_shards > 4096 {
+          return respond_json(
+            conn,
+            400,
+            "Bad Request",
+            error_json(
+              "bad_request", "?from=N is required: the shard count the data is placed by",
+            ),
+          )
+        }
+        if from_shards == state.cluster.length() {
+          return respond_json(
+            conn,
+            400,
+            "Bad Request",
+            error_json(
+              "bad_request", "from equals the current shard count, so nothing can move",
+            ),
+          )
+        }
+        let config : ClusterConfig = {
+          shards: state.cluster,
+          pool_per_shard: state.pool_per_shard,
+          timeout_ms: 15000,
+        }
+        let ids_by_shard = cluster_ids_by_shard(config)
+        let report = cluster_rebalance(config, ids_by_shard, from_shards)
+        respond_json(
+          conn,
+          200,
+          "OK",
+          move_report_json(report, "rebalance", state),
+        )
+        return ()
+      }
+    "/_repair" =>
+      // Anti-entropy: bring every member of every group back in line with its
+      // primary. Run it after a member comes back, and after any window in which
+      // a write may have been acknowledged by only some members.
+      if http_method is Post {
+        if state.cluster.is_empty() {
+          return respond_json(
+            conn,
+            400,
+            "Bad Request",
+            error_json("bad_request", "not a coordinator"),
+          )
+        }
+        let config : ClusterConfig = {
+          shards: state.cluster,
+          pool_per_shard: state.pool_per_shard,
+          timeout_ms: 15000,
+        }
+        let report = cluster_repair(config)
+        respond_json(conn, 200, "OK", move_report_json(report, "repair", state))
+        return ()
+      }
     "/_dfs" => {
       // Diagnostics for the two-phase path: what the coordinator gathered.
       if state.cluster.is_empty() {
@@ -1437,7 +1672,7 @@ fn error_json(code : String, msg : String) -> String {
 fn health_json(state : ServerState) -> String {
   let fields : Map[String, Json] = Map([])
   fields["status"] = @json.to_json("ok")
-  fields["version"] = @json.to_json("0.9.0")
+  fields["version"] = @json.to_json("1.0.0")
   fields["uptime_ms"] = @json.to_json(
     (@env.now() - state.started_ms).to_int().to_double(),
   )

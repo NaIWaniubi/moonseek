@@ -148,6 +148,9 @@ header, one JSON reply, then close.
 | `search` | `{"op":"search","query":…,"limit":N,"filters":[…],"sort":…,"order":…[,"stats":{…}]}` | `{"hits":[["id",score,key],…],"docs":N,"total":M}` |
 | `stats` | `{"op":"stats","terms":[["term","field"],…]}` | per-term `df`, per-field length sums and counts |
 | `agg` | `{"op":"agg","query":…,"specs":[…],"filters":[…],"values":[…]}` | per-shard aggregation results, plus raw values |
+| `export` | `{"op":"export","ids":[…]}` | those documents in the shape `POST /index` accepts, and the ids the shard did not have |
+| `has` | `{"op":"has","ids":[…]}` | which of those ids the shard is missing |
+| `delete_many` | `{"op":"delete_many","ids":[…]}` | how many were deleted |
 
 Two framing details are load-bearing:
 
@@ -282,6 +285,73 @@ where a single node returned 1190 — and ranked documents the filter excluded. 
 filters now travel with the search request and the shard applies them through
 `search_faceted`, which also returns the filtered match count.
 
+## Growing the cluster
+
+`GET /_plan?shards=N` says what a grow-out would cost; `POST /_rebalance?from=N`
+does it. The operator starts the new shard, adds it to `--shards`, restarts the
+coordinator — which is why `from` has to be passed rather than inferred, since a
+coordinator that has just been told about four groups cannot know the data is
+still placed by three — and then calls the endpoint.
+
+Measured on 3,000 documents (`tools/test-rebalance.sh`, its own CI job):
+
+```
+plan:     {"ids":3000,"from_shards":3,"to_shards":4,
+           "ring":{"moved":762,"moved_pct":25.4,"after":[840,738,660,762]}}
+rebalance:{"ok":true,"moved":762,"deferred":0,"missing_at_source":0}
+shards:   840 / 738 / 660 / 762 documents — exactly the predicted distribution
+```
+
+The plan predicted 762 moves and the executor made 762; the four shards then hold
+3,000 documents between them, which is the whole corpus exactly once. Afterwards
+`/_plan?shards=4` reports **0 documents to move**, and a second rebalance moves
+nothing: that pair is what makes a partial or repeated run safe rather than a way
+to lose or duplicate documents.
+
+**The order of operations is the guarantee.** Each moved document is written to
+its new owner and acknowledged by *every* member of that group before it is
+removed from its source. A document that exists twice is recoverable by
+re-running; a document deleted from its source before its destination had it is
+gone. Ids whose destination did not fully acknowledge are counted in `deferred`
+and deliberately left alone.
+
+Migration goes through the same JSON `POST /index` accepts, rebuilt from the
+index including vectors (`Index::get_vector` and `Index::vector_fields` exist for
+this). A rebalance that moved a document's text but not its vector would leave
+the destination answering text queries and silently missing vector ones.
+
+## Repairing a member
+
+`POST /_repair` brings every member back in line with its group's **primary**,
+which is authoritative: a member missing a document gets it, and a member holding
+a document the primary does not have loses it. Repairing only one direction would
+leave a replica that reports a different total from its primary — the state
+failover must not be in.
+
+Measured (`tools/test-repair.sh`, its own CI job): a replica is down while the
+cluster takes 3,000 writes. The write is honestly reported as
+`members_ok: 5, members: 6` with the dead address named, rather than as a
+success. The replica comes back empty (0 documents against its primary's 1,007),
+`POST /_repair` copies exactly those 1,007, and all three groups then agree. A
+document written *directly* to that replica is removed by the next repair, and
+killing the group's primary afterwards leaves the cluster's answer byte-identical
+— which is the point of the whole exercise.
+
+Unless you run one, nothing repairs anything: a member that missed a write stays
+behind. That is stated in the not-implemented list below.
+
+## Several coordinators
+
+The coordinator owns no state, so running several behind a load balancer is what
+the design already implies. Measured (`tools/test-cluster.sh`, claim 7): two
+coordinators started with the same `--shards` answer three queries identically
+(and identically to a single node under `dfs=true`), and killing one leaves the
+other serving.
+
+What is *not* solved is automatic agreement on the shard map: the two are started
+with the same list rather than converging on one. Changing the map means
+restarting both, which is the honest description of where this stands.
+
 ## Sorting across shards
 
 `GET /search` takes `sort=score|id|num:<field>` with `order=asc|desc`
@@ -331,21 +401,27 @@ the *coordinator* down along with the shard. Scatter-gather spawns with
 
 ## What is not implemented
 
-1. **No rebalancing executor.** `GET /_plan` reports exactly what would move if the
-   shard count changed, and which documents; moving them is left to an operator.
-   There is no background transfer and no way to serve a query across a
-   half-migrated ring.
-2. **No coordinator failover.** One coordinator is a single point of failure.
-   Running two would need leader election, which is not here.
-3. **Writes are replicated but not transactional.** A write that reaches one
-   member of three is reported as not-ok, but there is no rollback and no repair:
-   the members that missed it stay behind until written again. Replica recovery is
-   a re-index, not a log.
-4. **No write-ahead log on the coordinator.** A coordinator restart loses nothing
-   important (it holds no state), but an in-flight bulk load whose shard dies
-   mid-batch is reported, not retried.
-5. **`knn`/hybrid retrieval is not fanned out.** Fusing two rankings that live on
+1. **Nothing repairs itself.** `POST /_repair` fixes a member, but no background
+   process decides when to run it, and a member that misses a write stays behind
+   until an operator notices. There is no compensation log and no automatic
+   verification pass.
+2. **No coordinator election.** Several coordinators can run behind a load
+   balancer with the same shard map, and are interchangeable once started, but
+   they do not agree on that map themselves. Changing it means restarting them.
+3. **Writes are replicated but not transactional.** A write to part of a group is
+   reported as not-ok rather than rolled back, and the members that missed it are
+   not retried automatically (see 1).
+4. **No write-ahead log on the coordinator.** It holds no state, so a restart
+   loses nothing important — but an in-flight bulk load whose shard dies mid-batch
+   is reported, not resumed.
+5. **A rebalance is a foreground operation.** `/_rebalance` moves documents while
+   the client waits, and the cluster answers throughout (searches fan out, so a
+   document in two places during the move is returned by whichever shard is
+   asked) but the request holds the coordinator for its duration. There is no
+   background transfer and no resume.
+6. **`knn`/hybrid retrieval is not fanned out.** Fusing two rankings that live on
    different shards needs per-shard vectors and a second merge, which is a
    different design.
-6. **Sorting is by score, id, or one numeric field.** There is no multi-key
-   sort, no sort by a facet value, and no per-shard `sort` override.
+7. **A rebalance is not verified against a checksum**, only by counts and by the
+   plan converging to zero. A corrupted document would move intact and stay
+   corrupted.

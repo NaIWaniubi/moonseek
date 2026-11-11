@@ -38,6 +38,13 @@ pids+=($!)
 "$BIN" --addr 127.0.0.1:7805 --schema "$SCH" --pool 200 \
   --shards "127.0.0.1:7901,127.0.0.1:7902,127.0.0.1:7903" > "$LOG/coord.log" 2>&1 &
 pids+=($!)
+# A second coordinator with the same shard map. The coordinator holds no state,
+# so two of them are interchangeable; what they need is the same map, which is
+# passed in rather than agreed automatically.
+"$BIN" --addr 127.0.0.1:7806 --schema "$SCH" --pool 200 \
+  --shards "127.0.0.1:7901,127.0.0.1:7902,127.0.0.1:7903" > "$LOG/coord2.log" 2>&1 &
+coord2_pid=$!
+pids+=($coord2_pid)
 
 # Wait for readiness rather than sleeping a fixed amount.
 ready=0
@@ -236,6 +243,50 @@ else
   echo "FAIL: unknown sort returned $code, expected 400"
   exit 1
 fi
+
+# ---- claim 7: two coordinators are interchangeable -------------------------
+echo "== claim 7: a second coordinator answers identically, and survives the first =="
+for _ in $(seq 1 40); do
+  curl -sf -m 2 http://127.0.0.1:7806/_stats > /dev/null 2>&1 && break
+  sleep 0.5
+done
+python3 - <<'PY' || exit 1
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+QUERIES = ["parser", "socket cache", "scheduler OR allocator"]
+
+
+def ids(port, query):
+    url = ("http://127.0.0.1:%d/search?q=%s&limit=10&dfs=true"
+           % (port, urllib.parse.quote(query)))
+    with urllib.request.urlopen(url, timeout=30) as response:
+        body = json.load(response)
+    return body["total"], [h["id"] for h in body["hits"]]
+
+
+for query in QUERIES:
+    a = ids(7805, query)
+    b = ids(7806, query)
+    if a != b:
+        print("FAIL: %s: coordinator 7805 %s, 7806 %s" % (query, a, b))
+        sys.exit(1)
+    print("  ok: %-24s both coordinators agree (%d hits, total %d)"
+          % (query, len(a[1]), a[0]))
+print("TWO COORDINATORS ARE INTERCHANGEABLE")
+PY
+
+kill -9 "$coord2_pid" 2>/dev/null || true
+sleep 1
+still=$(curl -s -m 20 "http://127.0.0.1:7805/search?q=parser&limit=5&dfs=true" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["total"])' 2>/dev/null)
+if [ -z "$still" ]; then
+  echo "FAIL: the surviving coordinator stopped answering after its peer died"
+  exit 1
+fi
+echo "ok: the peer died and the survivor still answers (total $still)"
 
 # ---- claim 2: killing a shard yields a partial answer with accounting ------
 echo "== claim 2: shard failure is reported, not hidden =="

@@ -35,7 +35,7 @@ MoonBit's ecosystem has HTTP servers, crypto and database drivers — but no tan
 - **Portable**: pure MoonBit core (no FFI in the engine); native file store via `moonbitlang/async`; browser export via WasmGC + js-string builtins. **One snapshot format, two backends**: an index built by the native binary loads byte-for-byte into the browser's wasm-gc build
 - **Measured quality, not just latency**: NDCG@10 / MRR@10 / Recall@20 over 3,698 real packages with a 6-way ablation ([docs/quality.md](docs/quality.md))
 - **HTTP service**: a REST search API (`docs/api.md`) with bulk ingest, facets, aggregations, highlighting, `explain`, suggest and vector queries. The console in `console/` drives it
-- **Distributed cluster**: one binary is a node, a shard or a coordinator. **Consistent hashing** (a fourth shard moves 24% of the corpus, not 75%), write routing with **replication to every group member**, **cross-shard facets and aggregations that equal a single node**, **globally consistent scoring** (`?dfs=true` reproduced a single node's ranking exactly, 8/8 queries, zero score difference), replica failover, and partial answers that name the shards that failed ([docs/cluster.md](docs/cluster.md))
+- **Distributed cluster**: one binary is a node, a shard or a coordinator. **Consistent hashing** (a fourth shard moves 24% of the corpus, not 75%), **write routing with replication to every group member**, **cross-shard facets, aggregations and sorts that equal a single node**, **globally consistent scoring** (`?dfs=true` reproduced a single node's ranking exactly, 8/8 queries, zero score difference), **`POST /_rebalance` to grow without a reindex** (the plan predicted 762 moves and the executor made 762, ending at exactly the predicted distribution), **`POST /_repair` to bring a member that missed writes back in line**, replica failover, and partial answers that name the shards that failed ([docs/cluster.md](docs/cluster.md))
 - **Vector search**: pure-MoonBit HNSW with **measured recall** against brute force (0.996@ef=32, 0.999@ef=64 on 1,000 random 32-d points), plus hybrid BM25 × kNN fusion by reciprocal rank
 - **Numeric aggregations**: terms, stats, histogram and percentiles over a result set, with numeric doc values alongside facets
 - **Document lifecycle**: add, replace (same id), delete
@@ -79,6 +79,19 @@ done
 ./server.exe --addr 127.0.0.1:7805 --shards "127.0.0.1:7901,127.0.0.1:7902,127.0.0.1:7903"
 # ?dfs=true makes the ranking identical to a single node holding the whole corpus
 curl "localhost:7805/search?q=parser&dfs=true"
+```
+
+Four end-to-end scripts run in CI: `tools/test-cluster.sh` (dfs ranking, placement
+agreement, the ring's reshuffle, distributed aggregations, sorted queries,
+failover, two coordinators), `tools/test-replication.sh` (a replicated write
+survives the loss of its primary), `tools/test-rebalance.sh` (grow 3 shards to 4
+without reindexing), and `tools/test-repair.sh` (a member that missed writes is
+brought back). To grow a running cluster:
+
+```bash
+./server.exe --addr 127.0.0.1:7805 --shards "…:7920,…:7921,…:7922,…:7923"   # after adding the new shard
+curl -X POST "localhost:7805/_rebalance?from=3"
+curl -X POST "localhost:7805/_repair"      # after a member comes back
 ```
 
 `tools/check-cluster.mjs` runs the cluster-vs-single-node comparison and prints

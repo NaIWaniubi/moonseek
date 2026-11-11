@@ -115,6 +115,58 @@ gathered from the shards rather than from a sample.
 answer, its ids are missing and the shard is named in `failed_addresses`, so a
 plan built on part of the corpus says so.
 
+## `POST /_rebalance?from=N`
+
+**Coordinator only.** Move every document the ring's new owner assigns elsewhere,
+so the cluster can grow without a reindex.
+
+`from` is the shard count the data is currently placed by. The operator adds the
+new group to `--shards` and restarts the coordinator first, so the process cannot
+infer it from its own configuration — which is why the parameter is required and
+why a request without it is a `400`.
+
+```json
+{ "op": "rebalance", "ok": true, "moved": 762, "replicated": 6,
+  "deferred": 0, "missing_at_source": 0, "shards": 4 }
+```
+
+| field | meaning |
+|---|---|
+| `moved` | documents written to their new owner |
+| `replicated` | member-level writes and deletes that were acknowledged |
+| `deferred` | ids whose destination did not fully acknowledge, so they were **left in place** |
+| `missing_at_source` | ids a source shard no longer had; a healthy cluster reports `0` |
+| `ok` | nothing failed. `ok` is not "something moved" — a rebalance that needed no moves reports `ok: true` with `moved: 0` |
+
+**The order of operations is the guarantee**: write to the destination, wait for
+every member of that group to acknowledge, and only then remove from the source.
+A document that exists twice is recoverable by re-running; a document deleted
+from its source before its destination had it is gone. Anything not fully
+acknowledged is counted in `deferred` and left alone.
+
+Documents come across in the same JSON `POST /index` accepts, vectors included,
+so a moved document is not a special case with its own bugs. Re-running a
+completed rebalance is a no-op.
+
+## `POST /_repair`
+
+**Coordinator only.** Anti-entropy: bring every member of every group back in line
+with its group's **primary**, which is authoritative. Run it after a member comes
+back, and after any window in which a write may have been acknowledged by only
+some members.
+
+```json
+{ "op": "repair", "ok": true, "moved": 1007, "replicated": 1,
+  "deferred": 0, "missing_at_source": 0, "shards": 3 }
+```
+
+For a repair, `moved` counts documents copied to a member that lacked them and
+`deferred` counts documents *removed* from a member its primary did not have.
+Both directions matter: a replica that answers with extra documents reports a
+different total from its primary, which is exactly the state failover must not be
+in. Only the primary's ids travel as a `has` query, so the request size is bounded
+by that group's share of the corpus rather than the whole one.
+
 ## `GET /search`
 
 | param | default | meaning |

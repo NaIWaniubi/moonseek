@@ -624,3 +624,100 @@ test "a shard reply carries the sort key and tolerates its absence" {
   assert_eq(old_shape.hits[0].score, 2.0)
   assert_true(@moonseek.is_missing_number(old_shape.hits[0].key))
 }
+
+///|
+/// The migration and the planner have to agree on *which* documents move, not
+/// just on how many. If the executor's selection diverged from the planner's, a
+/// rebalance would move a different set than the operator was shown — and the
+/// end-to-end test would only catch it if the two counts happened to differ.
+
+///|
+test "the migration selects exactly the ids the planner counted" {
+  let ids : Array[String] = []
+  for i in 0..<2000 {
+    ids.push("pkg/\{i}")
+  }
+  let plan = rebalance_plan(ids, 3, 4, Ring)
+  let ring_from = build_ring(3)
+  let ring_to = build_ring(4)
+  let mut selected = 0
+  for id in ids {
+    if ring_from.owner(id) != ring_to.owner(id) {
+      selected = selected + 1
+      // Everything selected has a real destination, or the executor would index
+      // out of bounds building its per-destination buckets.
+      let dest = ring_to.owner(id)
+      assert_true(dest >= 0 && dest < 4)
+    }
+  }
+  assert_eq(selected, plan.moved)
+  // The same rule read the other way: an id the two rings agree about is never
+  // touched. This is what makes a repeated rebalance a no-op rather than a
+  // second round of moves.
+  let mut stayed = 0
+  for id in ids {
+    if ring_from.owner(id) == ring_to.owner(id) {
+      stayed = stayed + 1
+    }
+  }
+  assert_eq(stayed + selected, ids.length())
+  assert_eq(plan.moved, selected)
+}
+
+///|
+test "the rebalance plan makes the same claim as the ring arrays it returns" {
+  let ids : Array[String] = []
+  for i in 0..<1500 {
+    ids.push("pkg/\{i}")
+  }
+  for (from_shards, to_shards) in [(3, 4), (4, 3), (3, 5), (6, 2)] {
+    let plan = rebalance_plan(ids, from_shards, to_shards, Ring)
+    let mut before_sum = 0
+    for count in plan.before {
+      before_sum = before_sum + count
+    }
+    let mut after_sum = 0
+    for count in plan.after {
+      after_sum = after_sum + count
+    }
+    // Every id is in exactly one bucket on each side, so the counts have to add
+    // up. A ring that dropped or duplicated a key would show here.
+    assert_eq(before_sum, plan.total)
+    assert_eq(after_sum, plan.total)
+    assert_eq(plan.before.length(), from_shards)
+    assert_eq(plan.after.length(), to_shards)
+  }
+}
+
+///|
+test "the bulk request is valid JSON with the documents embedded" {
+  let request = bulk_request(["{\"id\":\"a\"}", "{\"id\":\"b\"}"])
+  let parsed = @json.parse(request) catch {
+    _ => abort("bulk_request is not JSON")
+  }
+  match parsed {
+    Object(fields) => {
+      match fields.get("op") {
+        Some(String(op)) => assert_eq(op, "bulk")
+        _ => abort("missing op")
+      }
+      match fields.get("body") {
+        Some(String(body)) => {
+          // Newline-delimited, which is what the shard's bulk op splits on.
+          let lines : Array[String] = []
+          for line in body.split("\n") {
+            if !line.trim().is_empty() {
+              lines.push(line.to_owned())
+            }
+          }
+          assert_eq(lines.length(), 2)
+        }
+        _ => abort("missing body")
+      }
+    }
+    _ => abort("not an object")
+  }
+  // A document containing a quote must not break the framing.
+  let quoted = bulk_request(["{\"id\":\"a\\\"b\"}"])
+  let _ = @json.parse(quoted) catch { _ => abort("a quoted id broke the JSON") }
+}

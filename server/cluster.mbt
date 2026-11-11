@@ -383,6 +383,20 @@ pub extend ShardHit with Eq::{equal, not_equal}
 pub extend ShardHit with @debug.Debug::{to_repr}
 
 ///|
+/// One request to one address, reply text only. A thin wrapper so the repair and
+/// migration helpers read as synchronous steps: they are called from `async`
+/// functions, and `shard_call` already awaits internally.
+async fn shard_call_text(addr : String, request : String) -> String? {
+  shard_call(addr, request)
+}
+
+///|
+/// The request that asks a shard for its live ids. One constant, because a typo
+/// in an inline JSON literal in two places is a bug that only shows up as an
+/// empty id list.
+const IDS_REQUEST : String = "{\"op\":\"ids\"}"
+
+///|
 /// One shard's answer to a search.
 struct ShardHits {
   /// Candidates, already in the order the shard was asked for.
@@ -923,6 +937,388 @@ pub fn doc_id_of(body : String) -> String? {
       }
     _ => None
   }
+}
+
+///|
+/// Ask every shard group for its own live document ids, keeping the grouping.
+///
+/// `cluster_all_ids` flattens the ids because the planner only counts them. A
+/// migration needs to know *which shard holds each one*, because a move is from
+/// a concrete source to a concrete destination.
+async fn cluster_ids_by_shard(config : ClusterConfig) -> Array[Array[String]] {
+  let answers : Array[(String?, String)] = Array::make(
+    config.shards.length(),
+    (None, ""),
+  )
+  @async.with_task_group(fn(tasks) {
+    for i in 0..<config.shards.length() {
+      let index = i
+      let _ = tasks.spawn(
+        async fn() {
+          answers[index] = call_group(config.shards[index], IDS_REQUEST)
+        },
+        allow_failure=true,
+      )
+    }
+  })
+  let out : Array[Array[String]] = []
+  for i in 0..<config.shards.length() {
+    let ids : Array[String] = []
+    match answers[i].0 {
+      Some(text) =>
+        match parse_json_or_none(text) {
+          Some(Object(fields)) =>
+            match fields.get("ids") {
+              Some(Array(items)) =>
+                for item in items {
+                  if item is String(id) {
+                    ids.push(id)
+                  }
+                }
+              _ => ()
+            }
+          _ => ()
+        }
+      None => ()
+    }
+    out.push(ids)
+  }
+  out
+}
+
+///|
+/// Documents from one group, in the shape `POST /index` accepts, plus the ids
+/// the group did not have.
+///
+/// Chunked because the ids travel in the request: one request per corpus would
+/// build a string as large as the index in memory before sending anything.
+async fn export_from(
+  group : ShardGroup,
+  ids : Array[String],
+  chunk~ : Int32 = 500,
+) -> (Array[String], Array[String]) {
+  let docs : Array[String] = []
+  let missing : Array[String] = []
+  let mut start = 0
+  while start < ids.length() {
+    let stop = if start + chunk > ids.length() {
+      ids.length()
+    } else {
+      start + chunk
+    }
+    let items : Array[String] = []
+    for i in start..<stop {
+      items.push(@json.to_json(ids[i]).stringify())
+    }
+    let request = "{\"op\":\"export\",\"ids\":[" + items.join(",") + "]}"
+    let (answer, _) = call_group(group, request)
+    match answer {
+      Some(text) =>
+        match parse_json_or_none(text) {
+          Some(Object(fields)) => {
+            match fields.get("docs") {
+              Some(Array(list)) =>
+                for item in list {
+                  docs.push(item.stringify())
+                }
+              _ => ()
+            }
+            match fields.get("missing") {
+              Some(Array(list)) =>
+                for item in list {
+                  if item is String(id) {
+                    missing.push(id)
+                  }
+                }
+              _ => ()
+            }
+          }
+          _ => ()
+        }
+      None => ()
+    }
+    start = stop
+  }
+  (docs, missing)
+}
+
+///|
+/// What a rebalance or a repair did.
+pub(all) struct MoveReport {
+  /// Documents written to their new owner.
+  moved : Int32
+  /// Member-level writes and deletes that were acknowledged.
+  replicated : Int32
+  /// Ids whose destination did not fully acknowledge, so they were deliberately
+  /// left in place: a document in two places is recoverable, one in none is not.
+  deferred : Int32
+  /// Ids a source shard no longer had, which a healthy cluster cannot produce.
+  missing_at_source : Int32
+  /// Members that did not answer.
+  failed : Array[String]
+} derive(Eq, Debug)
+
+///|
+pub extend MoveReport with Eq::{equal, not_equal}
+
+///|
+pub extend MoveReport with @debug.Debug::{to_repr}
+
+///|
+/// Move every document the new ring assigns elsewhere.
+///
+/// `from_shards` is the ring the data is currently placed by. The operator adds
+/// the new group to `--shards` and restarts the coordinator first, so the
+/// process cannot infer it from its own configuration: everything else follows
+/// from the two rings.
+///
+/// The order of operations is the point. **Write to the destination, wait for
+/// every member to acknowledge, and only then remove from the source.** A
+/// document that exists twice is recoverable by re-running; a document deleted
+/// from its source before its destination had it is gone. Ids whose destination
+/// did not fully acknowledge are counted in `deferred` and left alone.
+async fn cluster_rebalance(
+  config : ClusterConfig,
+  ids_by_shard : Array[Array[String]],
+  from_shards : Int32,
+) -> MoveReport {
+  let to_shards = config.shards.length()
+  let ring_from = build_ring(from_shards)
+  let ring_to = build_ring(to_shards)
+  let mut moved = 0
+  let mut replicated = 0
+  let mut deferred = 0
+  let mut missing_at_source = 0
+  let failed : Array[String] = []
+  for source in 0..<ids_by_shard.length() {
+    let leaving : Array[String] = []
+    for id in ids_by_shard[source] {
+      if ring_from.owner(id) != ring_to.owner(id) {
+        leaving.push(id)
+      }
+    }
+    if leaving.length() == 0 {
+      continue
+    }
+    let (docs, missing) = export_from(config.shards[source], leaving)
+    missing_at_source = missing_at_source + missing.length()
+    // Bucket the exported documents by where they are going.
+    let by_dest : Array[Array[String]] = []
+    for _ in 0..<to_shards {
+      by_dest.push([])
+    }
+    for doc in docs {
+      match doc_id_of(doc) {
+        Some(id) => {
+          let dest = ring_to.owner(id)
+          if dest >= 0 && dest < by_dest.length() {
+            by_dest[dest].push(doc)
+          }
+        }
+        None => ()
+      }
+    }
+    for dest in 0..<to_shards {
+      if dest == source || by_dest[dest].length() == 0 {
+        continue
+      }
+      let ids_here : Array[String] = []
+      for doc in by_dest[dest] {
+        match doc_id_of(doc) {
+          Some(id) => ids_here.push(id)
+          None => ()
+        }
+      }
+      let ack = write_group(config.shards[dest], bulk_request(by_dest[dest]))
+      replicated = replicated + ack.acked
+      if ack.failed.length() > 0 {
+        // Not fully replicated: leave the source copy alone.
+        deferred = deferred + ids_here.length()
+        for address in ack.failed {
+          failed.push(address)
+        }
+        continue
+      }
+      let removed = delete_group(config.shards[source], ids_here)
+      replicated = replicated + removed.acked
+      for address in removed.failed {
+        failed.push(address)
+      }
+      moved = moved + ids_here.length()
+    }
+  }
+  { moved, replicated, deferred, missing_at_source, failed, }
+}
+
+///|
+/// `{"op":"bulk","body":<ndjson>}`, the request that writes many documents to
+/// one group.
+fn bulk_request(bodies : Array[String]) -> String {
+  "{\"op\":\"bulk\",\"body\":" +
+  @json.to_json(bodies.join("\n")).stringify() +
+  "}"
+}
+
+///|
+/// Delete a list of ids from every member of a group.
+async fn delete_group(group : ShardGroup, ids : Array[String]) -> WriteAck {
+  if ids.length() == 0 {
+    return { acked: 0, members: 0, failed: [], reply: "", }
+  }
+  let items : Array[String] = []
+  for id in ids {
+    items.push(@json.to_json(id).stringify())
+  }
+  write_group(
+    group,
+    "{\"op\":\"delete_many\",\"ids\":[" + items.join(",") + "]}",
+  )
+}
+
+///|
+/// Bring every member of every group back in line with its primary.
+///
+/// The primary is authoritative: a member missing a document gets it, and a
+/// member holding a document the primary does not have loses it. Repairing only
+/// one direction would leave a replica that answers every query with a different
+/// total, which is exactly the state the failover path must not be in.
+///
+/// Only the primary's ids are sent as a `has` query, so the request size is
+/// bounded by the group's own share of the corpus rather than the whole one.
+async fn cluster_repair(config : ClusterConfig) -> MoveReport {
+  let mut repaired = 0
+  let mut replicated = 0
+  let mut removed = 0
+  let failed : Array[String] = []
+  for group in config.shards {
+    let members = group_members(group)
+    if members.length() < 2 {
+      continue
+    }
+    let primary_ids = group_ids(group.primary)
+    if primary_ids.is_empty() {
+      continue
+    }
+    let authoritative : Map[String, Unit] = Map([])
+    for id in primary_ids {
+      authoritative.set(id, ())
+    }
+    for i in 1..<members.length() {
+      let replica = members[i]
+      // What the member lacks...
+      let missing = replica_missing(replica, primary_ids)
+      if missing.length() > 0 {
+        let (docs, _) = export_from(
+          { primary: group.primary, replicas: [], },
+          missing,
+        )
+        if docs.length() > 0 {
+          let ack = write_group(
+            { primary: replica, replicas: [], },
+            bulk_request(docs),
+          )
+          if ack.failed.length() > 0 {
+            for address in ack.failed {
+              failed.push(address)
+            }
+          } else {
+            repaired = repaired + docs.length()
+            replicated = replicated + ack.acked
+          }
+        }
+      }
+      // ...and what it holds that the primary does not.
+      let extra : Array[String] = []
+      let replica_ids = group_ids(replica)
+      for id in replica_ids {
+        if !authoritative.contains(id) {
+          extra.push(id)
+        }
+      }
+      if extra.length() > 0 {
+        let ack = delete_group({ primary: replica, replicas: [], }, extra)
+        removed = removed + extra.length()
+        for address in ack.failed {
+          failed.push(address)
+        }
+      }
+    }
+  }
+  {
+    moved: repaired,
+    replicated,
+    deferred: removed,
+    missing_at_source: 0,
+    failed,
+  }
+}
+
+///|
+/// The ids one shard reports holding, or an empty list when it does not answer.
+async fn group_ids(addr : String) -> Array[String] {
+  let out : Array[String] = []
+  match shard_call_text(addr, IDS_REQUEST) {
+    Some(text) =>
+      match parse_json_or_none(text) {
+        Some(Object(fields)) =>
+          match fields.get("ids") {
+            Some(Array(items)) =>
+              for item in items {
+                if item is String(id) {
+                  out.push(id)
+                }
+              }
+            _ => ()
+          }
+        _ => ()
+      }
+    None => ()
+  }
+  out
+}
+
+///|
+/// Which of `ids` a shard does not have.
+async fn replica_missing(
+  replica : String,
+  ids : Array[String],
+) -> Array[String] {
+  let out : Array[String] = []
+  let mut start = 0
+  while start < ids.length() {
+    let stop = if start + 500 > ids.length() {
+      ids.length()
+    } else {
+      start + 500
+    }
+    let items : Array[String] = []
+    for i in start..<stop {
+      items.push(@json.to_json(ids[i]).stringify())
+    }
+    match
+      shard_call_text(
+        replica,
+        "{\"op\":\"has\",\"ids\":[" + items.join(",") + "]}",
+      ) {
+      Some(text) =>
+        match parse_json_or_none(text) {
+          Some(Object(fields)) =>
+            match fields.get("missing") {
+              Some(Array(list)) =>
+                for item in list {
+                  if item is String(id) {
+                    out.push(id)
+                  }
+                }
+              _ => ()
+            }
+          _ => ()
+        }
+      None => ()
+    }
+    start = stop
+  }
+  out
 }
 
 ///|

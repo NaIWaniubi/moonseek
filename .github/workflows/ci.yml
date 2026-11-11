@@ -124,3 +124,40 @@ jobs:
       - name: Write replication and failover
         run: |
           bash tools/test-replication.sh _build/native/release/build/server/server.exe .
+
+  # Whether the cluster can *grow* is a different claim from whether it can
+  # tolerate a failure: it says a prediction made by the planner matches what the
+  # executor moves, and that the corpus survives the move exactly once.
+  rebalance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up MoonBit
+        run: |
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
+          echo "$HOME/.moon/bin" >> $GITHUB_PATH
+      - name: Build the server
+        run: |
+          moon update
+          moon build server --target native --release
+      - name: Grow a cluster from 3 shards to 4 without reindexing
+        run: |
+          bash tools/test-rebalance.sh _build/native/release/build/server/server.exe .
+
+  # A member that was down while the cluster took writes is brought back in line
+  # with its group's primary, in both directions.
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up MoonBit
+        run: |
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
+          echo "$HOME/.moon/bin" >> $GITHUB_PATH
+      - name: Build the server
+        run: |
+          moon update
+          moon build server --target native --release
+      - name: Repair a member that missed writes
+        run: |
+          bash tools/test-repair.sh _build/native/release/build/server/server.exe .

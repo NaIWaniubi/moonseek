@@ -323,6 +323,7 @@ pub fn Index::fuzzy_terms_fast(Self, String, max_distance? : Int32, field? : Str
 pub fn Index::get_document(Self, String) -> Document?
 pub fn Index::get_facets(Self, String) -> Array[(String, Array[String])]
 pub fn Index::get_field(Self, String, String) -> String?
+pub fn Index::get_vector(Self, String, String) -> Array[Double]?
 pub fn Index::has_external_stats(Self) -> Bool
 pub fn Index::highlight(Self, String, String, String, pre_tag? : String, post_tag? : String) -> String raise QueryError
 pub fn Index::highlight_spans(Self, String, String, String) -> Array[HighlightSpan] raise QueryError
@@ -358,6 +359,7 @@ pub fn Index::to_bytes(Self) -> Bytes
 pub fn Index::tokens_in(Self, String) -> Int32
 pub fn Index::vector_count(Self, String) -> Int32
 pub fn Index::vector_dim(Self, String) -> Int32
+pub fn Index::vector_fields(Self) -> Array[String]
 
 pub(all) struct Posting {
   doc : Int32
