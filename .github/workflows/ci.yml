@@ -104,3 +104,23 @@ jobs:
       - name: Cluster end-to-end
         run: |
           bash tools/test-cluster.sh _build/native/release/build/server/server.exe .
+
+  # The replication claim is a different one from the cluster claim: it says a
+  # write routed through the coordinator reaches every member of the owning
+  # group, so failover survives data that was written after the replica started.
+  # It needs a second binary per shard, so it gets its own job.
+  replication:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up MoonBit
+        run: |
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
+          echo "$HOME/.moon/bin" >> $GITHUB_PATH
+      - name: Build the server
+        run: |
+          moon update
+          moon build server --target native --release
+      - name: Write replication and failover
+        run: |
+          bash tools/test-replication.sh _build/native/release/build/server/server.exe .

@@ -650,6 +650,107 @@ pub fn stat_key(field : String, term : String) -> String {
 }
 
 ///|
+/// The members of a shard group in preference order: the primary, then its
+/// replicas.
+pub fn group_members(group : ShardGroup) -> Array[String] {
+  let out : Array[String] = [group.primary]
+  for replica in group.replicas {
+    out.push(replica)
+  }
+  out
+}
+
+///|
+/// A shard reply counts as an acknowledgement when it is an object without an
+/// `error` field. Both `{"ok":true,…}` and `{"indexed":3,…}` qualify, and an
+/// `{"error":…}` never does. That is the property the coordinator needs: a
+/// transport that succeeded but a write that failed must not be counted.
+fn reply_ok(text : String) -> Bool {
+  match parse_json_or_none(text) {
+    Some(Object(fields)) => !fields.contains("error")
+    _ => false
+  }
+}
+
+///|
+/// What one shard group did with a write.
+pub(all) struct WriteAck {
+  /// Members that applied the write.
+  acked : Int32
+  /// Members the write was sent to.
+  members : Int32
+  /// Members that did not apply it, named so a caller can act.
+  failed : Array[String]
+  /// The first member's reply that counted as an acknowledgement, so a caller
+  /// can read write-specific counters such as `indexed`. Empty when none did.
+  reply : String
+} derive(Eq, Debug)
+
+///|
+pub extend WriteAck with Eq::{equal, not_equal}
+
+///|
+pub extend WriteAck with @debug.Debug::{to_repr}
+
+///|
+/// Send one write request to **every** member of a group, in parallel.
+///
+/// Replicating on the write path is what makes a replica a replica. Without it
+/// a replica is only correct if someone seeded it by hand, so the failover path
+/// answers from stale data while reporting success — the worst kind of failure,
+/// because it looks like a working cluster. Writing to every member costs one
+/// round trip to each of them, and they run in parallel with the primary's.
+async fn write_group(group : ShardGroup, request : String) -> WriteAck {
+  let members = group_members(group)
+  let answers : Array[String?] = Array::make(members.length(), None)
+  @async.with_task_group(fn(tasks) {
+    for i in 0..<members.length() {
+      let index = i
+      let _ = tasks.spawn(
+        async fn() {
+          answers[index] = shard_call(members[index], request)
+        },
+        allow_failure=true,
+      )
+    }
+  })
+  let mut acked = 0
+  let mut reply = ""
+  let failed : Array[String] = []
+  for i in 0..<members.length() {
+    match answers[i] {
+      Some(text) =>
+        if reply_ok(text) {
+          acked = acked + 1
+          if reply == "" {
+            reply = text
+          }
+        } else {
+          failed.push(members[i])
+        }
+      None => failed.push(members[i])
+    }
+  }
+  { acked, members: members.length(), failed, reply }
+}
+
+///|
+/// Read `"id"` out of a document body without applying it, so a coordinator can
+/// decide which shard owns a document before sending it anywhere. Returns None
+/// for anything that is not an object with a string id, which the caller
+/// reports as a bad request rather than guessing a shard.
+pub fn doc_id_of(body : String) -> String? {
+  match parse_json_or_none(body) {
+    Some(Object(fields)) =>
+      match fields.get("id") {
+        Some(String(id)) => Some(id)
+        _ => None
+      }
+    _ => None
+  }
+}
+
+///|
 /// Collect every live document id from every shard.
 ///
 /// Used by the rebalance planner. It reads the real keys rather than a sample,

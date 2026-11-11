@@ -365,6 +365,31 @@ fn shard_handle(state : ServerState, request : String) -> String {
       state.indexed_docs += 1
       text
     }
+    "bulk" => {
+      // A coordinator groups a bulk write by owning shard, so a shard gets one
+      // request carrying only the documents it owns, not one request per
+      // document.
+      let body = match obj.get("body") {
+        Some(String(s)) => s
+        _ => return "{\"error\":\"missing body\"}"
+      }
+      index_bulk(state, body)
+    }
+    "delete" => {
+      let id = match obj.get("id") {
+        Some(String(s)) => s
+        _ => return "{\"error\":\"missing id\"}"
+      }
+      let deleted = state.index.delete(id)
+      if deleted {
+        state.deleted_docs += 1
+      }
+      let fields : Map[String, Json] = Map([])
+      fields["ok"] = @json.to_json(true)
+      fields["deleted"] = @json.to_json(deleted)
+      fields["id"] = @json.to_json(id)
+      Json::object(fields).stringify()
+    }
     "search" => {
       let query = match obj.get("query") {
         Some(String(s)) => s
@@ -466,6 +491,167 @@ fn rebalance_to_json(plan : Rebalance) -> Json {
   fields["before"] = Json::array(before)
   fields["after"] = Json::array(after)
   Json::object(fields)
+}
+
+///|
+/// A write acknowledgement as JSON.
+///
+/// `ok` means *every* member applied it, which is the only reading of "ok" a
+/// client can act on: a write acknowledged by one member of three is not
+/// durable, and reporting it as a success is how a cluster loses data quietly.
+/// `acked`/`members` carry the partial case, with the addresses that did not
+/// answer named.
+fn write_reply(
+  state : ServerState,
+  id : String,
+  group_index : Int32,
+  ack : WriteAck,
+) -> String {
+  let fields : Map[String, Json] = Map([])
+  fields["ok"] = @json.to_json(ack.failed.length() == 0)
+  fields["id"] = @json.to_json(id)
+  fields["shard"] = @json.to_json(group_index)
+  fields["acked"] = @json.to_json(ack.acked)
+  fields["members"] = @json.to_json(ack.members)
+  if group_index >= 0 && group_index < state.cluster.length() {
+    fields["primary"] = @json.to_json(state.cluster[group_index].primary)
+  }
+  if ack.failed.length() > 0 {
+    let arr : Array[Json] = []
+    for address in ack.failed {
+      arr.push(@json.to_json(address))
+    }
+    fields["failed_addresses"] = Json::array(arr)
+  }
+  Json::object(fields).stringify()
+}
+
+///|
+/// Route one document from a coordinator to the group that owns it, replicating
+/// it to every member. The reply says how many members applied it.
+async fn coordinator_index(state : ServerState, body : String) -> String raise {
+  let id = match doc_id_of(body) {
+    Some(id) => id
+    None => raise Failure::Failure("document needs a string id")
+  }
+  let group_index = state.group_for(id)
+  let request = "{\"op\":\"index\",\"body\":" + @json.to_json(body).stringify() +
+    "}"
+  let ack = write_group(state.cluster[group_index], request)
+  // The coordinator counts what it accepted, not what it applied: it applies
+  // nothing itself.
+  state.indexed_docs += 1
+  write_reply(state, id, group_index, ack)
+}
+
+///|
+/// Route a delete from a coordinator to the owning group, replicating it.
+async fn coordinator_delete(state : ServerState, id : String) -> String {
+  let group_index = state.group_for(id)
+  let request = "{\"op\":\"delete\",\"id\":" + @json.to_json(id).stringify() + "}"
+  let ack = write_group(state.cluster[group_index], request)
+  write_reply(state, id, group_index, ack)
+}
+
+///|
+/// `POST /index/bulk` on a coordinator: split the batch by owning shard and
+/// send each shard one request carrying only its documents.
+///
+/// One request per shard rather than one per document is the difference between
+/// a bulk load that is one round trip per shard and one that is one round trip
+/// per document. It is also why a batch is grouped here rather than forwarded
+/// whole: a shard that received the entire batch would index documents it does
+/// not own, and then two shards would answer for the same document.
+async fn coordinator_bulk(state : ServerState, body : String) -> String {
+  let started = @env.now()
+  let per_shard : Array[Array[String]] = []
+  for _ in 0..<state.cluster.length() {
+    per_shard.push([])
+  }
+  let mut malformed = 0
+  for line in body.split("\n") {
+    let trimmed = line.trim().to_owned()
+    if trimmed.is_empty() {
+      continue
+    }
+    match doc_id_of(trimmed) {
+      Some(id) => per_shard[state.group_for(id)].push(trimmed)
+      None => malformed = malformed + 1
+    }
+  }
+  let acks : Array[WriteAck?] = Array::make(state.cluster.length(), None)
+  @async.with_task_group(fn(tasks) {
+    for i in 0..<state.cluster.length() {
+      if per_shard[i].length() == 0 {
+        continue
+      }
+      let index = i
+      let request = "{\"op\":\"bulk\",\"body\":" +
+        @json.to_json(per_shard[index].join("\n")).stringify() +
+        "}"
+      let _ = tasks.spawn(
+        async fn() {
+          acks[index] = Some(write_group(state.cluster[index], request))
+        },
+        allow_failure=true,
+      )
+    }
+  })
+  let mut indexed = 0
+  let mut failed = malformed
+  let mut members_total = 0
+  let mut members_ok = 0
+  let unreplicated : Array[String] = []
+  for i in 0..<state.cluster.length() {
+    match acks[i] {
+      Some(ack) => {
+        members_total += ack.members
+        members_ok += ack.acked
+        for address in ack.failed {
+          unreplicated.push(address)
+        }
+        // Per-document failures come from the shard's own count, so a batch
+        // with one bad document is reported as one failure rather than as a
+        // failed shard.
+        failed += bulk_failed_of(ack.reply)
+        if ack.acked > 0 {
+          indexed += per_shard[i].length() - bulk_failed_of(ack.reply)
+        }
+      }
+      None => ()
+    }
+  }
+  state.indexed_docs += indexed.to_int64()
+  let fields : Map[String, Json] = Map([])
+  fields["indexed"] = @json.to_json(indexed)
+  fields["failed"] = @json.to_json(failed)
+  fields["shards"] = @json.to_json(state.cluster.length())
+  fields["members_ok"] = @json.to_json(members_ok)
+  fields["members"] = @json.to_json(members_total)
+  fields["took_ms"] = @json.to_json((@env.now() - started).to_double())
+  if unreplicated.length() > 0 {
+    let arr : Array[Json] = []
+    for address in unreplicated {
+      arr.push(@json.to_json(address))
+    }
+    fields["failed_addresses"] = Json::array(arr)
+  }
+  Json::object(fields).stringify()
+}
+
+///|
+/// The `failed` count out of a shard's bulk reply, or 0 when it cannot be read.
+/// A shard that reports a different shape is not treated as having failed every
+/// document it was sent.
+fn bulk_failed_of(reply : String) -> Int32 {
+  match parse_json_or_none(reply) {
+    Some(Object(fields)) =>
+      match fields.get("failed") {
+        Some(Number(n, ..)) => n.to_int()
+        _ => 0
+      }
+    _ => 0
+  }
 }
 
 ///|
@@ -841,6 +1027,21 @@ async fn handle(
     "/index" => {
       if http_method is Post {
         let body = read_body(reader)
+        // A coordinator owns no documents: it routes the write to the group
+        // that owns the id and replicates it to every member of that group.
+        if !state.cluster.is_empty() {
+          let text = coordinator_index(state, body) catch {
+            e =>
+              return respond_json(
+                conn,
+                400,
+                "Bad Request",
+                error_json("bad_request", e.to_string()),
+              )
+          }
+          respond_json(conn, 202, "Accepted", text)
+          return ()
+        }
         let text = apply_document(state, body) catch {
           e =>
             return respond_json(
@@ -856,6 +1057,12 @@ async fn handle(
       }
       if http_method is Delete {
         let id = get_param(params, "id")
+        if !state.cluster.is_empty() {
+          // The delete has to reach the group that owns the id, or the
+          // coordinator would report a deletion that never happened while the
+          // document stayed searchable.
+          return respond_json(conn, 200, "OK", coordinator_delete(state, id))
+        }
         let deleted = state.index.delete(id)
         if deleted {
           state.deleted_docs += 1
@@ -869,6 +1076,9 @@ async fn handle(
     "/index/bulk" =>
       if http_method is Post {
         let body = read_body(reader)
+        if !state.cluster.is_empty() {
+          return respond_json(conn, 200, "OK", coordinator_bulk(state, body))
+        }
         respond_json(conn, 200, "OK", index_bulk(state, body))
         return ()
       }
