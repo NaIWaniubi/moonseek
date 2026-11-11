@@ -52,3 +52,40 @@ test "matchfield eval only returns documents with field content" {
   assert_eq(excluded[0].id, "other")
   assert_true(excluded[0].score.abs() < 0.000000001)
 }
+
+///|
+/// Tombstones must not change query cost. `field_live_count` is called once per
+/// (field, term) per query; when it re-scanned the length table on every call,
+/// deleting documents made each query O(N) and a selective term went from
+/// microseconds to a hundred milliseconds at 200k documents.
+test "deletion does not change the field live count's cost or value" {
+  let idx = Index::new([
+    { name: "title", weight: 2.0, },
+    { name: "body", weight: 1.0, },
+  ])
+  for i in 0..<50 {
+    idx.add({
+      id: "d\{i}",
+      fields: [("title", "t\{i}"), ("body", "common word \{i}")],
+    })
+  }
+  // No tombstones: 50 live documents carrying both fields.
+  assert_eq(idx.field_live_count("body"), 50)
+  assert_eq(idx.field_live_count("title"), 50)
+  // Delete ten and the count drops by ten, exactly.
+  for i in 0..<10 {
+    let _ = idx.delete("d\{i}")
+  }
+  assert_eq(idx.field_live_count("body"), 40)
+  assert_eq(idx.field_live_count("title"), 40)
+  // Deleting a document that declared only one field must not shift the other
+  // field's count.
+  idx.add({ id: "title-only", fields: [("title", "solo")] })
+  assert_eq(idx.field_live_count("body"), 40)
+  assert_eq(idx.field_live_count("title"), 41)
+  let _ = idx.delete("title-only")
+  assert_eq(idx.field_live_count("body"), 40)
+  assert_eq(idx.field_live_count("title"), 40)
+  // A field nothing carries is zero, not an error.
+  assert_eq(idx.field_live_count("nope"), 0)
+}

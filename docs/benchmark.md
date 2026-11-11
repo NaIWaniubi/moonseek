@@ -145,6 +145,35 @@ a CRC-32 over the payload. Both figures include CRC computation and exclude file
 is now faster than deserialization: writing is a straight append through `ByteWriter`, while reading
 must rebuild per-term hash maps.
 
+### Large scale: 200,000 documents
+
+`moon run bench/scale --target native --release -- --docs 200000` (median of 3
+builds, p50/p90/p99 of 200 samples per shape). The corpus is generated
+streaming — one document at a time, handed to `add`, then dropped — so the
+harness does not hold a second copy of the text.
+
+| metric | value |
+|---|---|
+| Documents / terms / raw text | 200,000 / 350,032 / 108 MB |
+| Build (median of 3) | 21.7 s |
+| Build throughput | **8,462 docs/s** |
+| Saturated term (df 41,524) | p50 24.4 ms, p99 44.5 ms |
+| Mid-frequency term (df 3,908) | p50 2.07 ms |
+| Selective term (df 117) | p50 **0.021 ms** |
+| Boolean AND (12,985 matches) | p50 45.6 ms |
+| Exact / sloppy phrase | p50 84.8 / 121.3 ms |
+| Prefix expansion (61 terms) | p50 3.0 ms |
+| Snapshot | 202.7 MB, serialize 7.96 s, load 7.15 s |
+| Estimated resident index | ~810 MB (raw text 108 MB + 14.6M postings + 14.8M positions) |
+
+**Peak RSS is not measured in-process**: `moonbitlang/core` exposes no memory
+API, so the 810 MB figure is a model (see the caveat block below), not a reading.
+
+Deleting 10% of the corpus used to make every query O(N) — a selective term went
+from 0.021 ms to 101 ms, because the live-document count re-scanned the field
+length table on every term. That is fixed in 0.7.0; post-delete latency now
+matches the clean case (0.015 ms). The before/after is in `CHANGELOG.md`.
+
 ### Registry corpus: 3,698 real packages
 
 This is the corpus the browser demo ships, built from the live mooncakes registry index.

@@ -82,6 +82,15 @@ with `v == v`, not 0.0, because 0.0 is a legitimate value and treating absence
 as zero corrupts every average.
 
 ### Fixed
+* **Tombstones made every query O(N).** `field_live_count` re-scanned a field's
+  length table whenever `deleted` was non-empty, and `bm25_context` calls it once
+  per (field, term) per query. On 200,000 documents, deleting 10% took a
+  selective-term query from **0.021 ms to 101 ms** — a 5000× regression from
+  tombstones alone. The table holds live documents only (`delete_by_num` removes
+  the entry and decrements `total_length`), so the scan was redundant as well as
+  quadratic; the count is now O(1). After the fix, post-delete latency matches
+  the clean case (0.015 ms vs 0.027 ms). Found by `bench/scale`, which is why
+  that benchmark exists.
 * **Every latency in the service was reported 1000× too small**: `@env.now()` is
   milliseconds and several call sites divided by 1000 again. `took_ms` was
   returning seconds.

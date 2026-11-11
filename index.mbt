@@ -592,16 +592,16 @@ fn Index::field_live_count(self : Index, field : String) -> Int32 {
     Some(s) => s
     None => return 0
   }
-  if self.deleted.is_empty() {
-    return stats.lengths.length()
-  }
-  let mut count = 0
-  for (num, _) in stats.lengths.iter2() {
-    if !self.deleted.contains(num) {
-      count += 1
-    }
-  }
-  count
+  // O(1). `delete_by_num` removes the document from every field's length table
+  // and decrements `total_length`, so the table holds live documents only.
+  //
+  // This used to re-scan the table whenever tombstones existed, filtering by
+  // `deleted`. That was redundant *and* quadratic in practice: `bm25_context`
+  // calls it once per (field, term) per query, so a single-term query over four
+  // fields walked 4 x N entries. On 200k documents deleting 10% took a
+  // selective-term query from 0.021 ms to 101 ms — a 5000x regression from
+  // tombstones, found by bench/scale and pinned by the tombstone test below.
+  stats.lengths.length()
 }
 
 ///|
