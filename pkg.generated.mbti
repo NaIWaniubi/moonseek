@@ -23,6 +23,8 @@ pub fn levenshtein(String, String) -> Int32
 
 pub fn parse_query(String, analyzer? : Analyzer, fields? : Array[String]) -> Query raise QueryError
 
+pub fn percentiles_of(Array[Double], Array[Double]) -> Array[(Double, Double)]
+
 pub fn query_terms(Query) -> Array[String]
 
 pub fn scoring_terms(Index, Query) -> Array[(String, String)]?
@@ -296,6 +298,7 @@ pub struct Index {
   // private fields
 }
 pub fn Index::add(Self, Document) -> Unit
+pub fn Index::agg_values(Self, String, String, filters? : Array[(String, Array[String])]) -> Array[Double] raise QueryError
 pub fn Index::aggregate(Self, String, Array[AggSpec], filters? : Array[(String, Array[String])]) -> Array[AggResult] raise QueryError
 pub fn Index::all_live_scores(Self, DocScores, (Int32) -> Bool) -> DocScores
 pub fn Index::analyzer(Self) -> Analyzer

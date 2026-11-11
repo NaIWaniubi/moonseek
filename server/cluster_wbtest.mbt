@@ -280,3 +280,248 @@ test "shard modes parse and reject typos" {
   // operator's own tooling disagrees.
   assert_true(parse_shard_mode("ring2") is None)
 }
+
+///|
+/// Per-shard aggregations merged into a corpus-wide answer.
+///
+/// Every case here is a merge rule that is easy to get subtly wrong and that
+/// produces a plausible number when you do, which is the worst combination.
+
+///|
+fn agg_terms(
+  field : String,
+  buckets : Array[(String, Double)],
+) -> @moonseek.AggResult {
+  let out : @moonseek.AggResult = {
+    field,
+    kind: "terms",
+    buckets,
+    stats: None,
+    percentiles: [],
+  }
+  out
+}
+
+///|
+fn agg_stats(field : String, st : @moonseek.StatSummary) -> @moonseek.AggResult {
+  let out : @moonseek.AggResult = {
+    field,
+    kind: "stats",
+    buckets: [],
+    stats: Some(st),
+    percentiles: [],
+  }
+  out
+}
+
+///|
+fn agg_histogram(
+  field : String,
+  buckets : Array[(String, Double)],
+) -> @moonseek.AggResult {
+  let out : @moonseek.AggResult = {
+    field,
+    kind: "histogram",
+    buckets,
+    stats: None,
+    percentiles: [],
+  }
+  out
+}
+
+///|
+fn agg_percentiles(
+  field : String,
+  ps : Array[(Double, Double)],
+) -> @moonseek.AggResult {
+  let out : @moonseek.AggResult = {
+    field,
+    kind: "percentiles",
+    buckets: [],
+    stats: None,
+    percentiles: ps,
+  }
+  out
+}
+
+///|
+test "terms merge sums counts across shards and caps after merging" {
+  let replies : Array[AggReply] = [
+    {
+      results: [agg_terms("license", [("MIT", 3.0), ("Apache-2.0", 1.0)])],
+      values: [],
+    },
+    {
+      results: [agg_terms("license", [("MIT", 2.0), ("GPL", 4.0)])],
+      values: [],
+    },
+  ]
+  let merged = merge_aggregates([@moonseek.TermsAgg("license", 0)], replies)
+  assert_eq(merged.length(), 1)
+  let buckets = merged[0].buckets
+  assert_eq(buckets.length(), 3)
+  // Counts are corpus-wide: MIT is 3 + 2, not 3 or 2.
+  assert_eq(buckets[0], ("MIT", 5.0))
+  assert_eq(buckets[1], ("GPL", 4.0))
+  assert_eq(buckets[2], ("Apache-2.0", 1.0))
+  // A GPL that is rank 1 inside one shard must survive a global cap of 2. If
+  // each shard had applied the cap itself, only MIT and Apache would have come
+  // back from shard 1 and GPL would have been dropped entirely.
+  let capped = merge_aggregates([@moonseek.TermsAgg("license", 2)], replies)
+  assert_eq(capped[0].buckets.length(), 2)
+  assert_eq(capped[0].buckets[1], ("GPL", 4.0))
+}
+
+///|
+test "stats merge recombines counts instead of averaging the averages" {
+  let small : @moonseek.StatSummary = {
+    count: 2,
+    min: 1.0,
+    max: 3.0,
+    avg: 2.0,
+    sum: 4.0,
+  }
+  let large : @moonseek.StatSummary = {
+    count: 40,
+    min: 10.0,
+    max: 50.0,
+    avg: 30.0,
+    sum: 1200.0,
+  }
+  let replies : Array[AggReply] = [
+    { results: [agg_stats("versions", small)], values: [], },
+    { results: [agg_stats("versions", large)], values: [], },
+  ]
+  let merged = merge_aggregates([@moonseek.StatsAgg("versions")], replies)
+  let st = merged[0].stats.unwrap()
+  assert_eq(st.count, 42)
+  assert_eq(st.min, 1.0)
+  assert_eq(st.max, 50.0)
+  assert_eq(st.sum, 1204.0)
+  // The mean of the union is 1204/42 = 28.67. Averaging the two averages gives
+  // 16.0 — a wrong answer that looks entirely reasonable in a dashboard, which
+  // is why it is worth a test rather than a comment.
+  assert_true((st.avg - 1204.0 / 42.0).abs() < 1.0e-9)
+  assert_true((st.avg - 16.0).abs() > 1.0)
+}
+
+///|
+test "stats merge ignores shards that hold no values" {
+  let empty : @moonseek.StatSummary = {
+    count: 0,
+    min: 0.0,
+    max: 0.0,
+    avg: 0.0,
+    sum: 0.0,
+  }
+  let some : @moonseek.StatSummary = {
+    count: 2,
+    min: 5.0,
+    max: 9.0,
+    avg: 7.0,
+    sum: 14.0,
+  }
+  let replies : Array[AggReply] = [
+    { results: [agg_stats("v", empty)], values: [], },
+    { results: [agg_stats("v", some)], values: [], },
+  ]
+  let merged = merge_aggregates([@moonseek.StatsAgg("v")], replies)
+  let st = merged[0].stats.unwrap()
+  assert_eq(st.count, 2)
+  // A shard with no values reports min/max 0.0; letting those through would
+  // drag the minimum to zero.
+  assert_eq(st.min, 5.0)
+  assert_eq(st.max, 9.0)
+}
+
+///|
+test "merged histogram buckets sort by bucket, not by label text" {
+  let replies : Array[AggReply] = [
+    { results: [agg_histogram("v", [("0", 1.0), ("10", 2.0)])], values: [], },
+    { results: [agg_histogram("v", [("2", 3.0)])], values: [], },
+  ]
+  let merged = merge_aggregates([@moonseek.HistogramAgg("v", 2.0)], replies)
+  let labels : Array[String] = []
+  for (label, _) in merged[0].buckets {
+    labels.push(label)
+  }
+  // As text this sorts "0", "10", "2". As buckets it is 0, 2, 10.
+  assert_eq(labels, ["0", "2", "10"])
+  assert_eq(merged[0].buckets[1], ("2", 3.0))
+}
+
+///|
+test "percentiles merge from the raw values, not from per-shard percentiles" {
+  // Two shards with disjoint ranges. Their medians are 2 and 20, so the average
+  // of the medians is 11; the median of the union is 6.5.
+  let low : Array[Double] = [1.0, 2.0, 3.0]
+  let high : Array[Double] = [10.0, 20.0, 30.0]
+  let replies : Array[AggReply] = [
+    { results: [agg_percentiles("v", [(50.0, 2.0)])], values: [("v", low)], },
+    { results: [agg_percentiles("v", [(50.0, 20.0)])], values: [("v", high)], },
+  ]
+  let merged = merge_aggregates(
+    [@moonseek.PercentilesAgg("v", [50.0])],
+    replies,
+  )
+  let p50 = merged[0].percentiles[0].1
+  assert_true((p50 - 6.5).abs() < 1.0e-9)
+  // And it is not the per-shard answer, which is what a summary-only merge
+  // would have produced.
+  assert_true((p50 - 11.0).abs() > 1.0)
+}
+
+///|
+test "percentiles_of sorts a copy and leaves the caller's array alone" {
+  let values : Array[Double] = [3.0, 1.0, 2.0]
+  let out = @moonseek.percentiles_of(values, [0.0, 100.0])
+  assert_eq(out[0].1, 1.0)
+  assert_eq(out[1].1, 3.0)
+  assert_eq(values, [3.0, 1.0, 2.0])
+}
+
+///|
+test "filters travel to the shards as valid JSON" {
+  let filters : Array[(String, Array[String])] = [
+    ("license", ["MIT", "Apache-2.0"]),
+    ("domain", ["wasm"]),
+  ]
+  let json = filters_json(filters)
+  let parsed = @json.parse(json) catch {
+    _ => abort("filters_json is not JSON")
+  }
+  match parsed {
+    Array(items) => {
+      assert_eq(items.length(), 2)
+      match items[0] {
+        Array(pair) => {
+          assert_eq(pair.length(), 2)
+          match pair[0] {
+            String(field) => assert_eq(field, "license")
+            _ => abort("field is not a string")
+          }
+          match pair[1] {
+            Array(values) => assert_eq(values.length(), 2)
+            _ => abort("values are not an array")
+          }
+        }
+        _ => abort("filter is not a pair")
+      }
+    }
+    _ => abort("filters_json is not an array")
+  }
+  assert_eq(filters_json([]), "[]")
+  // A filter value with a quote in it must not break the request.
+  let quoted : Array[(String, Array[String])] = [("name", ["a\"b"])]
+  let _ = @json.parse(filters_json(quoted)) catch {
+    _ => abort("a quoted filter value broke the JSON")
+  }
+}
+
+///|
+test "doc_id_of reads an id without applying the document" {
+  assert_eq(doc_id_of("{\"id\":\"pkg/1\",\"fields\":{}}"), Some("pkg/1"))
+  assert_eq(doc_id_of("{\"fields\":{}}"), None)
+  assert_eq(doc_id_of("{\"id\":7}"), None)
+  assert_eq(doc_id_of("not json"), None)
+}

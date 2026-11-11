@@ -403,25 +403,90 @@ fn shard_handle(state : ServerState, request : String) -> String {
       // scoring: install the corpus-wide numbers for this one query, then take
       // them straight back out. Leaving them installed would mis-score a later
       // local query, which is the kind of bug that only shows up under load.
+      let filters = requested_filters(obj)
       match stats_from_request(obj) {
         Some(stats) => {
           state.index.set_external_stats(Some(stats))
           defer state.index.set_external_stats(None)
-          shard_search(state, query, limit)
+          shard_search(state, query, limit, filters)
         }
-        None => shard_search(state, query, limit)
+        None => shard_search(state, query, limit, filters)
       }
     }
     "stats" =>
       // `df` and field lengths for the terms the coordinator named, so a
       // two-phase query carries only the statistics it will read.
       shard_stats(state, requested_terms(obj))
+    "agg" =>
+      // Corpus-wide aggregation, computed on this shard's slice. The
+      // coordinator merges the replies; see cluster_aggregate for why terms can
+      // be summed, stats have to be recombined rather than averaged, and
+      // percentiles need the raw values shipped.
+      shard_aggregate(state, obj)
     "ids" =>
       // Every live document id this shard holds. The coordinator uses these to
       // plan a rebalance over the real keys rather than a synthetic sample.
       shard_ids(state)
     _ => "{\"error\":\"unknown op\"}"
   }
+}
+
+///|
+/// Aggregations for this shard's slice of the corpus.
+///
+/// The request carries `specs` (the same JSON shape `POST /search` accepts),
+/// `filters`, and `values` — the numeric fields whose percentiles cannot be
+/// merged from summaries and therefore have to travel as raw values.
+///
+/// A spec that fails to parse is *dropped*, so the reply has fewer results than
+/// the request had specs; the coordinator checks that count and treats a short
+/// reply as a failed shard rather than merging it at the wrong offsets.
+fn shard_aggregate(state : ServerState, obj : Map[String, Json]) -> String {
+  let query = match obj.get("query") {
+    Some(String(s)) => s
+    _ => ""
+  }
+  let specs : Array[@moonseek.AggSpec] = []
+  match obj.get("specs") {
+    Some(Array(items)) =>
+      for item in items {
+        match parse_agg_json(item) {
+          Some(spec) => specs.push(spec)
+          None => ()
+        }
+      }
+    _ => ()
+  }
+  let filters = requested_filters(obj)
+  let results = state.index.aggregate(query, specs, filters~) catch {
+    e => return error_json("bad_request", e.to_string())
+  }
+  let rendered : Array[String] = []
+  for r in results {
+    rendered.push(r.to_json().stringify())
+  }
+  let values : Map[String, Json] = Map([])
+  match obj.get("values") {
+    Some(Array(items)) =>
+      for item in items {
+        if item is String(field) {
+          let nums = state.index.agg_values(query, field, filters~) catch {
+            _ => []
+          }
+          let arr : Array[Json] = []
+          for v in nums {
+            arr.push(@json.to_json(v))
+          }
+          values[field] = Json::array(arr)
+        }
+      }
+    _ => ()
+  }
+  "{\"results\":[" +
+  rendered.join(",") +
+  "],\"values\":" +
+  Json::object(values).stringify() +
+  "}"
 }
 
 ///|
@@ -529,13 +594,14 @@ fn write_reply(
 ///|
 /// Route one document from a coordinator to the group that owns it, replicating
 /// it to every member. The reply says how many members applied it.
-async fn coordinator_index(state : ServerState, body : String) -> String raise {
+async fn coordinator_index(state : ServerState, body : String) -> String {
   let id = match doc_id_of(body) {
     Some(id) => id
     None => raise Failure::Failure("document needs a string id")
   }
   let group_index = state.group_for(id)
-  let request = "{\"op\":\"index\",\"body\":" + @json.to_json(body).stringify() +
+  let request = "{\"op\":\"index\",\"body\":" +
+    @json.to_json(body).stringify() +
     "}"
   let ack = write_group(state.cluster[group_index], request)
   // The coordinator counts what it accepted, not what it applied: it applies
@@ -548,7 +614,9 @@ async fn coordinator_index(state : ServerState, body : String) -> String raise {
 /// Route a delete from a coordinator to the owning group, replicating it.
 async fn coordinator_delete(state : ServerState, id : String) -> String {
   let group_index = state.group_for(id)
-  let request = "{\"op\":\"delete\",\"id\":" + @json.to_json(id).stringify() + "}"
+  let request = "{\"op\":\"delete\",\"id\":" +
+    @json.to_json(id).stringify() +
+    "}"
   let ack = write_group(state.cluster[group_index], request)
   write_reply(state, id, group_index, ack)
 }
@@ -676,28 +744,86 @@ fn requested_terms(obj : Map[String, Json]) -> Array[(String, String)] {
 }
 
 ///|
-fn shard_search(state : ServerState, query : String, limit : Int32) -> String {
-  let hits = state.index.search(query, limit~) catch {
+/// The `[["field",["v1","v2"]], …]` filter list a search or aggregation request
+/// carries. A pair with no readable values is dropped rather than kept as an
+/// empty allow-list, which would match nothing and silently empty the answer.
+fn requested_filters(obj : Map[String, Json]) -> Array[(String, Array[String])] {
+  let out : Array[(String, Array[String])] = []
+  match obj.get("filters") {
+    Some(Array(items)) =>
+      for item in items {
+        match item {
+          Array(pair) if pair.length() == 2 =>
+            match (pair[0], pair[1]) {
+              (String(field), Array(values)) => {
+                let vals : Array[String] = []
+                for v in values {
+                  if v is String(sv) {
+                    vals.push(sv)
+                  }
+                }
+                if !vals.is_empty() {
+                  out.push((field, vals))
+                }
+              }
+              _ => ()
+            }
+          _ => ()
+        }
+      }
+    _ => ()
+  }
+  out
+}
+
+///|
+/// Plain (field, values) pairs into the engine's filter type: values within one
+/// field are "either", different fields are "and".
+fn to_facet_filters(
+  pairs : Array[(String, Array[String])],
+) -> Array[@moonseek.FacetFilter] {
+  let filters : Array[@moonseek.FacetFilter] = []
+  for (field, values) in pairs {
+    for v in values {
+      push_filter(filters, field, v)
+    }
+  }
+  filters
+}
+
+///|
+fn shard_search(
+  state : ServerState,
+  query : String,
+  limit : Int32,
+  filters : Array[(String, Array[String])],
+) -> String {
+  // `search_faceted` rather than `search`: the filters have to be applied here,
+  // on the node that holds the documents — a coordinator that applied them
+  // locally would be filtering an index it does not have. This call also
+  // returns the filtered match count, where a separate `count` call would count
+  // the unfiltered matches and report a total larger than the hits it returned.
+  let options : @moonseek.SearchOptions = {
+    limit,
+    offset: 0,
+    filters: to_facet_filters(filters),
+    facet_fields: [],
+  }
+  let result = state.index.search_faceted(query, options~) catch {
     e => return error_json("bad_request", e.to_string())
   }
   let items : Array[String] = []
-  for h in hits {
+  for h in result.hits {
     items.push(
       "[" + @json.to_json(h.id).stringify() + "," + h.score.to_string() + "]",
     )
   }
-  // The match count has to be exact rather than "at least pool", or the
-  // coordinator's total would be a lower bound presented as a number. It must
-  // also not cost a second ranking: `search(limit=0)` builds and sorts every
-  // hit, which dominated the cluster's per-query latency until this became a
-  // count-only path.
-  let total = state.index.count(query) catch { _ => 0 }
   "{\"hits\":[" +
   items.join(",") +
   "],\"docs\":" +
   state.index.doc_count().to_string() +
   ",\"total\":" +
-  total.to_string() +
+  result.total.to_string() +
   "}"
 }
 
@@ -1604,7 +1730,16 @@ async fn do_search(
     // those. It costs one extra round trip per query, which is why it is
     // opt-in rather than the default.
     let want_dfs = bool_param(params, "dfs")
-    return render_cluster(state, query, limit, started, want_dfs)
+    return render_cluster(
+      state,
+      query,
+      limit,
+      started,
+      want_dfs,
+      facet_fields,
+      aggs,
+      simple_filters(filters),
+    )
   }
   if !knn_vector.is_empty() && !knn_field.is_empty() {
     // Hybrid takes a different engine path: the two rankings must be fused
@@ -1697,6 +1832,9 @@ async fn render_cluster(
   limit : Int32,
   started : UInt64,
   want_dfs : Bool,
+  facet_fields : Array[String],
+  aggs : Array[@moonseek.AggSpec],
+  filters : Array[(String, Array[String])],
 ) -> String {
   let config : ClusterConfig = {
     shards: state.cluster,
@@ -1731,7 +1869,7 @@ async fn render_cluster(
   } else {
     None
   }
-  let result = cluster_search(config, query, limit, stats)
+  let result = cluster_search(config, query, limit, stats, filters)
   let took = (@env.now() - started).to_double()
   let fields : Map[String, Json] = Map([])
   fields["query"] = @json.to_json(query)
@@ -1749,7 +1887,58 @@ async fn render_cluster(
     hits.push(Json::object(entry))
   }
   fields["hits"] = Json::array(hits)
-  fields["facets"] = Json::object(Map([]))
+  // Facets and aggregations are computed over the whole corpus, not over the
+  // coordinator's own empty index. A facet is an uncapped terms aggregation
+  // over the filtered result set, so both go through the same fan-out and the
+  // same merge — one round trip for a query that asks for either.
+  let specs : Array[@moonseek.AggSpec] = []
+  for field in facet_fields {
+    specs.push(@moonseek.TermsAgg(field, 0))
+  }
+  for spec in aggs {
+    specs.push(spec)
+  }
+  let mut merged : Array[@moonseek.AggResult] = []
+  let agg_failed : Array[String] = []
+  if specs.length() > 0 {
+    let (results, failed_addresses, _) = cluster_aggregate(
+      config, query, specs, filters,
+    )
+    merged = results
+    for address in failed_addresses {
+      agg_failed.push(address)
+    }
+  }
+  let facet_obj : Map[String, Json] = Map([])
+  for i in 0..<facet_fields.length() {
+    if i >= merged.length() {
+      break
+    }
+    let arr : Array[Json] = []
+    for (label, count) in merged[i].buckets {
+      arr.push(Json::array([@json.to_json(label), @json.to_json(count)]))
+    }
+    facet_obj[facet_fields[i]] = Json::array(arr)
+  }
+  fields["facets"] = Json::object(facet_obj)
+  if !aggs.is_empty() {
+    let arr : Array[Json] = []
+    for i in facet_fields.length()..<merged.length() {
+      arr.push(merged[i].to_json())
+    }
+    fields["aggs"] = Json::array(arr)
+  }
+  if agg_failed.length() > 0 {
+    // The ranking may be complete while the aggregation is not, so this is a
+    // separate field rather than folded into the search's shard accounting:
+    // a facet total from two of three shards is a smaller number presented as a
+    // count of the corpus, which is a failure a dashboard would not notice.
+    let arr : Array[Json] = []
+    for address in agg_failed {
+      arr.push(@json.to_json(address))
+    }
+    fields["agg_failed_addresses"] = Json::array(arr)
+  }
   // The shard accounting is part of the contract: a partial answer must say so.
   let shards : Map[String, Json] = Map([])
   shards["total"] = @json.to_json(result.shards_total)

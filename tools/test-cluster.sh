@@ -149,6 +149,22 @@ if not (65.0 <= mod <= 85.0):
 print("ok: ring %s%% vs modulo %s%% (ideal 25%%)" % (ring, mod))
 PY
 
+# ---- claim 5: distributed facets and aggregations equal a single node ------
+echo "== claim 5: distributed facets and aggregations equal a single node =="
+AGG_SUFFIX='/search?q=parser&limit=5&dfs=true&facets=domain,license&agg=domain:terms:50&agg=versions:stats&agg=versions:histogram:10&agg=versions:percentiles'
+python3 "$(dirname "$0")/check-distributed-aggs.py" \
+  http://127.0.0.1:7805 http://127.0.0.1:7804 "$AGG_SUFFIX" || exit 1
+# The same check under a filter, because a facet that ignores the filter is the
+# classic way a search UI ends up contradicting itself.
+FILTERED='/search?q=parser&limit=5&dfs=true&facets=domain&filter=license:MIT&agg=versions:stats'
+python3 "$(dirname "$0")/check-distributed-aggs.py" \
+  http://127.0.0.1:7805 http://127.0.0.1:7804 "$FILTERED" || exit 1
+# And with an aggregation over a query that matches nothing: an empty result set
+# has to aggregate to zero on both sides rather than to an error on one.
+python3 "$(dirname "$0")/check-distributed-aggs.py" \
+  http://127.0.0.1:7805 http://127.0.0.1:7804 \
+  '/search?q=zzzznomatch&limit=5&facets=domain&agg=versions:stats&agg=versions:percentiles' || exit 1
+
 # ---- claim 2: killing a shard yields a partial answer with accounting ------
 echo "== claim 2: shard failure is reported, not hidden =="
 before=$(curl -s -m 20 "http://127.0.0.1:7805/search?q=parser&limit=10" \

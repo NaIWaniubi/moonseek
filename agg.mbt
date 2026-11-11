@@ -480,3 +480,59 @@ pub fn AggResult::to_json(self : AggResult) -> Json {
   }
   Json::object(fields)
 }
+
+///|
+/// The raw numeric values of `field` over the documents a query matched and the
+/// filters admitted — the same result set `aggregate` runs over.
+///
+/// This exists for exactly one reason: **percentiles cannot be merged from
+/// per-shard summaries.** Averaging shard medians is a different number from
+/// the median of the union, and not a small difference — with two shards it can
+/// be off by half the spread. A distributed percentile therefore has to ship
+/// the values themselves, which is why this is a separate call that a client
+/// opts into rather than part of the ordinary aggregation path.
+pub fn Index::agg_values(
+  self : Index,
+  query : String,
+  field : String,
+  filters~ : Array[(String, Array[String])] = [],
+) -> Array[Double] raise QueryError {
+  let parsed = parse_query(
+    query,
+    analyzer=self.analyzer,
+    fields=self.field_names(),
+  )
+  let scored = self.eval_sorted(parsed)
+  let matched : Array[Int32] = []
+  for i in 0..<scored.docs.length() {
+    let num = scored.docs[i]
+    if self.passes_simple_filters(num, filters) {
+      matched.push(num)
+    }
+  }
+  self.collect_numbers(field, matched)
+}
+
+///|
+/// Percentiles of an arbitrary value set, with the same interpolation the
+/// single-node aggregation uses.
+///
+/// Exposed so a coordinator can compute a percentile over the union of the
+/// shards' values and get the number a single-node index of the same corpus
+/// would have produced. It takes the values unsorted and sorts a copy, so the
+/// caller's array is not disturbed.
+pub fn percentiles_of(
+  values : Array[Double],
+  ps : Array[Double],
+) -> Array[(Double, Double)] {
+  let sorted : Array[Double] = []
+  for v in values {
+    sorted.push(v)
+  }
+  sorted.sort()
+  let out : Array[(Double, Double)] = []
+  for p in ps {
+    out.push((p, percentile_of(sorted, p)))
+  }
+  out
+}

@@ -449,17 +449,22 @@ async fn cluster_search(
   query : String,
   limit : Int32,
   stats : @moonseek.ExternalStats?,
+  filters : Array[(String, Array[String])],
 ) -> ClusterResult {
   let pool = if config.pool_per_shard < limit {
     limit
   } else {
     config.pool_per_shard
   }
-  // The query is escaped once and embedded in each request.
+  // The query is escaped once and embedded in each request. The filters travel
+  // with it: a coordinator that applied them locally would be filtering an
+  // index it does not have.
   let request = "{\"op\":\"search\",\"query\":" +
     @json.to_json(query).stringify() +
     ",\"limit\":" +
     pool.to_string() +
+    ",\"filters\":" +
+    filters_json(filters) +
     stats_clause(stats) +
     "}"
   let answers : Array[(String?, String)] = Array::make(
@@ -707,9 +712,7 @@ async fn write_group(group : ShardGroup, request : String) -> WriteAck {
     for i in 0..<members.length() {
       let index = i
       let _ = tasks.spawn(
-        async fn() {
-          answers[index] = shard_call(members[index], request)
-        },
+        async fn() { answers[index] = shard_call(members[index], request) },
         allow_failure=true,
       )
     }
@@ -731,7 +734,7 @@ async fn write_group(group : ShardGroup, request : String) -> WriteAck {
       None => failed.push(members[i])
     }
   }
-  { acked, members: members.length(), failed, reply }
+  { acked, members: members.length(), failed, reply, }
 }
 
 ///|
@@ -934,4 +937,464 @@ pub fn stats_to_json(stats : @moonseek.ExternalStats?) -> String {
       "}}"
     }
   }
+}
+
+///|
+/// One aggregation spec as the JSON the shard protocol carries.
+///
+/// The shape is the one `POST /search` already accepts in its body, so an
+/// aggregation has one vocabulary rather than two that can drift. `parse_agg_json`
+/// reads it back on both sides.
+pub fn agg_spec_to_json(spec : @moonseek.AggSpec) -> String {
+  match spec {
+    TermsAgg(field, size) =>
+      "{\"kind\":\"terms\",\"field\":" +
+      @json.to_json(field).stringify() +
+      ",\"size\":" +
+      size.to_string() +
+      "}"
+    StatsAgg(field) =>
+      "{\"kind\":\"stats\",\"field\":" + @json.to_json(field).stringify() + "}"
+    HistogramAgg(field, interval) =>
+      "{\"kind\":\"histogram\",\"field\":" +
+      @json.to_json(field).stringify() +
+      ",\"interval\":" +
+      interval.to_string() +
+      "}"
+    PercentilesAgg(field, ps) => {
+      let items : Array[String] = []
+      for p in ps {
+        items.push(p.to_string())
+      }
+      "{\"kind\":\"percentiles\",\"field\":" +
+      @json.to_json(field).stringify() +
+      ",\"percentiles\":[" +
+      items.join(",") +
+      "]}"
+    }
+  }
+}
+
+///|
+/// One shard's aggregation reply.
+struct AggReply {
+  /// Results in request order, so the merge can align them positionally with
+  /// the request's specs instead of matching on field name — two specs may
+  /// aggregate the same field in different ways.
+  results : Array[@moonseek.AggResult]
+  /// Raw values for each field a percentile was requested over.
+  values : Array[(String, Array[Double])]
+}
+
+///|
+/// The bucket a value falls in, matching the engine's rule: floor division, not
+/// truncation toward zero, so -0.5 and +0.5 are not folded into one bucket.
+/// Used to order merged histogram buckets, whose labels are formatted strings
+/// and do not sort numerically as text.
+fn bucket_index(value : Double, interval : Double) -> Int32 {
+  if interval <= 0.0 {
+    return 0
+  }
+  let q = value / interval
+  let f = if q >= 0.0 { q.floor() } else { -(-q).ceil() }
+  f.to_int()
+}
+
+///|
+/// `[[field, [value, …]], …]` — the filter form both a search request and an
+/// aggregation request carry.
+///
+/// Filters have to travel to the shards, not be applied at the coordinator: the
+/// coordinator never sees the documents, so a filter it applied locally would
+/// be applied to nothing while the shards returned everything. That is a bug
+/// that looks like a slightly larger corpus.
+pub fn filters_json(filters : Array[(String, Array[String])]) -> String {
+  let entries : Array[String] = []
+  for (field, values) in filters {
+    let items : Array[String] = []
+    for v in values {
+      items.push(@json.to_json(v).stringify())
+    }
+    entries.push(
+      "[" + @json.to_json(field).stringify() + ",[" + items.join(",") + "]]",
+    )
+  }
+  "[" + entries.join(",") + "]"
+}
+
+///|
+fn parse_stat_summary(j : Json) -> @moonseek.StatSummary? {
+  match j {
+    Object(fields) => {
+      let pick = fn(key : String) -> Double {
+        match fields.get(key) {
+          Some(Number(v, ..)) => v
+          _ => 0.0
+        }
+      }
+      let summary : @moonseek.StatSummary = {
+        count: pick("count").to_int(),
+        min: pick("min"),
+        max: pick("max"),
+        avg: pick("avg"),
+        sum: pick("sum"),
+      }
+      Some(summary)
+    }
+    _ => None
+  }
+}
+
+///|
+fn parse_agg_result(j : Json) -> @moonseek.AggResult? {
+  match j {
+    Object(fields) => {
+      let field = match fields.get("field") {
+        Some(String(s)) => s
+        _ => ""
+      }
+      let kind = match fields.get("kind") {
+        Some(String(s)) => s
+        _ => ""
+      }
+      let buckets : Array[(String, Double)] = []
+      match fields.get("buckets") {
+        Some(Array(items)) =>
+          for item in items {
+            match item {
+              Array(pair) if pair.length() == 2 =>
+                match (pair[0], pair[1]) {
+                  (String(label), Number(v, ..)) => buckets.push((label, v))
+                  _ => ()
+                }
+              _ => ()
+            }
+          }
+        _ => ()
+      }
+      let stats = match fields.get("stats") {
+        Some(s) => parse_stat_summary(s)
+        None => None
+      }
+      let percentiles : Array[(Double, Double)] = []
+      match fields.get("percentiles") {
+        Some(Array(items)) =>
+          for item in items {
+            match item {
+              Array(pair) if pair.length() == 2 =>
+                match (pair[0], pair[1]) {
+                  (Number(p, ..), Number(v, ..)) => percentiles.push((p, v))
+                  _ => ()
+                }
+              _ => ()
+            }
+          }
+        _ => ()
+      }
+      let result : @moonseek.AggResult = {
+        field,
+        kind,
+        buckets,
+        stats,
+        percentiles,
+      }
+      Some(result)
+    }
+    _ => None
+  }
+}
+
+///|
+fn parse_agg_reply(text : String) -> AggReply? {
+  let json = match parse_json_or_none(text) {
+    Some(j) => j
+    None => return None
+  }
+  match json {
+    Object(fields) => {
+      let results : Array[@moonseek.AggResult] = []
+      match fields.get("results") {
+        Some(Array(items)) =>
+          for item in items {
+            match parse_agg_result(item) {
+              Some(r) => results.push(r)
+              None => return None
+            }
+          }
+        _ => return None
+      }
+      let values : Array[(String, Array[Double])] = []
+      match fields.get("values") {
+        Some(Object(by_field)) =>
+          for (name, value) in by_field.iter() {
+            match value {
+              Array(items) => {
+                let nums : Array[Double] = []
+                for item in items {
+                  match item {
+                    Number(v, ..) => nums.push(v)
+                    _ => ()
+                  }
+                }
+                values.push((name, nums))
+              }
+              _ => ()
+            }
+          }
+        _ => ()
+      }
+      Some({ results, values, })
+    }
+    _ => None
+  }
+}
+
+///|
+/// Merge per-shard aggregations into the answer a single node would have given.
+///
+/// The rules differ per aggregation, and the differences are the whole point:
+///
+/// * **terms** — sum the counts per value, then sort and cap. Shards are asked
+///   for *every* bucket (size 0) because a value that is rank `size+1` inside
+///   one shard can be in the global top `size`; capping per shard would drop it.
+///   This is the same argument as the search pool size.
+/// * **stats** — count and sum add; min and max take the extreme; avg is
+///   recomputed from the merged sum and count. Never average the averages.
+/// * **histogram** — sum the counts per bucket and sort by the bucket's own
+///   numeric value.
+/// * **percentiles** — *cannot* be merged from summaries. The median of a union
+///   is not the average of the medians; with two equal shards those can differ
+///   by half the spread. The shards ship their raw values and the merge
+///   recomputes, using the engine's own interpolation so the number matches a
+///   single node exactly. That is the cost percentile aggregation pays for
+///   being right, and it is why it is the one aggregation that moves values
+///   rather than counts.
+fn merge_aggregates(
+  specs : Array[@moonseek.AggSpec],
+  replies : Array[AggReply],
+) -> Array[@moonseek.AggResult] {
+  let out : Array[@moonseek.AggResult] = []
+  for s in 0..<specs.length() {
+    let spec = specs[s]
+    let merged : @moonseek.AggResult = match spec {
+      TermsAgg(field, size) => {
+        let counts : Map[String, Double] = Map([])
+        for reply in replies {
+          if s >= reply.results.length() {
+            continue
+          }
+          for (label, count) in reply.results[s].buckets {
+            counts[label] = counts.get_or_default(label, 0.0) + count
+          }
+        }
+        let pairs : Array[(String, Double)] = []
+        for (label, count) in counts.iter() {
+          pairs.push((label, count))
+        }
+        pairs.sort_by(fn(a, b) {
+          let cmp = b.1.compare(a.1)
+          if cmp == 0 {
+            a.0.lexical_compare(b.0)
+          } else {
+            cmp
+          }
+        })
+        let buckets : Array[(String, Double)] = []
+        let cap = if size <= 0 || size > pairs.length() {
+          pairs.length()
+        } else {
+          size
+        }
+        for i in 0..<cap {
+          buckets.push(pairs[i])
+        }
+        { field, kind: "terms", buckets, stats: None, percentiles: [], }
+      }
+      StatsAgg(field) => {
+        let mut count = 0
+        let mut sum = 0.0
+        let mut min = 0.0
+        let mut max = 0.0
+        let mut seen = false
+        for reply in replies {
+          if s >= reply.results.length() {
+            continue
+          }
+          match reply.results[s].stats {
+            Some(st) if st.count > 0 => {
+              if !seen {
+                min = st.min
+                max = st.max
+                seen = true
+              } else {
+                if st.min < min {
+                  min = st.min
+                }
+                if st.max > max {
+                  max = st.max
+                }
+              }
+              count = count + st.count
+              sum = sum + st.sum
+            }
+            _ => ()
+          }
+        }
+        let avg = if count == 0 { 0.0 } else { sum / count.to_double() }
+        {
+          field,
+          kind: "stats",
+          buckets: [],
+          stats: Some({ count, min, max, avg, sum, }),
+          percentiles: [],
+        }
+      }
+      HistogramAgg(field, interval) => {
+        let counts : Map[String, Double] = Map([])
+        for reply in replies {
+          if s >= reply.results.length() {
+            continue
+          }
+          for (label, count) in reply.results[s].buckets {
+            counts[label] = counts.get_or_default(label, 0.0) + count
+          }
+        }
+        let pairs : Array[(Double, String, Double)] = []
+        for (label, count) in counts.iter() {
+          // Sort by the bucket's own index rather than by its label: as text,
+          // "10" does not fall between "0" and "2". Every shard used the same
+          // interval, so the label divided by the interval is the bucket index.
+          let value = @string.parse_double(label) catch { _ => 0.0 }
+          pairs.push((bucket_index(value, interval).to_double(), label, count))
+        }
+        pairs.sort_by(fn(a, b) { a.0.compare(b.0) })
+        let buckets : Array[(String, Double)] = []
+        for (_, label, count) in pairs {
+          buckets.push((label, count))
+        }
+        { field, kind: "histogram", buckets, stats: None, percentiles: [], }
+      }
+      PercentilesAgg(field, ps) => {
+        let all : Array[Double] = []
+        for reply in replies {
+          for (name, nums) in reply.values {
+            if name == field {
+              for v in nums {
+                all.push(v)
+              }
+            }
+          }
+        }
+        {
+          field,
+          kind: "percentiles",
+          buckets: [],
+          stats: None,
+          percentiles: @moonseek.percentiles_of(all, ps),
+        }
+      }
+    }
+    out.push(merged)
+  }
+  out
+}
+
+///|
+/// Scatter-gather aggregation: ask every shard for its own aggregation of the
+/// same query, then merge.
+///
+/// Returns the merged results and the addresses of shards that did not answer.
+/// A partial set is *not* silently reported as complete: a coordinator that
+/// merges two of three shards returns a smaller total that looks like a smaller
+/// corpus, which is exactly the failure mode the dashboard would not notice.
+async fn cluster_aggregate(
+  config : ClusterConfig,
+  query : String,
+  specs : Array[@moonseek.AggSpec],
+  filters : Array[(String, Array[String])],
+) -> (Array[@moonseek.AggResult], Array[String], Int32) {
+  // Ask for every terms bucket: a value that is rank size+1 inside one shard
+  // can be in the global top size, so capping per shard would drop it.
+  let shard_specs : Array[String] = []
+  for spec in specs {
+    match spec {
+      TermsAgg(field, _) =>
+        shard_specs.push(agg_spec_to_json(TermsAgg(field, 0)))
+      _ => shard_specs.push(agg_spec_to_json(spec))
+    }
+  }
+  let raw_fields : Array[String] = []
+  for spec in specs {
+    match spec {
+      PercentilesAgg(field, _) =>
+        if !raw_fields.contains(field) {
+          raw_fields.push(field)
+        }
+      _ => ()
+    }
+  }
+  let filter_json : Array[String] = []
+  for (field, values) in filters {
+    let items : Array[String] = []
+    for v in values {
+      items.push(@json.to_json(v).stringify())
+    }
+    filter_json.push(
+      "[" + @json.to_json(field).stringify() + ",[" + items.join(",") + "]]",
+    )
+  }
+  let raw_json : Array[String] = []
+  for field in raw_fields {
+    raw_json.push(@json.to_json(field).stringify())
+  }
+  let request = "{\"op\":\"agg\",\"query\":" +
+    @json.to_json(query).stringify() +
+    ",\"specs\":[" +
+    shard_specs.join(",") +
+    "],\"filters\":[" +
+    filter_json.join(",") +
+    "],\"values\":[" +
+    raw_json.join(",") +
+    "]}"
+  let answers : Array[(String?, String)] = Array::make(
+    config.shards.length(),
+    (None, ""),
+  )
+  @async.with_task_group(fn(tasks) {
+    for i in 0..<config.shards.length() {
+      let index = i
+      let shard = config.shards[index]
+      let _ = tasks.spawn(
+        async fn() {
+          let (answer, address) = call_group(shard, request)
+          answers[index] = (answer, address)
+        },
+        allow_failure=true,
+      )
+    }
+  })
+  let replies : Array[AggReply] = []
+  let failed : Array[String] = []
+  let mut answered = 0
+  for i in 0..<config.shards.length() {
+    let (answer, address) = answers[i]
+    let parsed = match answer {
+      Some(text) => parse_agg_reply(text)
+      None => None
+    }
+    match parsed {
+      Some(reply) =>
+        // A shard that answered with a different number of results than the
+        // request asked for cannot be aligned positionally, so it is treated as
+        // a failure rather than merged at the wrong offsets.
+        if reply.results.length() == specs.length() {
+          replies.push(reply)
+          answered = answered + 1
+        } else {
+          failed.push(address)
+        }
+      None => failed.push(address)
+    }
+  }
+  (merge_aggregates(specs, replies), failed, answered)
 }
