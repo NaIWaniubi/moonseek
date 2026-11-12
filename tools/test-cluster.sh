@@ -288,6 +288,105 @@ if [ -z "$still" ]; then
 fi
 echo "ok: the peer died and the survivor still answers (total $still)"
 
+# ---- claim 8: distributed hybrid retrieval equals a single node ------------
+echo "== claim 8: distributed hybrid (knn) retrieval equals a single node =="
+python3 - <<'PY' || exit 1
+import json
+import math
+import random
+import sys
+import urllib.parse
+import urllib.request
+
+DIM = 8
+N = 300
+rng = random.Random(20261112)
+
+
+def unit():
+    v = [rng.uniform(-1, 1) for _ in range(DIM)]
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / n for x in v]
+
+
+def ingest(port, docs):
+    body = "\n".join(json.dumps(d) for d in docs).encode()
+    req = urllib.request.Request(
+        "http://127.0.0.1:%d/index/bulk" % port, data=body,
+        headers={"Content-Type": "application/jsonl"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        return json.load(r)
+
+
+def hybrid(port, query, qvec):
+    params = urllib.parse.urlencode({
+        "q": query, "limit": "10",
+        "knn": "emb:" + ",".join("%.6f" % v for v in qvec),
+        "knn_k": "50", "knn_exact": "true"})
+    url = "http://127.0.0.1:%d/search?%s" % (port, params)
+    with urllib.request.urlopen(url, timeout=30) as r:
+        return json.load(r)
+
+
+# Documents share a term six ways, carry a unit vector, and each has a
+# *distinct* length (the padding count is the index). Distinct lengths keep the
+# BM25 scores apart, so the test is measuring the fan-out and not the tie-break
+# order of two equal scores on either side.
+WORDS = ["parser", "socket", "cache", "scheduler", "allocator", "tensor"]
+docs = []
+for i in range(N):
+    w = WORDS[i % len(WORDS)]
+    docs.append({
+        "id": "vec-%d" % i,
+        "fields": {
+            "title": "%s doc %d" % (w, i),
+            "desc": ("pad " * i) + "about " + w,
+        },
+        "vector": {"emb": unit()},
+    })
+# The same corpus on a single node and, through the coordinator, on the shards.
+ingest(7804, docs)
+ingest(7805, docs)
+
+QUERIES = ["parser", "socket cache", "scheduler", "tensor", "allocator"]
+failures = []
+for q in QUERIES:
+    qvec = unit()
+    coord = hybrid(7805, q, qvec)
+    single = hybrid(7804, q, qvec)
+    if coord.get("total") != single.get("total"):
+        failures.append("%s: total coord %s single %s"
+                        % (q, coord.get("total"), single.get("total")))
+        continue
+    ci = [h["id"] for h in coord["hits"]]
+    si = [h["id"] for h in single["hits"]]
+    if ci != si:
+        failures.append("%s: ids differ\n  coord  %s\n  single %s" % (q, ci, si))
+        continue
+    # The per-hit ranks must match too, not only the ids: a differing rank means
+    # the fusion read a different pair of rankings and agreed by coincidence.
+    bad = None
+    for c, s in zip(coord["hits"], single["hits"]):
+        if (c["lexical_rank"] != s["lexical_rank"]
+                or c["vector_rank"] != s["vector_rank"]):
+            bad = ("%s: %s ranks coord %s/%s single %s/%s"
+                   % (q, c["id"], c["lexical_rank"], c["vector_rank"],
+                      s["lexical_rank"], s["vector_rank"]))
+            break
+    if bad:
+        failures.append(bad)
+    else:
+        print("  ok: %-16s %d hits, total %d, ids and ranks identical"
+              % (q, len(ci), coord["total"]))
+
+if failures:
+    print("FAIL: distributed hybrid diverges from a single node")
+    for f in failures:
+        print("  " + f)
+    sys.exit(1)
+print("DISTRIBUTED HYBRID EQUALS SINGLE NODE")
+PY
+
 # ---- claim 2: killing a shard yields a partial answer with accounting ------
 echo "== claim 2: shard failure is reported, not hidden =="
 before=$(curl -s -m 20 "http://127.0.0.1:7805/search?q=parser&limit=10" \

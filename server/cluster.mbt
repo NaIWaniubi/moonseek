@@ -718,6 +718,140 @@ async fn cluster_search(
 }
 
 ///|
+/// One shard's vector answer.
+struct KnnHits {
+  hits : Array[(String, Double)]
+  ok : Bool
+}
+
+///|
+/// Parse a shard's `knn` answer into `(id, similarity)` pairs.
+fn parse_knn_hits(answer : String) -> KnnHits {
+  let json = match parse_json_or_none(answer) {
+    Some(j) => j
+    None => return { hits: [], ok: false, }
+  }
+  match json {
+    Object(fields) => {
+      let hits : Array[(String, Double)] = []
+      match fields.get("hits") {
+        Some(Array(items)) =>
+          for item in items {
+            match item {
+              Array(pair) if pair.length() == 2 =>
+                match (pair[0], pair[1]) {
+                  (String(id), Number(score, ..)) => hits.push((id, score))
+                  _ => ()
+                }
+              _ => ()
+            }
+          }
+        _ => ()
+      }
+      { hits, ok: true, }
+    }
+    _ => { hits: [], ok: false, }
+  }
+}
+
+///|
+/// The distributed vector ranking: ask every shard for its top neighbours,
+/// merge by similarity. `similarity = 1 - cosine distance` is comparable across
+/// shards — same metric, same scale — so the union of per-shard top-k contains
+/// the true global top-k, and merging by score yields exactly the ranking a
+/// single node would produce.
+///
+/// `exact` selects brute force on the shards, which makes the result
+/// byte-identical to a single-node exact query rather than merely bounded by
+/// HNSW recall. The endpoint exposes both; the equivalence test uses exact.
+async fn cluster_knn(
+  config : ClusterConfig,
+  field : String,
+  vector : Array[Double],
+  k : Int32,
+  exact : Bool,
+) -> (Array[(String, Double)], Int32, Array[String]) {
+  let coords : Array[String] = []
+  for v in vector {
+    coords.push(v.to_string())
+  }
+  let pool = if config.pool_per_shard < k { k } else { config.pool_per_shard }
+  let request = "{\"op\":\"knn\",\"field\":" +
+    @json.to_json(field).stringify() +
+    ",\"vector\":[" +
+    coords.join(",") +
+    "],\"k\":" +
+    pool.to_string() +
+    ",\"exact\":" +
+    (if exact { "true" } else { "false" }) +
+    "}"
+  let answers : Array[(String?, String)] = Array::make(
+    config.shards.length(),
+    (None, ""),
+  )
+  @async.with_task_group(fn(group) {
+    for i in 0..<config.shards.length() {
+      let index = i
+      let shard = config.shards[index]
+      let _ = group.spawn(
+        async fn() {
+          let (answer, address) = call_group(shard, request)
+          answers[index] = (answer, address)
+        },
+        allow_failure=true,
+      )
+    }
+  })
+  // A document lives on exactly one shard, but a replica answering for a dead
+  // primary can deliver the same id twice, so the merge keeps the best score
+  // rather than pushing duplicates into the fusion's rank maps.
+  let best : Map[String, Double] = Map([])
+  let failed : Array[String] = []
+  let mut ok = 0
+  for i in 0..<config.shards.length() {
+    let (answer, address) = answers[i]
+    let parsed = match answer {
+      Some(text) => parse_knn_hits(text)
+      None => { hits: [], ok: false, }
+    }
+    if parsed.ok {
+      ok += 1
+      for (id, score) in parsed.hits {
+        match best.get(id) {
+          Some(prev) => if score > prev { best.set(id, score) }
+          None => best.set(id, score)
+        }
+      }
+    } else {
+      failed.push(address)
+    }
+  }
+  let hits : Array[(String, Double)] = []
+  for (id, score) in best.iter() {
+    hits.push((id, score))
+  }
+  // Best first, ties by id: the same order the single node produces, which is
+  // what lets the coordinator's fused result equal its.
+  hits.sort_by(fn(a, b) {
+    let cmp = b.1.compare(a.1)
+    if cmp == 0 {
+      a.0.lexical_compare(b.0)
+    } else {
+      cmp
+    }
+  })
+  // Cap to k so the vector ranking has the same length the single node used:
+  // RRF reads ranks, and a longer list would hand a document a worse rank than
+  // it has locally.
+  let capped = if k > 0 && hits.length() > k {
+    hits[:k].to_owned()
+  } else {
+    hits
+  }
+  (capped, ok, failed)
+}
+
+///|
 /// Gather corpus-wide statistics from every shard: live document count, the
 /// document frequency of each query term, and the average length of each
 /// field. This is phase one of `dfs_query_then_fetch`.

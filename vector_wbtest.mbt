@@ -293,3 +293,73 @@ test "hybrid search does not lose hits when there are no vectors at all" {
     assert_true(h.lexical_rank > 0)
   }
 }
+
+///|
+test "knn_exact_ids orders by similarity with a deterministic tiebreak" {
+  let idx = vector_index(60, 12)
+  let q = vec_of(9UL, 12)
+  let ids = idx.knn_exact_ids("emb", q, 10)
+  assert_eq(ids.length(), 10)
+  for i in 1..<ids.length() {
+    // Similarity is non-increasing: higher = closer, like a BM25 score.
+    assert_true(ids[i - 1].1 >= ids[i].1)
+  }
+  // Same query, same order. The coordinator's cross-shard merge depends on it.
+  let again = idx.knn_exact_ids("emb", q, 10)
+  for i in 0..<ids.length() {
+    assert_eq(ids[i].0, again[i].0)
+  }
+  // The id-keyed view is the doc-number view with similarity in place of
+  // distance; a sign slip here would rank the farthest neighbour first.
+  let by_doc = idx.knn_exact("emb", q, 10)
+  assert_eq(by_doc.length(), ids.length())
+  for i in 0..<ids.length() {
+    assert_true((by_doc[i].1 - (1.0 - ids[i].1)).abs() < 1.0e-12)
+  }
+}
+
+///|
+/// The distributed hybrid path rebuilds the two global rankings and calls
+/// `fuse_rankings`; this pins that rebuild to the single-node answer, so a
+/// coordinator that assembles the same two lists lands on the same result by
+/// construction rather than by luck.
+test "fuse_rankings reproduces hybrid_search from the same two lists" {
+  let idx = Index::new([
+    { name: "title", weight: 3.0, },
+    { name: "body", weight: 1.0, },
+  ])
+  for i in 0..<40 {
+    let id = "d\{i}"
+    // Half the documents share a term so the lexical ranking has depth.
+    let text = if i % 2 == 0 {
+      "parser socket cache"
+    } else {
+      "scheduler build"
+    }
+    idx.add({ id, fields: [("title", text), ("body", text)], })
+    let _ = idx.set_vector(id, "emb", vec_of(i.to_uint64() + 1UL, 16))
+  }
+  let q_vec = vec_of(500UL, 16)
+  let pool = 20
+  let direct = idx.hybrid_search(
+    "socket",
+    q_vec,
+    "emb",
+    limit=10,
+    candidate_pool=pool,
+    exact=true,
+  )
+  // The coordinator's two lists: a BM25 ranking and a vector ranking.
+  let lex : Array[(String, Double)] = []
+  for h in idx.search("socket", limit=pool) {
+    lex.push((h.id, h.score))
+  }
+  let semantic = idx.knn_exact_ids("emb", q_vec, pool)
+  let rebuilt = fuse_rankings(lex, semantic, limit=10)
+  assert_eq(rebuilt.length(), direct.length())
+  for i in 0..<rebuilt.length() {
+    assert_eq(rebuilt[i].id, direct[i].id)
+    assert_eq(rebuilt[i].lexical_rank, direct[i].lexical_rank)
+    assert_eq(rebuilt[i].vector_rank, direct[i].vector_rank)
+  }
+}

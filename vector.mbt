@@ -841,6 +841,36 @@ pub fn Index::knn_exact(
 }
 
 ///|
+/// Brute-force kNN keyed by document id, with similarity (1 - distance) so a
+/// higher score is better and the ranking reads like `knn`. Ties break by id,
+/// which makes the order deterministic — the property a distributed comparison
+/// against a single node needs, since it cannot tolerate two runs of the same
+/// query disagreeing on a tie.
+pub fn Index::knn_exact_ids(
+  self : Index,
+  field : String,
+  query : Array[Double],
+  k : Int32,
+) -> Array[(String, Double)] {
+  let scored = self.knn_exact(field, query, k)
+  let out : Array[(String, Double)] = []
+  for (doc, dist) in scored {
+    out.push((self.doc_ids[doc], 1.0 - dist))
+  }
+  // `knn_exact` breaks ties by doc number; the id order can differ from that,
+  // so re-sort by similarity then id to pin a stable order across nodes.
+  out.sort_by(fn(a, b) {
+    let cmp = b.1.compare(a.1)
+    if cmp == 0 {
+      a.0.lexical_compare(b.0)
+    } else {
+      cmp
+    }
+  })
+  out
+}
+
+///|
 /// Document numbers returned by the graph search. Used by the recall
 /// measurement, which must compare doc numbers rather than id strings.
 fn Index::knn_graph_docs(
@@ -979,14 +1009,41 @@ pub fn Index::hybrid_search(
   candidate_pool~ : Int32 = 100,
   fusion~ : Fusion = Rrf,
   ef~ : Int32 = 100,
+  exact~ : Bool = false,
 ) -> Array[HybridHit] raise QueryError {
   let lexical = self.search(query, limit=candidate_pool)
-  let semantic = self.knn(vector_field, vector, candidate_pool, ef~)
+  let lex : Array[(String, Double)] = []
+  for h in lexical {
+    lex.push((h.id, h.score))
+  }
+  // `exact` swaps the graph for the brute-force reference. It exists so the
+  // distributed path can be compared to a single node without the two graphs'
+  // independent approximation error muddying the comparison.
+  let semantic = if exact {
+    self.knn_exact_ids(vector_field, vector, candidate_pool)
+  } else {
+    self.knn(vector_field, vector, candidate_pool, ef~)
+  }
+  fuse_rankings(lex, semantic, limit~, fusion~)
+}
+
+///|
+/// Fuse an already-ranked lexical list with an already-ranked semantic list.
+/// Both are `(id, score)`, best first. The single-node hybrid path and the
+/// coordinator both call this — the coordinator builds the same two global
+/// lists from per-shard answers — so there is exactly one fusion
+/// implementation and the two cannot drift apart.
+pub fn fuse_rankings(
+  lexical : Array[(String, Double)],
+  semantic : Array[(String, Double)],
+  limit~ : Int32 = 10,
+  fusion~ : Fusion = Rrf,
+) -> Array[HybridHit] {
   let lex_rank : @hashmap.HashMap[String, Int32] = @hashmap.HashMap([])
   let lex_score : @hashmap.HashMap[String, Double] = @hashmap.HashMap([])
   for i in 0..<lexical.length() {
-    lex_rank.set(lexical[i].id, i + 1)
-    lex_score.set(lexical[i].id, lexical[i].score)
+    lex_rank.set(lexical[i].0, i + 1)
+    lex_score.set(lexical[i].0, lexical[i].1)
   }
   let vec_rank : @hashmap.HashMap[String, Int32] = @hashmap.HashMap([])
   let vec_score : @hashmap.HashMap[String, Double] = @hashmap.HashMap([])

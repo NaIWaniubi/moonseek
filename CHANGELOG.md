@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.11.0 (2026-11-12)
+
+Hybrid retrieval — BM25 fused with vector kNN — now works on a coordinator.
+This closes the last item in the distributed gap list that was a *missing
+capability* rather than an operational nicety, and it is exact rather than
+"close enough": the coordinator builds the same two global rankings a single
+node would and calls the same fusion function, so there is one implementation
+and nothing to drift.
+
+### Cross-shard hybrid retrieval
+
+`GET /search?knn=emb:0.1,0.2,…&knn_k=50` on a coordinator now:
+
+* gathers corpus-wide statistics unconditionally (a hybrid query that skipped
+  `dfs` would fuse rankings from two different scales),
+* takes each shard's top-k vectors via a new `{"op":"knn"}` shard request,
+  merging them by cosine similarity — comparable across shards, so the union of
+  per-shard top-k contains the true global top-k,
+* fuses the two global lists with **`fuse_rankings`**, the very function
+  `Index::hybrid_search` calls.
+
+Measured (`tools/test-cluster.sh`, claim 8): 300 documents with vectors indexed
+once on a single node and once through the coordinator onto three shards; five
+queries with `knn_exact=true` on both sides — **ids and per-hit
+`lexical_rank`/`vector_rank` identical, 5/5**. `knn_exact` is what makes that a
+statement about the fan-out instead of about two HNSW graphs; the default graph
+path is approximate per shard, and `Index::knn_recall` measures that bound.
+
+### Fixed
+
+* **The query-string `knn` parameter was documented but never parsed.** The
+  handler only read the JSON-body form, so `GET /search?knn=…` silently behaved
+  like a plain BM25 query — the same "documented but not wired" shape as the
+  `sort` bug in 0.9.0. Both forms now work, and the body still overrides.
+* A malformed coordinate is skipped rather than folded in as zero: a bad float
+  would otherwise become a real 0.0 and quietly move the query vector.
+
+### Added
+
+* Engine: `fuse_rankings` (the fusion step, now shared), `Index::knn_exact_ids`
+  (deterministic id-keyed brute force), and an `exact` switch on
+  `Index::hybrid_search`.
+* Shard op `knn`; coordinator `cluster_knn` with the same per-shard pooling and
+  failure accounting as search.
+* Three unit tests (fusion reconstruction, exact-id ordering, shard-reply
+  parsing) and claim 8 in the cluster end-to-end test. 328 tests.
+
 ## 0.10.0 (2026-11-12)
 
 The distributed layer is finished in the sense that it can now be *operated*:

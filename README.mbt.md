@@ -1,15 +1,15 @@
 # moonseek
 
-**Search engine, service and cluster in pure MoonBit.** Inverted index, BM25, dictionary-free Chinese tokenization, fuzzy search, facets, numeric aggregations, HNSW vector search, hybrid fusion — plus an HTTP search service and a distributed coordinator with scatter-gather, globally consistent scoring and replica failover. Runs on native, WebAssembly and JavaScript.
+**A search platform in pure MoonBit: embeddable library, HTTP service, and horizontally scalable cluster.** Inverted index, BM25, dictionary-free Chinese tokenization, fuzzy search, facets, numeric aggregations, HNSW vector search, hybrid fusion — plus an HTTP search service and a distributed coordinator with scatter-gather, globally consistent scoring, replication, failover, online rebalancing, replica repair and cross-shard hybrid retrieval. Runs on native, WebAssembly and JavaScript.
 
-纯 MoonBit 实现的嵌入式全文搜索引擎：倒排索引、BM25、免词典中文分词、模糊搜索、分面过滤、服务端高亮、WAL 崩溃恢复，支持 native / WASM / JS 三端。
+纯 MoonBit 实现的搜索平台：既是嵌入式库，也是 HTTP 检索服务，还是可水平扩展的集群（一致性哈希、写入复制、在线扩容、副本自愈）。倒排索引、BM25、免词典中文分词、模糊搜索、分面过滤、服务端高亮、WAL 崩溃恢复，支持 native / WASM / JS 三端。
 
 **▶ Live demo: [naiwaniubi.github.io/moonseek](https://naiwaniubi.github.io/moonseek/)** — searches **all 3,698 packages on mooncakes.io** in your browser. No server, no network requests after load. Also: drop your own files in and index them live, and read the measured quality/ablation report.
 
 [![CI](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml/badge.svg)](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![mooncakes](https://img.shields.io/badge/mooncakes-v0.6.0-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
-[![tests](https://img.shields.io/badge/tests-259%20native%20%C2%B7%20242%20wasm--gc-3fb950.svg)](#testing)
+[![mooncakes](https://img.shields.io/badge/mooncakes-v0.11.0-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
+[![tests](https://img.shields.io/badge/tests-328%20native%20%C2%B7%20277%20wasm--gc-3fb950.svg)](#testing)
 
 ![moonseek demo](docs/demo-screenshot.png)
 
@@ -35,7 +35,7 @@ MoonBit's ecosystem has HTTP servers, crypto and database drivers — but no tan
 - **Portable**: pure MoonBit core (no FFI in the engine); native file store via `moonbitlang/async`; browser export via WasmGC + js-string builtins. **One snapshot format, two backends**: an index built by the native binary loads byte-for-byte into the browser's wasm-gc build
 - **Measured quality, not just latency**: NDCG@10 / MRR@10 / Recall@20 over 3,698 real packages with a 6-way ablation ([docs/quality.md](docs/quality.md))
 - **HTTP service**: a REST search API (`docs/api.md`) with bulk ingest, facets, aggregations, highlighting, `explain`, suggest and vector queries. The console in `console/` drives it
-- **Distributed cluster**: one binary is a node, a shard or a coordinator. **Consistent hashing** (a fourth shard moves 24% of the corpus, not 75%), **write routing with replication to every group member**, **cross-shard facets, aggregations and sorts that equal a single node**, **globally consistent scoring** (`?dfs=true` reproduced a single node's ranking exactly, 8/8 queries, zero score difference), **`POST /_rebalance` to grow without a reindex** (the plan predicted 762 moves and the executor made 762, ending at exactly the predicted distribution), **`POST /_repair` to bring a member that missed writes back in line**, replica failover, and partial answers that name the shards that failed ([docs/cluster.md](docs/cluster.md))
+- **Distributed cluster**: one binary is a node, a shard or a coordinator. **Consistent hashing** (a fourth shard moves 24% of the corpus, not 75%), **write routing with replication to every group member**, **cross-shard facets, aggregations, sorts and hybrid retrieval that equal a single node**, **globally consistent scoring** (`?dfs=true` reproduced a single node's ranking exactly, 8/8 queries, zero score difference), **`POST /_rebalance` to grow without a reindex** (the plan predicted 762 moves and the executor made 762, ending at exactly the predicted distribution), **`POST /_repair` to bring a member that missed writes back in line**, replica failover, and partial answers that name the shards that failed ([docs/cluster.md](docs/cluster.md))
 - **Vector search**: pure-MoonBit HNSW with **measured recall** against brute force (0.996@ef=32, 0.999@ef=64 on 1,000 random 32-d points), plus hybrid BM25 × kNN fusion by reciprocal rank
 - **Numeric aggregations**: terms, stats, histogram and percentiles over a result set, with numeric doc values alongside facets
 - **Document lifecycle**: add, replace (same id), delete
@@ -83,10 +83,11 @@ curl "localhost:7805/search?q=parser&dfs=true"
 
 Four end-to-end scripts run in CI: `tools/test-cluster.sh` (dfs ranking, placement
 agreement, the ring's reshuffle, distributed aggregations, sorted queries,
-failover, two coordinators), `tools/test-replication.sh` (a replicated write
-survives the loss of its primary), `tools/test-rebalance.sh` (grow 3 shards to 4
-without reindexing), and `tools/test-repair.sh` (a member that missed writes is
-brought back). To grow a running cluster:
+distributed hybrid retrieval, failover, two coordinators),
+`tools/test-replication.sh` (a replicated write survives the loss of its
+primary), `tools/test-rebalance.sh` (grow 3 shards to 4 without reindexing), and
+`tools/test-repair.sh` (a member that missed writes is brought back). To grow a
+running cluster:
 
 ```bash
 ./server.exe --addr 127.0.0.1:7805 --shards "…:7920,…:7921,…:7922,…:7923"   # after adding the new shard
@@ -95,12 +96,9 @@ curl -X POST "localhost:7805/_repair"      # after a member comes back
 ```
 
 `tools/check-cluster.mjs` runs the cluster-vs-single-node comparison and prints
-the identity and latency tables in [docs/cluster.md](docs/cluster.md). Two more
-end-to-end scripts run in CI: `tools/test-cluster.sh` (placement agreement,
-distributed aggregations, failover) and `tools/test-replication.sh` (a replicated
-write survives the loss of its primary). Ask a coordinator where a document lives
-with `GET /_placement?id=…`, and what a grow-out would cost with
-`GET /_plan?shards=4`.
+the identity and latency tables in [docs/cluster.md](docs/cluster.md). Ask a
+coordinator where a document lives with `GET /_placement?id=…`, and what a
+grow-out would cost with `GET /_plan?shards=4`.
 
 ## Quick start
 

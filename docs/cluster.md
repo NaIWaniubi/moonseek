@@ -240,8 +240,39 @@ two shards would gather statistics for different term sets and the merge would m
 two rankings. The coordinator detects this (`scoring_terms` returns None for a
 prefix) and answers with `"dfs": false` plus
 `"dfs_note": "query has shard-dependent terms (prefix); dfs not applied"` rather
-than pretending. The same applies to hybrid (`knn`) retrieval, which is not fanned
-out at all.
+than pretending. Hybrid (`knn`) retrieval has the same exposure, and handles it
+the same way: it gathers corpus-wide statistics unconditionally (see the next
+section), so a prefix query falls back to local statistics rather than mixing
+two rankings.
+
+## Hybrid retrieval across shards
+
+`GET /search?knn=field:v1,v2,…` fuses BM25 and vector kNN, and it works on a
+coordinator as well as on a single node. The coordinator builds the two *global*
+rankings and then calls the same fusion function the single node uses:
+
+* **Lexical.** Corpus-wide statistics are gathered unconditionally (one extra
+  round trip), then each shard returns its top-pool under score order. Merging by
+  score gives the global BM25 ranking.
+* **Vector.** Each shard answers `{"op":"knn"}` with its top-k as
+  `[id, similarity]`, where `similarity = 1 - cosine distance`. Cosine similarity
+  is comparable across shards, so the union of the per-shard top-k contains the
+  true global top-k, and merging by similarity gives the ranking a single node
+  would produce.
+* **Fusion.** `fuse_rankings` — the engine function `hybrid_search` itself calls
+  — applies RRF or weighted fusion to the two lists. One implementation, so the
+  distributed and single-node answers cannot drift apart.
+
+Measured (`tools/test-cluster.sh`, claim 8): 300 documents with vectors indexed
+once on a single node and once through the coordinator onto three shards, then
+five queries compared with `knn_exact=true` on both sides — **ids and per-hit
+`lexical_rank` / `vector_rank` identical, 5/5**.
+
+`knn_exact=true` is what makes that a statement about the fan-out rather than
+about two independently built HNSW graphs. The default graph path on each shard
+is approximate, so a distributed answer is bounded by per-shard HNSW recall
+exactly as a single node is bounded by its own; `Index::knn_recall` measures that
+number rather than assuming it.
 
 ## Aggregations: merged, not approximated
 
@@ -419,9 +450,12 @@ the *coordinator* down along with the shard. Scatter-gather spawns with
    document in two places during the move is returned by whichever shard is
    asked) but the request holds the coordinator for its duration. There is no
    background transfer and no resume.
-6. **`knn`/hybrid retrieval is not fanned out.** Fusing two rankings that live on
-   different shards needs per-shard vectors and a second merge, which is a
-   different design.
-7. **A rebalance is not verified against a checksum**, only by counts and by the
+6. **A rebalance is not verified against a checksum**, only by counts and by the
    plan converging to zero. A corrupted document would move intact and stay
    corrupted.
+7. **The coordinator does not re-rank the fused head.** It merges the two global
+   rankings and fuses them over the per-shard candidate pools (default 200 per
+   shard), so a document outside every shard's pool cannot enter the fused top-k
+   even if a different cut would have included it. A single node has the same
+   `candidate_pool` bound, which is why the two agree — but raising the global
+   accuracy means raising `knn_k`/`pool`, not adding a second pass.

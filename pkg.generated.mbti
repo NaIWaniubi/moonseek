@@ -19,6 +19,8 @@ pub fn damerau_levenshtein_bounded(String, String, Int32) -> Int32
 
 pub fn explain_terms(Index, Query) -> Array[String]
 
+pub fn fuse_rankings(Array[(String, Double)], Array[(String, Double)], limit? : Int32, fusion? : Fusion) -> Array[HybridHit]
+
 pub fn is_missing_number(Double) -> Bool
 
 pub fn levenshtein(String, String) -> Int32
@@ -328,10 +330,11 @@ pub fn Index::has_external_stats(Self) -> Bool
 pub fn Index::highlight(Self, String, String, String, pre_tag? : String, post_tag? : String) -> String raise QueryError
 pub fn Index::highlight_spans(Self, String, String, String) -> Array[HighlightSpan] raise QueryError
 pub fn Index::hnsw_graph(Self, String) -> HnswGraph
-pub fn Index::hybrid_search(Self, String, Array[Double], String, limit? : Int32, candidate_pool? : Int32, fusion? : Fusion, ef? : Int32) -> Array[HybridHit] raise QueryError
+pub fn Index::hybrid_search(Self, String, Array[Double], String, limit? : Int32, candidate_pool? : Int32, fusion? : Fusion, ef? : Int32, exact? : Bool) -> Array[HybridHit] raise QueryError
 pub fn Index::is_deleted(Self, Int32) -> Bool
 pub fn Index::knn(Self, String, Array[Double], Int32, ef? : Int32) -> Array[(String, Double)]
 pub fn Index::knn_exact(Self, String, Array[Double], Int32) -> Array[(Int32, Double)]
+pub fn Index::knn_exact_ids(Self, String, Array[Double], Int32) -> Array[(String, Double)]
 pub fn Index::knn_recall(Self, String, Array[Array[Double]], Int32, ef? : Int32) -> Double
 pub async fn Index::load(String) -> Self raise StoreError
 pub async fn Index::load_or_create(String, Array[FieldSchema]) -> Self raise StoreError

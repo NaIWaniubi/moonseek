@@ -181,6 +181,7 @@ by that group's share of the corpus rather than the whole one.
 | `explain` | `false` | include the per-term BM25 breakdown per hit |
 | `knn` | — | vector query: `field:k1,k2,...` (comma-separated floats) |
 | `knn_k` | 100 | how many neighbours the vector index contributes |
+| `knn_exact` | `false` | brute-force the vector side instead of the HNSW graph; makes the ranking deterministic, so a distributed answer can be compared to a single node exactly |
 | `fusion` | `rrf` | `rrf` or `weighted` |
 | `alpha` | 0.5 | weight for BM25 in `weighted` fusion |
 | `sort` | `score` | `score`, `id`, or `num:<field>` (a numeric doc value) |
@@ -283,6 +284,17 @@ would return the same set in an order that merely looks plausible. A sort by
 `id` or by a numeric field is exact in the default (local statistics) mode,
 since it never reads a score; a `score` sort is exact only with `dfs=true`, for
 the reason [docs/cluster.md](cluster.md) measures.
+
+**Hybrid retrieval works on a coordinator too.** The coordinator gathers
+corpus-wide statistics, takes each shard's `knn` top-k, merges the vector
+ranking by similarity and the lexical ranking by score, then fuses both with the
+engine's own `fuse_rankings`. Hits carry `id`, `score`, `lexical_rank` and
+`vector_rank`; the stored text is not shipped, as with any coordinator hit. With
+`knn_exact=true` on both sides the distributed result is identical to a single
+node — measured on ids and per-hit ranks, 5/5 queries in
+`tools/test-cluster.sh`. Without it each shard's HNSW graph is approximate, so
+the answer is bounded by per-shard recall exactly as a single node's is bounded
+by its own.
 
 ## `POST /index`
 

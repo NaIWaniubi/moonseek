@@ -721,3 +721,27 @@ test "the bulk request is valid JSON with the documents embedded" {
   let quoted = bulk_request(["{\"id\":\"a\\\"b\"}"])
   let _ = @json.parse(quoted) catch { _ => abort("a quoted id broke the JSON") }
 }
+
+///|
+/// The coordinator parses each shard's `knn` answer into `(id, similarity)`
+/// pairs, and a two-element `[id, score]` array is the whole contract. A
+/// malformed answer must be `ok: false` rather than an empty success, which
+/// would silently drop a shard from the vector ranking and shorten the fused
+/// result with no error anywhere.
+test "parse_knn_hits reads [id, similarity] pairs and flags malformed answers" {
+  let good = parse_knn_hits("{\"hits\":[[\"a\",0.9],[\"b\",0.5]],\"docs\":10}")
+  assert_true(good.ok)
+  assert_eq(good.hits.length(), 2)
+  assert_eq(good.hits[0].0, "a")
+  assert_true((good.hits[0].1 - 0.9).abs() < 1.0e-12)
+  // Empty but well-formed: a shard with no vectors, still an answer.
+  let empty = parse_knn_hits("{\"hits\":[],\"docs\":0}")
+  assert_true(empty.ok)
+  assert_eq(empty.hits.length(), 0)
+  // Malformed JSON is not ok; a wrong-shaped entry inside valid JSON is skipped
+  // without discarding the well-formed ones.
+  assert_true(!parse_knn_hits("not json").ok)
+  let mixed = parse_knn_hits("{\"hits\":[[\"a\",0.9],\"oops\"],\"docs\":1}")
+  assert_true(mixed.ok)
+  assert_eq(mixed.hits.length(), 1)
+}

@@ -438,6 +438,13 @@ fn shard_handle(state : ServerState, request : String) -> String {
       shard_aggregate(state, obj)
     "export" => shard_export(state, obj)
     "has" => shard_has(state, obj)
+    "knn" =>
+      // This shard's neighbours for the query vector. The coordinator merges
+      // per-shard `[id, similarity]` lists and fuses them with the global BM25
+      // ranking — the reason `similarity = 1 - distance` (see Index::knn): a
+      // higher score reads the same way a BM25 score does, so one merge rule
+      // works for both.
+      shard_knn(state, obj)
     "ids" =>
       // Every live document id this shard holds. The coordinator uses these to
       // plan a rebalance over the real keys rather than a synthetic sample.
@@ -1099,6 +1106,59 @@ fn shard_search(
 }
 
 ///|
+/// `{"op":"knn","field":F,"vector":[…],"k":K,"ef":E,"exact":bool}` — this
+/// shard's top-k neighbours for the query vector, as `[id, similarity]` pairs
+/// (similarity = 1 - cosine distance, so higher is better). `exact` swaps the
+/// HNSW graph for brute force; the coordinator's equivalence test uses it so
+/// two independently-built graphs' approximation error cannot blur the
+/// comparison.
+fn shard_knn(state : ServerState, obj : Map[String, Json]) -> String {
+  let field = match obj.get("field") {
+    Some(String(s)) => s
+    _ => return "{\"error\":\"missing field\"}"
+  }
+  let query : Array[Double] = []
+  match obj.get("vector") {
+    Some(Array(values)) =>
+      for v in values {
+        match v {
+          Number(n, ..) => query.push(n)
+          _ => ()
+        }
+      }
+    _ => ()
+  }
+  let k = match obj.get("k") {
+    Some(Number(n, ..)) => n.to_int()
+    _ => 100
+  }
+  let ef = match obj.get("ef") {
+    Some(Number(n, ..)) => n.to_int()
+    _ => 100
+  }
+  let exact = match obj.get("exact") {
+    Some(True) => true
+    _ => false
+  }
+  let hits = if exact {
+    state.index.knn_exact_ids(field, query, k)
+  } else {
+    state.index.knn(field, query, k, ef~)
+  }
+  let items : Array[String] = []
+  for (id, score) in hits {
+    items.push(
+      "[" + @json.to_json(id).stringify() + "," + score.to_string() + "]",
+    )
+  }
+  "{\"hits\":[" +
+  items.join(",") +
+  "],\"docs\":" +
+  state.index.doc_count().to_string() +
+  "}"
+}
+
+///|
 /// Corpus statistics for the named (field, term) pairs, plus per-field length
 /// sums and live counts so the coordinator can compute a global `avgdl`.
 fn shard_stats(state : ServerState, terms : Array[(String, String)]) -> String {
@@ -1672,7 +1732,7 @@ fn error_json(code : String, msg : String) -> String {
 fn health_json(state : ServerState) -> String {
   let fields : Map[String, Json] = Map([])
   fields["status"] = @json.to_json("ok")
-  fields["version"] = @json.to_json("0.10.0")
+  fields["version"] = @json.to_json("0.11.0")
   fields["uptime_ms"] = @json.to_json(
     (@env.now() - state.started_ms).to_int().to_double(),
   )
@@ -1892,6 +1952,16 @@ fn double_param(
 }
 
 ///|
+/// Parse a float, or None. `@string.parse_double` raises on bad input, and the
+/// query-string vector parser has to tell "not a number" apart from a real
+/// zero rather than folding a bad coordinate into the vector.
+fn parse_double_opt(text : String) -> Double? {
+  Some(@string.parse_double(text)) catch {
+    _ => None
+  }
+}
+
+///|
 fn bool_param(params : Array[(String, String)], key : String) -> Bool {
   let text = get_param(params, key)
   text == "true" || text == "1" || text == "yes"
@@ -1925,6 +1995,10 @@ async fn do_search(
   let knn_vector : Array[Double] = []
   let mut knn_field = ""
   let mut knn_k : Int32 = 100
+  // Force brute force on the vector side. The distributed equivalence test uses
+  // it so two independently built HNSW graphs cannot disagree by approximation
+  // error and blur the comparison.
+  let mut knn_exact = bool_param(params, "knn_exact")
   let mut fusion = @moonseek.Rrf
   let mut sort_text = get_param(params, "sort")
   let mut order_text = get_param(params, "order")
@@ -1936,6 +2010,28 @@ async fn do_search(
         facet_fields.push(name.to_owned())
       }
     }
+  }
+  // Query-string vector query: `knn=field:v1,v2,...`, with `knn_k` the pool.
+  // The documentation promised this form, and for a while only the body form
+  // was wired — the same "documented but never implemented" shape as the `sort`
+  // parameter. The body form, parsed below, still overrides it.
+  let knn_text = get_param(params, "knn")
+  if !knn_text.is_empty() {
+    match knn_text.find(":") {
+      Some(colon) => {
+        knn_field = knn_text[:colon].to_owned()
+        for piece in knn_text[colon + 1:].split(",") {
+          match parse_double_opt(piece.trim().to_owned()) {
+            Some(v) => knn_vector.push(v)
+            None => ()
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  if !knn_field.is_empty() {
+    knn_k = int_param(params, "knn_k", knn_k)
   }
   for raw in params_all(params, "filter") {
     match raw.find(":") {
@@ -2027,6 +2123,10 @@ async fn do_search(
             Some(Number(n, ..)) => knn_k = n.to_int()
             _ => ()
           }
+          match k.get("exact") {
+            Some(True) => knn_exact = true
+            _ => ()
+          }
           match k.get("vector") {
             Some(Array(values)) =>
               for v in values {
@@ -2090,12 +2190,14 @@ async fn do_search(
   }
   let started = @env.now()
   if !state.cluster.is_empty() {
-    // Cluster path. Hybrid retrieval is not fanned out: fusing two rankings
-    // that live on different shards would need per-shard vectors and a second
-    // merge, which is a different design (see docs/cluster.md).
     if !knn_vector.is_empty() && !knn_field.is_empty() {
-      raise Failure::Failure(
-        "hybrid (knn) search is not available in coordinator mode",
+      // Hybrid retrieval is fanned out. The coordinator builds the same two
+      // global rankings a single node would — BM25 with corpus-wide statistics,
+      // and the vector neighbours merged across shards — then fuses them with
+      // the engine's own `fuse_rankings`, so there is one fusion implementation
+      // and the distributed answer cannot drift from the single-node one.
+      return render_cluster_hybrid(
+        state, query, knn_vector, knn_field, knn_k, knn_exact, limit, fusion, started,
       )
     }
     // `dfs=true` asks for a ranking identical to a single-node index of the
@@ -2125,6 +2227,7 @@ async fn do_search(
       limit~,
       candidate_pool=knn_k,
       fusion~,
+      exact=knn_exact,
     )
     return render_hybrid(
       state, fused, query, highlight_field, snippet_chars, started, fusion,
@@ -2575,6 +2678,86 @@ fn render_hybrid(
       _ => ()
     }
     hits.push(json)
+  }
+  fields["hits"] = Json::array(hits)
+  fields["facets"] = Json::object(Map([]))
+  Json::object(fields).stringify()
+}
+
+///|
+/// Coordinator hybrid: build the global BM25 ranking (corpus-wide statistics,
+/// so it matches a single node) and the global vector ranking (per-shard
+/// neighbours merged by similarity), then fuse them with the engine's own
+/// `fuse_rankings` — the very function the single node uses, so the two paths
+/// share one fusion.
+///
+/// The coordinator holds no documents, so its hits carry `id`, the fused
+/// `score`, and the two ranks, exactly as its BM25 hits carry only `id` and
+/// `score`; a client that wants the stored text fetches it from the owning
+/// shard. Filters are not applied here, matching the single-node hybrid path,
+/// which does not take filters either.
+async fn render_cluster_hybrid(
+  state : ServerState,
+  query : String,
+  knn_vector : Array[Double],
+  knn_field : String,
+  candidate_pool : Int32,
+  exact : Bool,
+  limit : Int32,
+  fusion : @moonseek.Fusion,
+  started : UInt64,
+) -> String {
+  let config : ClusterConfig = {
+    shards: state.cluster,
+    pool_per_shard: state.pool_per_shard,
+    timeout_ms: 2000,
+  }
+  // The lexical ranking has to be globally comparable to be fused against the
+  // vector one, so the corpus-wide statistics are gathered unconditionally
+  // here: a hybrid query that skipped dfs would fuse two rankings from
+  // different scales and quietly return a different top-k from a single node.
+  let stats : @moonseek.ExternalStats? = match query_terms_local(state, query) {
+    Some(terms) => cluster_gather_stats(config, terms)
+    None => None
+  }
+  let lexical = cluster_search(
+    config,
+    query,
+    candidate_pool,
+    stats,
+    [],
+    @moonseek.ScoreDesc,
+  )
+  let lex : Array[(String, Double)] = []
+  for h in lexical.hits {
+    lex.push((h.id, h.score))
+  }
+  let (semantic, _, _) = cluster_knn(
+    config, knn_field, knn_vector, candidate_pool, exact,
+  )
+  let fused = @moonseek.fuse_rankings(lex, semantic, limit~, fusion~)
+  let took = (@env.now() - started).to_double()
+  let fields : Map[String, Json] = Map([])
+  fields["query"] = @json.to_json(query)
+  fields["total"] = @json.to_json(fused.length())
+  fields["took_ms"] = @json.to_json(took)
+  fields["fusion"] = @json.to_json(
+    match fusion {
+      @moonseek.Rrf => "rrf"
+      @moonseek.Weighted(_) => "weighted"
+    },
+  )
+  fields["shards_total"] = @json.to_json(lexical.shards_total)
+  fields["shards_ok"] = @json.to_json(lexical.shards_ok)
+  fields["shards_failed"] = @json.to_json(lexical.shards_failed)
+  let hits : Array[Json] = []
+  for h in fused {
+    let entry : Map[String, Json] = Map([])
+    entry["id"] = @json.to_json(h.id)
+    entry["score"] = @json.to_json(h.score)
+    entry["lexical_rank"] = @json.to_json(h.lexical_rank)
+    entry["vector_rank"] = @json.to_json(h.vector_rank)
+    hits.push(Json::object(entry))
   }
   fields["hits"] = Json::array(hits)
   fields["facets"] = Json::object(Map([]))
