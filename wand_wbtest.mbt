@@ -149,3 +149,69 @@ test "a bounded single-term search returns the same hits as the exact path" {
   }
   assert_eq(via_search, wand_exact(idx, "common", None, 10))
 }
+
+///|
+/// The exact path for an arbitrary query string.
+fn query_exact(idx : Index, query : String, limit : Int32) -> Array[Hit] {
+  let parsed = parse_query(
+    query,
+    analyzer=idx.analyzer(),
+    fields=idx.field_names(),
+  ) catch {
+    _ => abort("parse failed: " + query)
+  }
+  idx.collect_hits(idx.eval_sorted(parsed), limit)
+}
+
+///|
+/// A conjunction is walked over its shortest term and scored in query order;
+/// both have to leave the result indistinguishable from the exact evaluator,
+/// including duplicate terms (which the exact path scores twice) and a term
+/// that matches nothing (which empties the conjunction).
+test "multi-term conjunction top-k equals the exact path, bit for bit" {
+  let idx = wand_corpus(1500)
+  let queries : Array[String] = [
+    "common filler", "common t7", "common filler t7", "common t3 t9", "filler t3",
+    "t3 t9", "common common", "common notaterm", "body:common body:t7", "body:common body:filler body:t7",
+  ]
+  for q in queries {
+    for limit in [1, 5, 10, 100] {
+      let exact = query_exact(idx, q, limit)
+      let via = idx.search(q, limit~) catch { _ => ([] : Array[Hit]) }
+      assert_eq(via, exact)
+    }
+  }
+}
+
+///|
+test "a selective term drives the conjunction, not the saturated one" {
+  let idx = wand_corpus(2000)
+  // "common" is in nearly every document; "t7" is rare. The walk visits t7's
+  // postings and asks "common" about those documents, so the number of
+  // candidates scored is bounded by t7's document frequency — not "common"'s.
+  let r = idx.and_terms_topk([("common", None), ("t7", None)], 10)
+  assert_true(r.hits.length() > 0)
+  assert_true(r.scored <= idx.doc_freq("body", "t7"))
+  // And it still equals the exact answer.
+  assert_eq(r.hits, query_exact(idx, "common t7", 10))
+}
+
+///|
+test "conjunction block-max handles deleted documents" {
+  let idx = wand_corpus(900)
+  for d in 0..<900 {
+    if d % 5 == 0 {
+      let _ = idx.delete("d\{d}")
+    }
+  }
+  for limit in [1, 10, 50] {
+    for q in ["common filler", "common t3 t9"] {
+      assert_eq(
+        idx.search(q, limit~) catch {
+          _ => ([] : Array[Hit])
+        },
+        query_exact(idx, q, limit),
+      )
+    }
+  }
+}

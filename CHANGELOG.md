@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.13.0 (2026-11-12)
+
+Block-max WAND now covers **conjunctions**, and the scoring loop around it lost
+the work that was actually costing time. Together: a saturated single term is
+3–4× faster than the full scan, `search AND engine` ~1.5×, the three-term case
+~2×, and all of it bit-for-bit identical to the exact evaluation.
+
+### Conjunctions
+
+`a b` / `a AND b` no longer evaluate every term fully. The shortest term's
+posting list drives a leapfrog walk: only its documents can match, so the other
+terms are asked "are you at this document?" through forward-only cursors instead
+of being enumerated — a saturated term is never fully walked. A driver block is
+skipped when the *sum* of the terms' block maxima cannot reach the threshold, and
+scores are summed in the query's term order, which is the order the exact
+evaluator's nested intersections sum in.
+
+Measured on 20k documents (`bench/stress/main.mbt`), p50 of 200 samples:
+`search AND engine` 2.85–3.51 ms against 4.27–5.60 ms; `moonbit AND search`
+2.43–2.84 ms against 4.58–5.55 ms; `search AND engine AND index` 4.07–4.25 ms
+against 7.24–9.63 ms. Single saturated terms improved too (0.47–1.06 ms against
+2.30–2.94 ms) once the loop was cleaned up.
+
+### The scoring loop
+
+MoonBit's core library exposes only an experimental, hidden `v128_load` and no
+SIMD arithmetic intrinsics, so a hand-vectorised BM25 loop would need FFI or a
+third-party dependency — both against this project's "pure MoonBit, two
+dependencies" design. The time was somewhere else anyway: a `Hit` was being
+allocated for every candidate scored (thousands, to keep ten), the block bound
+was computed for all 1,250 blocks when postings occupied ~250 of them, and the
+single-field case built an intermediate array per block. All three are gone; the
+single-term path went from 1.29 ms to 0.47–0.83 ms on that change alone.
+
+### Fixed
+
+* **A block bound could land one ulp below a posting's score.** The bound is
+  computed from factored terms while a posting's score is one expression, and on
+  a corpus with a huge tie group sitting on the cut, the low bound skipped a
+  document that tied with the k-th best — and would have won the id tiebreak.
+  The bound is now inflated by one part in 1e12, which can only make a block
+  *less* likely to be skipped. Found by the new multi-term equality test, which
+  includes exactly that corpus.
+
+### Added
+
+* `Index::and_terms_topk`; `search` routes a bounded conjunction through it and
+  a bounded single term through `term_topk_blockmax`. Three new tests (334 -> 337).
+
 ## 0.12.0 (2026-11-12)
 
 Three additions: a **one-command demo**, a **shot list for a demo video**, and

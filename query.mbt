@@ -808,6 +808,31 @@ fn Index::phrase_count(
 }
 
 ///|
+/// Flatten a conjunction of plain terms into query order, or None when the query
+/// is anything else (a phrase, a prefix, a disjunction, a negation). The
+/// block-max conjunction path only accepts the shape it can evaluate exactly.
+fn flatten_and_terms(q : Query) -> Array[(String, String?)]? {
+  match q {
+    Term(term, field) => Some([(term, field)])
+    And(left, right) =>
+      match (flatten_and_terms(left), flatten_and_terms(right)) {
+        (Some(a), Some(b)) => {
+          let out : Array[(String, String?)] = []
+          for x in a {
+            out.push(x)
+          }
+          for x in b {
+            out.push(x)
+          }
+          Some(out)
+        }
+        _ => None
+      }
+    _ => None
+  }
+}
+
+///|
 /// Search the index. `limit` caps the number of hits (0 = unlimited).
 /// Results are sorted by descending score, ties broken by document id.
 ///
@@ -825,16 +850,22 @@ pub fn Index::search(
     analyzer=self.analyzer,
     fields=self.field_names(),
   )
-  // A single term with a bounded limit is the one shape where the top-k can be
-  // found without scoring every matching document: block-max WAND skips whole
-  // doc blocks whose highest possible score cannot reach the current k-th best.
-  // The result is identical to the exact path (see `Index::term_topk_blockmax`);
-  // every other query shape falls through to it.
+  // A bounded query that is a single term, or a conjunction of them, is where
+  // the top-k can be found without scoring every matching document: block-max
+  // WAND skips whole doc blocks whose highest possible score cannot reach the
+  // current k-th best, and a conjunction walks the shortest term's postings
+  // instead of enumerating the saturated ones. The result is identical to the
+  // exact path (see `term_topk_blockmax` / `and_terms_topk`); every other query
+  // shape falls through to it.
   if limit > 0 {
-    match parsed {
-      Term(term, field) =>
-        return self.term_topk_blockmax(field, term, limit).hits
-      _ => ()
+    match flatten_and_terms(parsed) {
+      Some(terms) =>
+        if terms.length() == 1 {
+          return self.term_topk_blockmax(terms[0].1, terms[0].0, limit).hits
+        } else if terms.length() >= 2 {
+          return self.and_terms_topk(terms, limit).hits
+        }
+      None => ()
     }
   }
   let scored = self.eval_sorted(parsed)

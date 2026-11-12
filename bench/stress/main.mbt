@@ -321,6 +321,45 @@ fn main {
     )
   }
 
+  // 2c. Block-max on a conjunction: the walk drives on the shortest term and
+  // prunes whole blocks whose summed bound cannot reach the threshold.
+  println("=== block-max WAND (conjunction, limit=10) ===")
+  let conjunctions : Array[(String, String, String)] = [
+    ("search AND engine", "search", "engine"),
+    ("moonbit AND search", "moonbit", "search"),
+    ("search AND engine AND index", "search", "engine"),
+  ]
+  for (label, a, b) in conjunctions {
+    let terms : Array[(String, String?)] = [(a, None), (b, None)]
+    if label == "search AND engine AND index" {
+      terms.push(("index", None))
+    }
+    let r = idx.and_terms_topk(terms, 10)
+    let total = r.scored + r.skipped
+    let pct = if total == 0 {
+      0.0
+    } else {
+      100.0 * r.skipped.to_double() / total.to_double()
+    }
+    let bm = p50_search(idx, label, true)
+    let ex = p50_search(idx, label, false)
+    println(
+      "  " +
+      label +
+      ": candidates scored " +
+      r.scored.to_string() +
+      ", driver postings skipped " +
+      r.skipped.to_string() +
+      " (" +
+      round3(pct).to_string() +
+      "%) · p50 wand " +
+      round3(bm).to_string() +
+      " ms vs exact " +
+      round3(ex).to_string() +
+      " ms",
+    )
+  }
+
   // 3. Fuzzy: linear scan vs cached BK-tree
   println("=== fuzzy lookup: linear vs cached BK-tree ===")
   let tree = idx.bk_tree()

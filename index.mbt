@@ -823,11 +823,18 @@ fn Bm25Context::block_bound(self : Bm25Context, s : BlockStat) -> Double {
   if !self.valid || s.max_tf <= 0 {
     return 0.0
   }
-  if s.avgdl == self.avgdl {
+  let raw = if s.avgdl == self.avgdl {
     self.idf * (self.k1 + 1.0) * self.weight * s.impact_max
   } else {
     self.score_upper(s.max_tf, s.min_dl)
   }
+  // Inflate by one part in 1e12. The bound is computed from factored terms
+  // while a posting's score is computed as one expression, so the two can
+  // disagree in the last bits — and a bound one ulp *below* a posting that ties
+  // the threshold would skip a document that can still win the id tiebreak.
+  // The inflation is far above accumulated rounding and far below any real
+  // score difference, and it can only make a block less likely to be skipped.
+  raw * (1.0 + 1.0e-12)
 }
 
 ///|

@@ -97,37 +97,63 @@ this harness measured `w4999x` and `title:rust`, neither of which occurs in the 
 so those two rows were timing an empty posting list. They now pick terms by their actual document
 frequency and print it.
 
-### Block-max top-k: skipping the postings that cannot win
+### Block-max WAND: skipping the postings that cannot win
 
-A bounded single-term query does not have to score every posting. The engine
-walks the doc-sorted posting list in blocks of 16 and, once the top-`k` set is
-full, skips a whole block when the highest score any posting in it can reach is
-strictly below the current k-th best. The bound is the block's own maximum: the
-exact maximum of `tf / (tf + k1·norm(dl))` over the block's postings, times the
-block's constant factors (`idf`, `k1+1`, the field weight). Because the skip
-uses a *strict* inequality, a posting that merely ties with the k-th best is
-still scored and can still win the id tiebreak — so the result is identical to
-the full scan, not merely close. The engine tests assert that equality bit for
-bit across a corpus, both field-scoped and across fields, with deletions.
+A bounded query that is a single term — or a conjunction of terms — does not
+have to score every matching posting.
 
-| Query (20k docs, `limit=10`) | df | Postings scored | skipped | p50 block-max | p50 exact | Speedup |
-|---|---:|---:|---:|---:|---:|---:|
-| `moonbit` | 4,114 | 1,373 | 3,473 (72%) | **1.24 ms** | 2.83 ms | 2.3× |
-| `search` | 4,021 | 1,221 | 3,457 (74%) | **1.29 ms** | 2.79 ms | 2.2× |
-| `搜索` | 4,113 | 1,221 | 3,565 (74%) | **1.29 ms** | 3.02 ms | 2.3× |
+**Single term.** The doc-sorted posting list is walked in blocks of 16 and, once
+the top-`k` set is full, a block is skipped when the highest score any posting in
+it can reach is strictly below the current k-th best. The bound is the block's
+own maximum (the `tf / (tf + k1·norm(dl))` maximum over its postings, times the
+block's constant factors), computed once per term and cached, and evaluated
+lazily — only for blocks the walk actually visits, not for all of them.
 
-The remaining ~1.3 ms is the fixed cost: building the per-block bounds (one
-pass over the blocks, not the postings) and the final top-`k`. A smaller block
-skips more (block 8 reached 85%) but pays more per block; 16 measured fastest
-overall and is what is shipped.
+**Conjunction** (`a b`, `a AND b`). The shortest term's list drives the walk:
+only its documents can match, so the other terms are asked about those documents
+instead of being enumerated — a saturated term is never fully walked. A driver
+block is skipped when the *sum* of the terms' block maxima cannot reach the
+threshold. Scores are summed in the query's term order, which is the order the
+exact evaluator's nested intersections sum in.
 
-Two honest qualifications. It applies to **single-term** queries; a multi-term
-query still evaluates its terms exactly and is where the next win would come
-from (`bench/stress/main.mbt` reports both paths side by side). And the skip
-rate is corpus-dependent: it is high when a term's per-document frequency is
-skewed — a few documents with it several times, most with it once — and low when
-the frequency is uniform, since then every block's maximum is near the
-threshold.
+In both cases the skip test is **strict**, so a document that only ties with the
+k-th best is still scored and can still win the id tiebreak — the result is
+bit-for-bit the full scan, not merely close. Six engine tests assert that
+equality (field-scoped and across fields, with deletions, including a corpus
+with one huge tie group sitting on the cut) and assert that the skipping fires,
+so it cannot silently regress to a no-op. A bounds bug this caught: the block
+bound was computed from factored terms and could land one ulp *below* a
+posting's actual score, which skipped a tie; the shipped bound is inflated by
+one part in 1e12, which can only make a block less likely to be skipped.
+
+20,000 documents, `limit=10`, p50 of 200 samples:
+
+| Query | scored | skipped | p50 block-max | p50 exact | Speedup |
+|---|---:|---:|---:|---:|---:|
+| `moonbit` (df 4,114) | 1,373 | 3,473 (72%) | **0.65–1.06 ms** | 2.50–2.94 ms | 2.8–3.8× |
+| `search` (df 4,021) | 1,221 | 3,457 (74%) | **0.47–0.83 ms** | 2.30–2.61 ms | 3.1–4.4× |
+| `搜索` (df 4,113) | 1,221 | 3,565 (74%) | **0.40–1.00 ms** | 2.31–2.83 ms | 2.8–5.7× |
+| `search AND engine` | 710 | 1,817 (72%) | **2.85–3.51 ms** | 4.27–5.60 ms | 1.5–1.6× |
+| `moonbit AND search` | 719 | 1,675 (70%) | **2.43–2.84 ms** | 4.58–5.55 ms | 1.9× |
+| `search AND engine AND index` | 256 | 853 (77%) | **4.07–4.25 ms** | 7.24–9.63 ms | 1.7–2.3× |
+
+Ranges are across repeated runs on the same machine; the harness is
+single-threaded on a shared machine, so the ratio is steadier than the absolute
+figures.
+
+**What is not done: there is no SIMD scoring loop.** MoonBit's core library
+exposes only an experimental, hidden `v128_load` and no arithmetic intrinsics, so
+a hand-vectorised BM25 loop would need FFI or a third-party dependency — both
+against this project's "pure MoonBit, two dependencies" design. What was done
+instead, and measured above: the per-candidate `Hit` allocation was removed (a
+candidate gets a `Hit` only when it can enter the top set), the block bound is
+computed lazily, and the single-field case scores without an intermediate
+buffer. Those, not arithmetic width, were where the remaining time went.
+
+Skip rates are corpus-dependent: high when a term's per-document frequency is
+skewed, low when it is uniform. Multi-term **disjunctions** (`a OR b`) still use
+the exact union; extending the walk to them is the next step.
+
 
 ### Fuzzy lookup: linear scan vs BK-tree
 
@@ -307,8 +333,11 @@ harness prints its own min/max range so a rerun is directly comparable.
 
 1. **Single-threaded by design.** No worker pool, no parallel segment search, no concurrent
    indexing. Throughput scales with one core; the machine's other cores are unused.
-2. **No SIMD.** Scoring and distance loops are scalar. A vectorized BM25 loop is a plausible 2–4×
-   on saturated terms; unmeasured, so not claimed.
+2. **No SIMD.** MoonBit core exposes only an experimental, hidden `v128_load`
+   and no arithmetic intrinsics, so the scoring loop is scalar. The scalar work
+   it leaves — per-candidate `Hit` allocation, eager block bounds, an
+   intermediate buffer per block — was removed and measured instead; see
+   *Block-max WAND* above.
 3. **`explain` re-derives scoring state.** It costs about as much as the query it explains
    (2.18 ms vs 2.14 ms), because it binary-searches posting lists instead of reusing evaluator
    arrays. Fine for a diagnostic, not for a per-hit path.
