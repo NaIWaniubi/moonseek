@@ -97,6 +97,38 @@ this harness measured `w4999x` and `title:rust`, neither of which occurs in the 
 so those two rows were timing an empty posting list. They now pick terms by their actual document
 frequency and print it.
 
+### Block-max top-k: skipping the postings that cannot win
+
+A bounded single-term query does not have to score every posting. The engine
+walks the doc-sorted posting list in blocks of 16 and, once the top-`k` set is
+full, skips a whole block when the highest score any posting in it can reach is
+strictly below the current k-th best. The bound is the block's own maximum: the
+exact maximum of `tf / (tf + k1·norm(dl))` over the block's postings, times the
+block's constant factors (`idf`, `k1+1`, the field weight). Because the skip
+uses a *strict* inequality, a posting that merely ties with the k-th best is
+still scored and can still win the id tiebreak — so the result is identical to
+the full scan, not merely close. The engine tests assert that equality bit for
+bit across a corpus, both field-scoped and across fields, with deletions.
+
+| Query (20k docs, `limit=10`) | df | Postings scored | skipped | p50 block-max | p50 exact | Speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| `moonbit` | 4,114 | 1,373 | 3,473 (72%) | **1.24 ms** | 2.83 ms | 2.3× |
+| `search` | 4,021 | 1,221 | 3,457 (74%) | **1.29 ms** | 2.79 ms | 2.2× |
+| `搜索` | 4,113 | 1,221 | 3,565 (74%) | **1.29 ms** | 3.02 ms | 2.3× |
+
+The remaining ~1.3 ms is the fixed cost: building the per-block bounds (one
+pass over the blocks, not the postings) and the final top-`k`. A smaller block
+skips more (block 8 reached 85%) but pays more per block; 16 measured fastest
+overall and is what is shipped.
+
+Two honest qualifications. It applies to **single-term** queries; a multi-term
+query still evaluates its terms exactly and is where the next win would come
+from (`bench/stress/main.mbt` reports both paths side by side). And the skip
+rate is corpus-dependent: it is high when a term's per-document frequency is
+skewed — a few documents with it several times, most with it once — and low when
+the frequency is uniform, since then every block's maximum is near the
+threshold.
+
 ### Fuzzy lookup: linear scan vs BK-tree
 
 23,782 terms, `max_distance=2`, Damerau-Levenshtein (adjacent transposition = 1 edit). Five real

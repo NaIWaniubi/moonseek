@@ -256,3 +256,147 @@ fn replace_worst(top : Array[Hit], hit : Hit) -> Unit {
   }
   top[i + 1] = hit
 }
+
+///|
+/// A block-max top-k run, with the work it did: postings scored and postings
+/// skipped because their whole block could not reach the threshold. The
+/// counters exist so the optimization is measured, not assumed.
+pub(all) struct BlockMaxResult {
+  hits : Array[Hit]
+  scored : Int32
+  skipped : Int32
+} derive(Eq, Debug)
+
+///|
+pub extend BlockMaxResult with Eq::{equal, not_equal}
+
+///|
+pub extend BlockMaxResult with @debug.Debug::{to_repr}
+
+///|
+/// Top-k for a single term by Block-Max WAND (Ding & Suel): walk the postings in
+/// doc order, and skip a whole doc block when the highest score any posting in
+/// it could reach is below the current k-th best.
+///
+/// The bound is per block of `BLOCK_SIZE` consecutive doc numbers, taken from
+/// that block's maximum term frequency and minimum document length — the score
+/// rises with frequency and falls with length, so the pair dominates every
+/// posting in the block. A block is skipped only when its bound is *strictly*
+/// below the threshold, so a document that merely ties with the current k-th
+/// best is still scored and can still win the id tiebreak: the result is
+/// identical to scoring every posting, not merely close.
+///
+/// `field` restricts the term to one field (the common case); with None the
+/// term is summed across fields, and the per-block bound is the sum of the
+/// fields' bounds, which still dominates a document's total.
+pub fn Index::term_topk_blockmax(
+  self : Index,
+  field : String?,
+  term : String,
+  limit : Int32,
+) -> BlockMaxResult {
+  let fields = match field {
+    Some(f) => [f]
+    None => self.field_names()
+  }
+  let n_docs = self.doc_ids.length()
+  if limit <= 0 || n_docs == 0 || fields.is_empty() {
+    return { hits: [], scored: 0, skipped: 0, }
+  }
+  let n_blocks = (n_docs + BLOCK_SIZE - 1) / BLOCK_SIZE
+  let any_deleted = !self.deleted.is_empty()
+  let ctxs : Array[Bm25Context] = []
+  let lists : Array[Array[Posting]] = []
+  let bounds : Array[Array[Double]] = []
+  for f in fields {
+    let ctx = self.bm25_context(f, term)
+    ctxs.push(ctx)
+    lists.push(self.postings_of(f, term))
+    let stats = self.term_block_stats(f, term)
+    let arr : Array[Double] = []
+    for s in stats {
+      arr.push(ctx.block_bound(s))
+    }
+    bounds.push(arr)
+  }
+  let curs = Array::make(fields.length(), 0)
+  let top : Array[Hit] = []
+  let mut scored = 0
+  let mut skipped = 0
+  for b in 0..<n_blocks {
+    let hi = (b + 1) * BLOCK_SIZE
+    let mut upper = 0.0
+    for i in 0..<fields.length() {
+      if b < bounds[i].length() {
+        upper += bounds[i][b]
+      }
+    }
+    // Skippable only once the top set is full: before that there is no
+    // threshold to skip against.
+    if top.length() >= limit && upper < top[top.length() - 1].score {
+      for i in 0..<fields.length() {
+        while curs[i] < lists[i].length() && lists[i][curs[i]].doc < hi {
+          skipped += 1
+          curs[i] += 1
+        }
+      }
+      continue
+    }
+    // Score the block. Contributions are gathered across fields and summed per
+    // document in sorted (doc, score) order, which is exactly the order
+    // `DocScores::from_pairs` sums in — so the accumulated score is bit-for-bit
+    // what the exact path produces, not just numerically close.
+    let contrib : Array[(Int32, Double)] = []
+    for i in 0..<fields.length() {
+      let ctx = ctxs[i]
+      if !ctx.valid {
+        while curs[i] < lists[i].length() && lists[i][curs[i]].doc < hi {
+          skipped += 1
+          curs[i] += 1
+        }
+        continue
+      }
+      while curs[i] < lists[i].length() && lists[i][curs[i]].doc < hi {
+        let posting = lists[i][curs[i]]
+        scored += 1
+        curs[i] += 1
+        if any_deleted && self.deleted.contains(posting.doc) {
+          continue
+        }
+        contrib.push((posting.doc, ctx.score(posting)))
+      }
+    }
+    if contrib.is_empty() {
+      continue
+    }
+    contrib.sort_by(fn(a, b2) {
+      let c = a.0.compare(b2.0)
+      if c == 0 {
+        a.1.compare(b2.1)
+      } else {
+        c
+      }
+    })
+    let mut i = 0
+    while i < contrib.length() {
+      let doc = contrib[i].0
+      let mut sum = 0.0
+      while i < contrib.length() && contrib[i].0 == doc {
+        sum += contrib[i].1
+        i += 1
+      }
+      let hit : Hit = { id: self.doc_ids[doc], score: sum, }
+      if top.length() < limit {
+        insert_best_first(top, hit)
+      } else {
+        let worst = top[top.length() - 1]
+        if sum > worst.score {
+          replace_worst(top, hit)
+        } else if sum == worst.score && hit_before_lex(hit, worst) {
+          replace_worst(top, hit)
+        }
+      }
+    }
+  }
+  { hits: top, scored, skipped, }
+}

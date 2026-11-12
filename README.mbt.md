@@ -8,8 +8,8 @@
 
 [![CI](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml/badge.svg)](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![mooncakes](https://img.shields.io/badge/mooncakes-v0.11.0-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
-[![tests](https://img.shields.io/badge/tests-328%20native%20%C2%B7%20277%20wasm--gc-3fb950.svg)](#testing)
+[![mooncakes](https://img.shields.io/badge/mooncakes-v0.12.0-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
+[![tests](https://img.shields.io/badge/tests-334%20native%20%C2%B7%20283%20wasm--gc-3fb950.svg)](#testing)
 
 ![moonseek demo](docs/demo-screenshot.png)
 
@@ -80,6 +80,19 @@ done
 # ?dfs=true makes the ranking identical to a single node holding the whole corpus
 curl "localhost:7805/search?q=parser&dfs=true"
 ```
+
+**4. The whole thing in one command** — a replicated cluster, the corpus loaded
+through the coordinator, and the console served:
+
+```bash
+tools/demo.sh          # starts it and prints the URLs
+tools/demo-story.sh    # or: the full story as a script (see docs/demo-video.md)
+```
+
+`tools/demo-story.sh` walks search → `dfs` → hybrid retrieval → grow 3→4 groups
+without a reindex → repair a diverged member → kill a primary (failover) → kill
+its replica (honest degradation). It is the thing to screen-record, and
+[docs/demo-video.md](docs/demo-video.md) is the shot list with narration.
 
 Four end-to-end scripts run in CI: `tools/test-cluster.sh` (dfs ranking, placement
 agreement, the ring's reshuffle, distributed aggregations, sorted queries,
@@ -182,7 +195,7 @@ median of 4 timed runs; queries are p50 of 200 samples, `limit=10`:
 | Index build | 2.73 s -> **7,320 docs/s** (median of 4) |
 | Selective term (df 285) | **0.06 ms** |
 | Field-scoped term (df 732) | 0.13 ms |
-| Saturated term (df 4,021) | 2.14 ms |
+| Saturated term (df 4,021) | 2.14 ms -> **1.29 ms** with block-max (see below) |
 | Chinese bigram (df 4,113) | 2.19 ms |
 | Boolean query | 4.50 ms |
 | Exact phrase | 6.25 ms |
@@ -191,6 +204,14 @@ median of 4 timed runs; queries are p50 of 200 samples, `limit=10`:
 | Facet filter + aggregation (3,055 matches) | 14.0 ms |
 | Fuzzy lookup, 23.8k terms | linear 37-46 ms -> **BK-tree 0.07-2.7 ms** (17-491x) |
 | Snapshot 17.6 MB: serialize / load | 0.68 s / 0.75 s |
+
+**Block-max WAND** on a bounded single-term query: the doc-sorted postings are
+walked in blocks of 16 and, once the top-`k` is full, a block is skipped when
+its highest reachable score is below the k-th best. On the saturated case above
+that skips 72–74% of the postings and roughly halves the latency; the result is
+bit-for-bit the full scan, because a block is skipped only on a *strict*
+inequality (a tie is still scored, so it can still win the id tiebreak). It
+applies to single-term queries; multi-term queries are still evaluated exactly.
 
 Browser (WasmGC, the 3,698-package registry snapshot): 206 KB binary, snapshot load ~200 ms, median
 query **0.20 ms**, p90 0.2-0.3 ms, snapshot export ~200-315 ms.

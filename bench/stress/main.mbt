@@ -102,6 +102,46 @@ fn round3(x : Double) -> Double {
 }
 
 ///|
+/// p50 latency in ms of a single-term query over 200 samples, optionally
+/// through the block-max path, warmed first so the first sample is not a
+/// cold-cache outlier.
+fn p50_search(idx : @moonseek.Index, term : String, blockmax : Bool) -> Double {
+  for _ in 0..<10 {
+    let _ = if blockmax {
+      idx.search(term, limit=10) catch {
+        _ => ([] : Array[@moonseek.Hit])
+      }
+    } else {
+      idx.search_exact(term, limit=10) catch {
+        _ => ([] : Array[@moonseek.Hit])
+      }
+    }
+  }
+  let samples : Array[Double] = []
+  let mut sink = 0
+  for _ in 0..<200 {
+    let t = @bench.monotonic_clock_start()
+    let hits = if blockmax {
+      idx.search(term, limit=10) catch {
+        _ => ([] : Array[@moonseek.Hit])
+      }
+    } else {
+      idx.search_exact(term, limit=10) catch {
+        _ => ([] : Array[@moonseek.Hit])
+      }
+    }
+    let e = @bench.monotonic_clock_end(t)
+    samples.push(us_to_ms(e))
+    sink += hits.length()
+  }
+  samples.sort()
+  if sink < 0 {
+    return 0.0
+  }
+  samples[samples.length() * 50 / 100]
+}
+
+///|
 fn main {
   let n_docs : Int32 = 20000
   let n_vocab : Int32 = 5000
@@ -247,6 +287,40 @@ fn main {
       ")",
     )
   }
+  // 2b. Block-max WAND on saturated single-term queries: how much of a posting
+  // list is skipped once the threshold is set, and what that buys against the
+  // exact full-scan path. The two return the same hits (the engine tests check
+  // that); the difference measured here is only how much work each does.
+  println("=== block-max WAND (single term, limit=10) ===")
+  for term in ["moonbit", "search", "搜索"] {
+    let r = idx.term_topk_blockmax(None, term, 10)
+    let total = r.scored + r.skipped
+    let pct = if total == 0 {
+      0.0
+    } else {
+      100.0 * r.skipped.to_double() / total.to_double()
+    }
+    let bm = p50_search(idx, term, true)
+    let ex = p50_search(idx, term, false)
+    println(
+      "  " +
+      term +
+      " (df " +
+      idx.doc_freq("body", term).to_string() +
+      "): scored " +
+      r.scored.to_string() +
+      ", skipped " +
+      r.skipped.to_string() +
+      " (" +
+      round3(pct).to_string() +
+      "%) · p50 block-max " +
+      round3(bm).to_string() +
+      " ms vs exact " +
+      round3(ex).to_string() +
+      " ms",
+    )
+  }
+
   // 3. Fuzzy: linear scan vs cached BK-tree
   println("=== fuzzy lookup: linear vs cached BK-tree ===")
   let tree = idx.bk_tree()

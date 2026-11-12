@@ -7,6 +7,8 @@ import {
 }
 
 // Values
+pub const BLOCK_SIZE : Int32 = 16
+
 pub fn build_hnsw(Array[(Int32, Array[Double])], Int32, m? : Int32, ef_construction? : Int32, seed? : UInt64) -> HnswGraph
 
 pub fn compare_numeric(Index, String, String, String, forward~ : Bool) -> Int32
@@ -130,6 +132,15 @@ pub fn BkTree::insert(Self, String) -> Unit
 pub fn BkTree::len(Self) -> Int32
 pub fn BkTree::new() -> Self
 pub fn BkTree::search(Self, String, max_distance? : Int32) -> Array[FuzzyMatch]
+
+pub(all) struct BlockMaxResult {
+  hits : Array[Hit]
+  scored : Int32
+  skipped : Int32
+} derive(Eq, @debug.Debug)
+pub fn BlockMaxResult::equal(Self, Self) -> Bool
+pub fn BlockMaxResult::not_equal(Self, Self) -> Bool
+pub fn BlockMaxResult::to_repr(Self) -> @debug.Repr
 
 pub(all) struct Bm25Params {
   k1 : Double
@@ -347,6 +358,7 @@ pub async fn Index::save(Self, String) -> Unit raise StoreError
 pub fn Index::schema(Self) -> Array[FieldSchema]
 pub fn Index::search(Self, String, limit? : Int32) -> Array[Hit] raise QueryError
 pub fn Index::search_after(Self, String, after_score~ : Double, after_id~ : String, limit? : Int32) -> Array[Hit] raise QueryError
+pub fn Index::search_exact(Self, String, limit? : Int32) -> Array[Hit] raise QueryError
 pub fn Index::search_faceted(Self, String, options? : SearchOptions) -> FacetedResult raise QueryError
 pub fn Index::search_sorted(Self, String, limit? : Int32, sort? : SortOrder) -> Array[Hit] raise QueryError
 pub fn Index::set_external_stats(Self, ExternalStats?) -> Unit
@@ -357,6 +369,7 @@ pub fn Index::slot_count(Self) -> Int32
 pub fn Index::snippet(Self, String, String, String, max_chars? : Int32, pre_tag? : String, post_tag? : String) -> String raise QueryError
 pub fn Index::suggest(Self, String, max_distance? : Int32) -> String?
 pub fn Index::term_count(Self) -> Int32
+pub fn Index::term_topk_blockmax(Self, String?, String, Int32) -> BlockMaxResult
 pub fn Index::terms_of(Self, String) -> Array[String]
 pub fn Index::to_bytes(Self) -> Bytes
 pub fn Index::tokens_in(Self, String) -> Int32

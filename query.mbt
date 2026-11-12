@@ -825,6 +825,39 @@ pub fn Index::search(
     analyzer=self.analyzer,
     fields=self.field_names(),
   )
+  // A single term with a bounded limit is the one shape where the top-k can be
+  // found without scoring every matching document: block-max WAND skips whole
+  // doc blocks whose highest possible score cannot reach the current k-th best.
+  // The result is identical to the exact path (see `Index::term_topk_blockmax`);
+  // every other query shape falls through to it.
+  if limit > 0 {
+    match parsed {
+      Term(term, field) =>
+        return self.term_topk_blockmax(field, term, limit).hits
+      _ => ()
+    }
+  }
+  let scored = self.eval_sorted(parsed)
+  self.collect_hits(scored, limit)
+}
+
+///|
+
+///|
+/// The unbounded evaluation of `search`, without the block-max top-k shortcut.
+/// `search` returns the same hits; this exists so a caller can force the
+/// full-scan path — the benchmark compares the two, and the tests check that
+/// the shortcut is indistinguishable from it.
+pub fn Index::search_exact(
+  self : Index,
+  query : String,
+  limit~ : Int32 = 10,
+) -> Array[Hit] raise QueryError {
+  let parsed = parse_query(
+    query,
+    analyzer=self.analyzer,
+    fields=self.field_names(),
+  )
   let scored = self.eval_sorted(parsed)
   self.collect_hits(scored, limit)
 }

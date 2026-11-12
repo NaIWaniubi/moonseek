@@ -111,6 +111,12 @@ pub struct Index {
   /// lazily from `stats` and invalidated whenever documents or tombstones
   /// change. Removes the last per-posting hash probe from BM25 scoring.
   priv lengths_dense : @hashmap.HashMap[String, Array[Int32]]
+  /// Per-(field, term) doc-block statistics for block-max top-k: for each block
+  /// of `BLOCK_SIZE` consecutive internal doc numbers, the highest BM25 impact
+  /// any posting in it reaches and the raw values needed to recompute a safe
+  /// bound when the scoring context changes. Built lazily, cleared on mutation
+  /// like the other caches.
+  priv block_stats : @hashmap.HashMap[(String, String), Array[BlockStat]]
   /// Cached BK-trees for fuzzy lookup, keyed by field name ("*" = all fields).
   /// Cleared on add. Building one tree per query was the dominant cost of
   /// fuzzy search on large vocabularies.
@@ -243,6 +249,7 @@ pub fn Index::new(
     scratch_terms: [],
     scratch_poses: [],
     lengths_dense: @hashmap.HashMap([]),
+    block_stats: @hashmap.HashMap([]),
     bk_trees: @hashmap.HashMap([]),
     nums: @hashmap.HashMap([]),
     num_cols: @hashmap.HashMap([]),
@@ -292,6 +299,9 @@ pub fn Index::add(self : Index, doc : Document) -> Unit {
   }
   if !self.lengths_dense.is_empty() {
     self.lengths_dense.clear()
+  }
+  if !self.block_stats.is_empty() {
+    self.block_stats.clear()
   }
   if !self.bk_trees.is_empty() {
     self.bk_trees.clear()
@@ -370,6 +380,9 @@ fn Index::delete_by_num(self : Index, num : Int32) -> Unit {
   self.deleted.set(num, ())
   if !self.lengths_dense.is_empty() {
     self.lengths_dense.clear()
+  }
+  if !self.block_stats.is_empty() {
+    self.block_stats.clear()
   }
   self.stored.remove(num)
   // Facet values of a deleted document are dead state: keeping them
@@ -547,6 +560,97 @@ pub fn Index::terms_of(self : Index, field : String) -> Array[String] {
 }
 
 ///|
+/// Documents per block for the block-max top-k walk. 64 is the usual choice:
+/// large enough that one extra scored posting costs little, small enough that a
+/// block's maximum stays tight and skip decisions land often.
+pub const BLOCK_SIZE : Int32 = 16
+
+///|
+/// One block's bound on the BM25 score of any posting in it.
+///
+/// `impact_max` is the maximum of the score's context-free part,
+/// `tf / (tf + k1 * norm(dl))`, over the block's postings — computed once, with
+/// the average document length `avgdl` recorded alongside. It is the *exact*
+/// block maximum when the scoring context has the same average length, because
+/// the rest of the score (`idf`, `(k1+1)`, the field weight) is constant across
+/// the block. When the context differs — the `dfs` path installs corpus-wide
+/// statistics — the bound is recomputed from `max_tf` and `min_dl` instead,
+/// which dominates the block regardless of the average length.
+priv struct BlockStat {
+  max_tf : Int32
+  min_dl : Int32
+  impact_max : Double
+  avgdl : Double
+}
+
+///|
+/// Per-(field, term) block statistics: one `BlockStat` per block of
+/// `BLOCK_SIZE` consecutive internal doc numbers. A block with no posting
+/// stores zeros, whose bound is zero and which is therefore always skippable.
+/// Computed once per term and cached; cleared on mutation with the other caches.
+fn Index::term_block_stats(
+  self : Index,
+  field : String,
+  term : String,
+) -> Array[BlockStat] {
+  match self.block_stats.get((field, term)) {
+    Some(cached) => cached
+    None => {
+      let n_docs = self.doc_ids.length()
+      let n_blocks = (n_docs + BLOCK_SIZE - 1) / BLOCK_SIZE
+      let avgdl = self.avg_field_length(field)
+      let k1 = self.bm25.k1
+      let b = self.bm25.b
+      // Start above any real length so the minimum is taken correctly; a whole
+      // int is safe because lengths are token counts, far below it.
+      let max_tf = Array::make(n_blocks, 0)
+      let min_dl = Array::make(n_blocks, 2147483647)
+      let impact = Array::make(n_blocks, 0.0)
+      let lengths = self.field_lengths(field)
+      for posting in self.postings_of(field, term) {
+        let blk = posting.doc / BLOCK_SIZE
+        if blk < 0 || blk >= n_blocks {
+          continue
+        }
+        if posting.freq > max_tf[blk] {
+          max_tf[blk] = posting.freq
+        }
+        let dl = if posting.doc < lengths.length() {
+          lengths[posting.doc]
+        } else {
+          0
+        }
+        if dl < min_dl[blk] {
+          min_dl[blk] = dl
+        }
+        let norm = if avgdl == 0.0 {
+          1.0
+        } else {
+          1.0 - b + b * dl.to_double() / avgdl
+        }
+        let tf = posting.freq.to_double()
+        let imp = tf / (tf + k1 * norm)
+        if imp > impact[blk] {
+          impact[blk] = imp
+        }
+      }
+      let out : Array[BlockStat] = []
+      for blk in 0..<n_blocks {
+        let lo = if min_dl[blk] == 2147483647 { 0 } else { min_dl[blk] }
+        out.push({
+          max_tf: max_tf[blk],
+          min_dl: lo,
+          impact_max: impact[blk],
+          avgdl,
+        })
+      }
+      self.block_stats.set((field, term), out)
+      out
+    }
+  }
+}
+
+///|
 /// Dense per-field token counts indexed by internal doc number (0 when the
 /// document has no content in that field). Cached until the next mutation.
 /// Replaces the per-posting `HashMap` probe on the BM25 scoring path.
@@ -681,6 +785,49 @@ fn Bm25Context::score(self : Bm25Context, posting : Posting) -> Double {
   }
   let tf = posting.freq.to_double()
   self.idf * (tf * (self.k1 + 1.0)) / (tf + self.k1 * norm) * self.weight
+}
+
+///|
+/// The block-max bound: the highest score any posting in a block can reach,
+/// given the block's maximum term frequency and minimum document length. Both
+/// together dominate every posting in the block, because the score increases
+/// with frequency and decreases with length — so the true maximum is no greater
+/// than this, and a block whose bound is below the threshold cannot contain a
+/// winner. `max_tf <= 0` means the block has no posting of this term, whose
+/// bound is zero.
+fn Bm25Context::score_upper(
+  self : Bm25Context,
+  max_tf : Int32,
+  min_dl : Int32,
+) -> Double {
+  if !self.valid || max_tf <= 0 {
+    return 0.0
+  }
+  let norm = if self.avgdl == 0.0 {
+    1.0
+  } else {
+    1.0 - self.b + self.b * min_dl.to_double() / self.avgdl
+  }
+  let tf = max_tf.to_double()
+  self.idf * (tf * (self.k1 + 1.0)) / (tf + self.k1 * norm) * self.weight
+}
+
+///|
+/// The block-max bound for one block: the highest score any posting in it can
+/// reach. Uses the tight `impact_max` when the scoring context has the same
+/// average length the block was built with — the common, local-statistics case,
+/// where `impact_max` times the block's constant factors *is* the block's exact
+/// maximum — and the looser `(max_tf, min_dl)` bound otherwise, which dominates
+/// the block for any average length.
+fn Bm25Context::block_bound(self : Bm25Context, s : BlockStat) -> Double {
+  if !self.valid || s.max_tf <= 0 {
+    return 0.0
+  }
+  if s.avgdl == self.avgdl {
+    self.idf * (self.k1 + 1.0) * self.weight * s.impact_max
+  } else {
+    self.score_upper(s.max_tf, s.min_dl)
+  }
 }
 
 ///|

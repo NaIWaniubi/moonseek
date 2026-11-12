@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.12.0 (2026-11-12)
+
+Three additions: a **one-command demo**, a **shot list for a demo video**, and
+**Block-Max WAND** for saturated single-term queries — the last documented
+`O(df)` cost, now measured at ~2.3× on the saturated case.
+
+### Block-max top-k
+
+`Index::search` on a bounded single-term query no longer scores every posting.
+The doc-sorted list is walked in blocks of 16, and once the top-`k` set is full
+a block is skipped when the highest score any posting in it can reach is
+**strictly** below the current k-th best. The bound is the block's exact
+maximum, computed once and cached, and the strict inequality means a posting
+that only ties is still scored and can still win the id tiebreak — so the result
+is bit-for-bit the full scan. Six engine tests assert that equality over a
+corpus, field-scoped and across fields, with deletions, and assert that the
+skipping actually fires so it cannot silently regress to a no-op.
+
+Measured on 20k documents (`bench/stress/main.mbt`): 72–74% of postings skipped,
+p50 **1.24–1.29 ms** against 2.79–3.02 ms for the exact path. It applies to
+single-term queries; multi-term queries still evaluate exactly, and the skip
+rate is corpus-dependent — both stated in `docs/benchmark.md`.
+
+### One-command demo
+
+* `tools/demo.sh` builds if needed, starts a replicated cluster (primary +
+  replica per group), ingests the corpus through the coordinator, and serves the
+  console — then prints the URLs and waits.
+* `tools/demo-story.sh` is the whole story as a script: start, load, search,
+  `dfs`, hybrid retrieval, grow 3→4 groups without a reindex, repair a diverged
+  member, kill a primary (invisible failover), kill its replica (honest
+  degradation). It is the thing to screen-record, and `docs/demo-video.md` is
+  the shot list with narration in both languages.
+
+### Added
+
+* Engine: `Index::term_topk_blockmax`, `Index::search_exact` (the full-scan path
+  the shortcut is measured and tested against), `BLOCK_SIZE`, per-term block
+  statistics. 334 tests.
+
 ## 0.11.0 (2026-11-12)
 
 Hybrid retrieval — BM25 fused with vector kNN — now works on a coordinator.

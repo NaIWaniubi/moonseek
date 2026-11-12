@@ -1732,7 +1732,7 @@ fn error_json(code : String, msg : String) -> String {
 fn health_json(state : ServerState) -> String {
   let fields : Map[String, Json] = Map([])
   fields["status"] = @json.to_json("ok")
-  fields["version"] = @json.to_json("0.11.0")
+  fields["version"] = @json.to_json("0.12.0")
   fields["uptime_ms"] = @json.to_json(
     (@env.now() - state.started_ms).to_int().to_double(),
   )
