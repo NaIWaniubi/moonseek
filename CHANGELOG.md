@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.14.0 (2026-11-12)
+
+Block-max WAND now covers **disjunctions** — where it is a measured win on the
+shape it suits and is gated off where it is not — and vector search keeps its
+points in a cached buffer instead of rebuilding them on every query.
+
+### Disjunction block-max WAND
+
+`a OR b` previously scored every posting of every term. `Index::or_terms_topk`
+walks the union in blocks of 16 with the same bound test the single-term and
+conjunction paths use: a block is skipped, without scoring its documents, when
+the terms' summed block maxima cannot reach the current k-th best. Documents hit
+by several terms are summed once, in query order, so the result equals the exact
+union bit-for-bit (asserted over 8 queries × 4 limits, plus deletions).
+
+The walk is not unconditionally faster, so `search` takes it only when
+`Index::or_walk_pays` says the union has something to skip. Measured on 20k
+documents at `--release`, min of 200 interleaved samples:
+
+| union | walk | exact merge |
+|---|---:|---:|
+| one dense (df 4021) + four rare (df 285) | **2.38 ms** | 3.64 ms |
+| one dense + eight rare | **3.96 ms** | 4.51 ms |
+| two comparably dense | 4.14 ms | 4.64 ms |
+| three comparably dense | 11.59 ms | **10.50 ms** |
+| eight rare, no dense operand | 1.09 ms | **0.61 ms** |
+
+One dense operand keeps the summed bound above the threshold everywhere, so
+nothing is skipped and the per-document cursor bookkeeping is pure loss; a union
+with *no* dense operand is short enough that the plain merge is already cheapest.
+The gate asks for an operand at least ten times rarer than the densest, which
+separates all five rows, and the tests pin both sides of it. It is a performance
+choice only: the paths return identical results.
+
+### Cached vector points
+
+`HnswPoints` was rebuilt on every kNN query, so a search paid a full 5,000-vector
+flatten before touching the graph. The flattened buffer is now cached per field
+(a `points_cache` invalidated by `set_vector`, like the block stats and the
+HNSW graph) and `knn_exact` iterates it directly. The rebuild — 4.29 ms on the
+5,000 × 64 index — is paid once per mutation instead of once per query.
+
+### Changed
+
+* `Index::or_walk_pays` and `Index::or_terms_topk` are public;
+  `Index::knn_exact_ids` returns similarity-sorted `(id, score)` pairs.
+* The stress bench measures two query variants **interleaved** (both timed within
+  each sample) and reports the **minimum** sample next to p50, so a contended
+  machine cannot dress noise up as a speed-up. Its disjunction rows compare the
+  walk against the exact merge directly and print which the gate selects.
+
 ## 0.13.0 (2026-11-12)
 
 Block-max WAND now covers **conjunctions**, and the scoring loop around it lost

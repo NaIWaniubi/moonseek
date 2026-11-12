@@ -13,6 +13,8 @@ pub fn build_hnsw(Array[(Int32, Array[Double])], Int32, m? : Int32, ef_construct
 
 pub fn compare_numeric(Index, String, String, String, forward~ : Bool) -> Int32
 
+pub fn cosine_distance(Array[Double], Array[Double]) -> Double
+
 pub fn crc32(Bytes) -> UInt32
 
 pub fn damerau_levenshtein(String, String) -> Int32
@@ -354,6 +356,8 @@ pub fn Index::new(Array[FieldSchema], analyzer? : Analyzer, bm25? : Bm25Params) 
 pub fn Index::num_column(Self, String) -> Array[Double]
 pub fn Index::num_of(Self, String, String) -> Double?
 pub fn Index::numeric_fields(Self) -> Array[String]
+pub fn Index::or_terms_topk(Self, Array[(String, String?)], Int32) -> BlockMaxResult
+pub fn Index::or_walk_pays(Self, Array[(String, String?)]) -> Bool
 pub fn Index::postings_of(Self, String, String) -> Array[Posting]
 pub async fn Index::save(Self, String) -> Unit raise StoreError
 pub fn Index::schema(Self) -> Array[FieldSchema]

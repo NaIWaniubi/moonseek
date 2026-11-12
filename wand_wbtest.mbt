@@ -215,3 +215,90 @@ test "conjunction block-max handles deleted documents" {
     }
   }
 }
+
+///|
+/// A disjunction is walked as a union with block skipping; like the
+/// conjunction, the result has to be indistinguishable from the exact
+/// evaluator — including duplicate terms (scored twice), a term that matches
+/// nothing (an empty operand of a union contributes nothing) and a mixed
+/// field-scoped operand.
+test "multi-term disjunction top-k equals the exact path, bit for bit" {
+  let idx = wand_corpus(1500)
+  let queries : Array[String] = [
+    "common OR t7", "t3 OR t9", "filler OR t3 OR t9", "common OR common", "common OR notaterm",
+    "notaterm OR alsomissing", "body:common OR body:t7", "common OR body:filler OR t3",
+  ]
+  for q in queries {
+    for limit in [1, 5, 10, 100] {
+      let exact = query_exact(idx, q, limit)
+      let via = idx.search(q, limit~) catch { _ => ([] : Array[Hit]) }
+      assert_eq(via, exact)
+      // And the walk itself, called directly, agrees — so the equality does not
+      // depend on the routing decision.
+      match
+        flatten_or_terms(
+          parse_query(q, analyzer=idx.analyzer, fields=idx.field_names()),
+        ) {
+        Some(terms) => assert_eq(idx.or_terms_topk(terms, limit).hits, exact)
+        None => ()
+      }
+    }
+  }
+}
+
+///|
+test "disjunction block-max fires on a saturated operand" {
+  let idx = wand_corpus(2000)
+  // "common" is in nearly every document; the union is dominated by it, so once
+  // the threshold is set most blocks cannot contribute.
+  let r = idx.or_terms_topk([("common", None), ("t7", None)], 10)
+  assert_true(r.hits.length() > 0)
+  assert_true(r.skipped > 0)
+  assert_eq(r.hits, query_exact(idx, "common OR t7", 10))
+}
+
+///|
+test "disjunction block-max handles deleted documents" {
+  let idx = wand_corpus(900)
+  for d in 0..<900 {
+    if d % 4 == 0 {
+      let _ = idx.delete("d\{d}")
+    }
+  }
+  for limit in [1, 10, 50] {
+    for q in ["common OR t7", "t3 OR t9 OR filler"] {
+      assert_eq(
+        idx.search(q, limit~) catch {
+          _ => ([] : Array[Hit])
+        },
+        query_exact(idx, q, limit),
+      )
+    }
+  }
+}
+
+///|
+/// The disjunction walk pays only when the union has a dense operand to set the
+/// threshold *and* one far rarer to fall below it, so `search` opts into it per
+/// query. This pins the gate against the five shapes the benchmark measured:
+/// two dense operands, three dense, one dense plus rare, dense plus many rare,
+/// and all-rare.
+test "the disjunction gate needs a dense operand and a much rarer one" {
+  let idx = wand_corpus(1500)
+  // `common`/`filler` hit every document: no spread, so nothing to skip.
+  assert_true(!idx.or_walk_pays([("common", None), ("filler", None)]))
+  // `t7` (114 of 1500) is an order of magnitude rarer than `common` (1500): a
+  // dense term sets the threshold and a sparse one creates the gap.
+  assert_true(idx.or_walk_pays([("common", None), ("t7", None)]))
+  // Two tail terms are comparably sparse and there is no dense operand: the
+  // union is short and the merge wins.
+  assert_true(!idx.or_walk_pays([("t3", None), ("t7", None)]))
+  // And the gated-out shape still produces the right answer: it routes through
+  // the evaluator, which the equality tests cover.
+  assert_eq(
+    idx.search("common OR filler", limit=10) catch {
+      _ => ([] : Array[Hit])
+    },
+    query_exact(idx, "common OR filler", 10),
+  )
+}

@@ -8,8 +8,8 @@
 
 [![CI](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml/badge.svg)](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![mooncakes](https://img.shields.io/badge/mooncakes-v0.13.0-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
-[![tests](https://img.shields.io/badge/tests-337%20native%20%C2%B7%20286%20wasm--gc-3fb950.svg)](#testing)
+[![mooncakes](https://img.shields.io/badge/mooncakes-v0.14.0-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
+[![tests](https://img.shields.io/badge/tests-341%20native%20%C2%B7%20290%20wasm--gc-3fb950.svg)](#testing)
 
 ![moonseek demo](docs/demo-screenshot.png)
 
@@ -205,17 +205,21 @@ median of 4 timed runs; queries are p50 of 200 samples, `limit=10`:
 | Fuzzy lookup, 23.8k terms | linear 37-46 ms -> **BK-tree 0.07-2.7 ms** (17-491x) |
 | Snapshot 17.6 MB: serialize / load | 0.68 s / 0.75 s |
 
-**Block-max WAND** on a bounded query that is a single term or a conjunction:
-the doc-sorted postings are walked in blocks of 16 and, once the top-`k` is full,
-a block is skipped when its highest reachable score is below the k-th best. A
-conjunction additionally drives on its **shortest** term, so a saturated term is
-never enumerated. On the corpus above this skips 70–74% of the postings: a
-single saturated term drops from ~2.5 ms to **0.47–0.83 ms (3–4×)** and
-`search AND engine` from ~4.3 ms to **2.9–3.5 ms**. The result is bit-for-bit
-the full scan, because a block is skipped only on a *strict* inequality (a tie is
+**Block-max WAND** on a bounded query that is a single term, a conjunction, or a
+disjunction with a wide document-frequency spread: the doc-sorted postings are
+walked in blocks of 16 and, once the top-`k` is full, a block is skipped when its
+highest reachable score is below the k-th best. A conjunction additionally drives
+on its **shortest** term, so a saturated term is never enumerated. On the corpus
+above this skips 70–74% of the postings: a single saturated term drops from
+~2.0 ms to **0.92 ms (2.2×)** and `search AND engine` from ~4.3 ms to **2.7 ms**.
+A disjunction takes the walk only when a dense operand sets the threshold and a
+much rarer one creates the gap — `search OR <4 rare terms>` is then 29% faster
+and skips 75% of the postings — because otherwise the plain merge wins; the gate
+(`or_walk_pays`), its measurements and the tests pinning both sides are in
+[docs/benchmark.md](docs/benchmark.md). Everywhere the result is bit-for-bit the
+full scan, because a block is skipped only on a *strict* inequality (a tie is
 still scored, so it can still win the id tiebreak) and the tests assert the
-equality, including a corpus with a huge tie group on the cut. Disjunctions
-(`a OR b`) still use the exact union.
+equality, including a corpus with a huge tie group on the cut.
 
 Browser (WasmGC, the 3,698-package registry snapshot): 206 KB binary, snapshot load ~200 ms, median
 query **0.20 ms**, p90 0.2-0.3 ms, snapshot export ~200-315 ms.

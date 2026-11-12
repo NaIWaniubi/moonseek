@@ -294,7 +294,7 @@ pub extend BlockMaxResult with @debug.Debug::{to_repr}
 ///|
 /// One term of a conjunction, prepared for the block-max walk: its posting list
 /// per field, the BM25 context for each, and a cursor per field.
-priv struct AndTerm {
+priv struct TermCursor {
   name : String
   fields : Array[String]
   ctxs : Array[Bm25Context]
@@ -303,11 +303,11 @@ priv struct AndTerm {
 }
 
 ///|
-fn Index::and_term_prepare(
+fn Index::term_cursor_prepare(
   self : Index,
   term : String,
   field : String?,
-) -> AndTerm {
+) -> TermCursor {
   let fields = match field {
     Some(f) => [f]
     None => self.field_names()
@@ -325,7 +325,7 @@ fn Index::and_term_prepare(
 /// True when the term can match nothing: every field it would be read in has
 /// either no postings or no usable statistics. The exact evaluator produces an
 /// empty result in that case, so a conjunction containing such a term is empty.
-fn AndTerm::is_empty(self : AndTerm) -> Bool {
+fn TermCursor::is_empty(self : TermCursor) -> Bool {
   for i in 0..<self.fields.length() {
     if self.ctxs[i].valid && !self.lists[i].is_empty() {
       return false
@@ -337,7 +337,7 @@ fn AndTerm::is_empty(self : AndTerm) -> Bool {
 ///|
 /// Number of postings over all fields. Only used to choose the driver: the term
 /// with the fewest, so the walk crosses the shortest list.
-fn AndTerm::posting_count(self : AndTerm) -> Int32 {
+fn TermCursor::posting_count(self : TermCursor) -> Int32 {
   let mut n = 0
   for list in self.lists {
     n += list.length()
@@ -347,7 +347,7 @@ fn AndTerm::posting_count(self : AndTerm) -> Int32 {
 
 ///|
 /// The smallest document number any of this term's field cursors is sitting on.
-fn AndTerm::peek(self : AndTerm) -> Int32? {
+fn TermCursor::peek(self : TermCursor) -> Int32? {
   let mut best : Int32? = None
   for i in 0..<self.lists.length() {
     if self.curs[i] < self.lists[i].length() {
@@ -364,7 +364,7 @@ fn AndTerm::peek(self : AndTerm) -> Int32? {
 ///|
 /// Move every field cursor past the document `peek` just returned, dropping
 /// duplicate occurrences of the same document across fields.
-fn AndTerm::advance(self : AndTerm) -> Unit {
+fn TermCursor::advance(self : TermCursor) -> Unit {
   let d = match self.peek() {
     Some(d) => d
     None => return
@@ -385,7 +385,22 @@ fn AndTerm::advance(self : AndTerm) -> Unit {
 /// A term read across several fields is the sum of its per-field scores, summed
 /// in ascending-score order — exactly the order `DocScores::from_pairs` sums in,
 /// so the value is bit-for-bit what the exact evaluator produces.
-fn AndTerm::score_at(self : AndTerm, doc : Int32) -> (Bool, Double) {
+fn TermCursor::score_at(self : TermCursor, doc : Int32) -> (Bool, Double) {
+  if self.lists.length() == 1 {
+    // One field is the common case and needs neither the contribution array nor
+    // the sort: a union walks a document per term, and allocating per document
+    // was the dominant cost of the disjunction walk.
+    let list = self.lists[0]
+    let mut c = self.curs[0]
+    while c < list.length() && list[c].doc < doc {
+      c += 1
+    }
+    self.curs[0] = c
+    if c < list.length() && list[c].doc == doc && self.ctxs[0].valid {
+      return (true, self.ctxs[0].score(list[c]))
+    }
+    return (false, 0.0)
+  }
   let contribs : Array[Double] = []
   for i in 0..<self.lists.length() {
     let list = self.lists[i]
@@ -407,6 +422,54 @@ fn AndTerm::score_at(self : AndTerm, doc : Int32) -> (Bool, Double) {
     sum += v
   }
   (true, sum)
+}
+
+///|
+/// True when any of this term's field cursors is sitting on `doc`. Used by the
+/// disjunction walk to step exactly the cursors that were visited — stepping one
+/// that was not would skip a document it still holds.
+fn TermCursor::at(self : TermCursor, doc : Int32) -> Bool {
+  for i in 0..<self.lists.length() {
+    if self.curs[i] < self.lists[i].length() &&
+      self.lists[i][self.curs[i]].doc == doc {
+      return true
+    }
+  }
+  false
+}
+
+///|
+/// Move every field cursor past `hi`, returning how many postings were passed
+/// without being scored. This is the block skip: the postings are stepped over,
+/// not examined for a score.
+fn TermCursor::advance_before(self : TermCursor, hi : Int32) -> Int32 {
+  let mut n = 0
+  for i in 0..<self.lists.length() {
+    while self.curs[i] < self.lists[i].length() &&
+          self.lists[i][self.curs[i]].doc < hi {
+      self.curs[i] += 1
+      n += 1
+    }
+  }
+  n
+}
+
+///|
+/// The smallest document number any cursor is sitting on, or None when every
+/// list is exhausted.
+fn min_peek(cursors : Array[TermCursor]) -> Int32? {
+  let mut best : Int32? = None
+  for t in cursors {
+    match t.peek() {
+      Some(d) =>
+        match best {
+          Some(b) => if d < b { best = Some(d) }
+          None => best = Some(d)
+        }
+      None => ()
+    }
+  }
+  best
 }
 
 ///|
@@ -437,9 +500,9 @@ pub fn Index::and_terms_topk(
   if limit <= 0 || n_docs == 0 || terms.is_empty() {
     return { hits: [], scored: 0, skipped: 0, }
   }
-  let prepared : Array[AndTerm] = []
+  let prepared : Array[TermCursor] = []
   for pair in terms {
-    prepared.push(self.and_term_prepare(pair.0, pair.1))
+    prepared.push(self.term_cursor_prepare(pair.0, pair.1))
   }
   for t in prepared {
     if t.is_empty() {
@@ -531,6 +594,175 @@ pub fn Index::and_terms_topk(
       total += s
     }
     prepared[driver].advance()
+    if !present {
+      continue
+    }
+    if any_deleted && self.deleted.contains(d) {
+      continue
+    }
+    scored += 1
+    offer(top, total, self.doc_ids[d], limit)
+  }
+  { hits: top, scored, skipped, }
+}
+
+///|
+/// Whether a disjunction should take the block-max walk instead of the exact
+/// merge. A block is skipped when the terms' summed block maxima cannot reach
+/// the threshold, which needs two things at once:
+///
+/// * a **dense** operand — so the threshold is set high by a term with postings
+///   in every block, giving the sparse terms' blocks something to fall below;
+/// * a **much rarer** operand — so most blocks contain none of it and the summed
+///   bound really does drop below the threshold.
+///
+/// With only the first, nothing can be skipped; with only the second, the union
+/// is short enough that the plain merge is already the cheapest thing to do, and
+/// the walk's per-document bookkeeping — it peeks, scores and advances every
+/// cursor once per candidate document — is pure loss. So the gate asks for a
+/// densest operand holding at least a tenth of the documents *and* an operand at
+/// least ten times rarer than it.
+///
+/// Measured on 20k documents, `--release`, min of 200 interleaved samples
+/// (`bench/stress/main.mbt`): one dense term (df 4021) with four rare ones
+/// (df 285) is ~30% faster through the walk, one dense with eight rare is a wash,
+/// two or three comparably dense operands are a wash to 20% slower, and eight
+/// rare terms with no dense operand are ~1.7× slower — the five rows the tests
+/// pin, three routed to the walk and two left to the merge. It is a performance
+/// choice only: the two paths return identical results (the tests assert that),
+/// so the gate can never change an answer.
+///
+/// Public because `search` consults it and tooling (the stress bench) reports
+/// which path a disjunction takes.
+pub fn Index::or_walk_pays(
+  self : Index,
+  terms : Array[(String, String?)],
+) -> Bool {
+  let live = self.doc_count()
+  if live == 0 {
+    return false
+  }
+  let mut min_df = -1
+  let mut max_df = 0
+  for pair in terms {
+    let mut df = 0
+    match pair.1 {
+      Some(f) => df = self.postings_of(f, pair.0).length()
+      None =>
+        for f in self.field_names() {
+          df += self.postings_of(f, pair.0).length()
+        }
+    }
+    if min_df < 0 || df < min_df {
+      min_df = df
+    }
+    if df > max_df {
+      max_df = df
+    }
+  }
+  // A dense operand to set the threshold, and one far rarer to create the gap.
+  max_df * 10 > live && min_df * 10 < max_df
+}
+
+///|
+/// Top-k for a disjunction of terms (`a OR b`), by the same block-max idea as the
+/// conjunction: walk the union in document order and skip a whole doc block when
+/// the sum of the terms' block maxima cannot reach the current k-th best.
+///
+/// A document's score is the sum of the terms that occur in it, accumulated in
+/// the query's term order — the order the exact evaluator's nested unions add
+/// in — so the result is bit-for-bit the full evaluation. Terms that match
+/// nothing are dropped (an empty operand of a union contributes nothing).
+///
+/// `search` routes here through `or_walk_pays`, which is what keeps the walk off
+/// the shapes where it loses; the numbers behind that gate are on that function.
+pub fn Index::or_terms_topk(
+  self : Index,
+  terms : Array[(String, String?)],
+  limit : Int32,
+) -> BlockMaxResult {
+  let n_docs = self.doc_ids.length()
+  if limit <= 0 || n_docs == 0 || terms.is_empty() {
+    return { hits: [], scored: 0, skipped: 0, }
+  }
+  let active : Array[TermCursor] = []
+  for pair in terms {
+    let cursor = self.term_cursor_prepare(pair.0, pair.1)
+    if !cursor.is_empty() {
+      active.push(cursor)
+    }
+  }
+  if active.is_empty() {
+    return { hits: [], scored: 0, skipped: 0, }
+  }
+  let n_blocks = (n_docs + BLOCK_SIZE - 1) / BLOCK_SIZE
+  let stats_all : Array[Array[Array[BlockStat]]] = []
+  for t in active {
+    let per_field : Array[Array[BlockStat]] = []
+    for i in 0..<t.fields.length() {
+      per_field.push(self.term_block_stats(t.fields[i], t.name))
+    }
+    stats_all.push(per_field)
+  }
+  let any_deleted = !self.deleted.is_empty()
+  let top : Array[Hit] = []
+  let mut scored = 0
+  let mut skipped = 0
+  let mut last_block = -1
+  let mut block_upper = 0.0
+  let mut done = false
+  while !done {
+    let d = match min_peek(active) {
+      None => {
+        done = true
+        0
+      }
+      Some(d) => d
+    }
+    if done {
+      continue
+    }
+    let b = d / BLOCK_SIZE
+    // The bound only changes when the walk enters a new block.
+    if b != last_block {
+      last_block = b
+      block_upper = 0.0
+      for i in 0..<active.length() {
+        for j in 0..<active[i].fields.length() {
+          if b < stats_all[i][j].length() && stats_all[i][j][b].max_tf > 0 {
+            block_upper += active[i].ctxs[j].block_bound(stats_all[i][j][b])
+          }
+        }
+      }
+    }
+    if top.length() >= limit &&
+      b < n_blocks &&
+      block_upper < top[top.length() - 1].score {
+      // Every document in this block is dominated: step past the whole block.
+      let hi = (b + 1) * BLOCK_SIZE
+      for i in 0..<active.length() {
+        skipped += active[i].advance_before(hi)
+      }
+      continue
+    }
+    // Sum the terms present at this document, in query order.
+    let mut total = 0.0
+    let mut present = false
+    for i in 0..<active.length() {
+      let (ok, s) = active[i].score_at(d)
+      if ok {
+        total += s
+        present = true
+      }
+    }
+    // Step every cursor that was sitting on this document, whether or not it
+    // contributed: one whose statistics are unusable still holds the posting,
+    // and leaving it would make the walk revisit the same document forever.
+    for i in 0..<active.length() {
+      if active[i].at(d) {
+        active[i].advance()
+      }
+    }
     if !present {
       continue
     }

@@ -202,7 +202,12 @@ fn HnswRng::level(self : HnswRng, ml : Double) -> Int32 {
 /// Cosine distance in [0, 2] = 1 - cosine similarity. Callers are expected to
 /// pass normalized vectors; normalizing here as well means an unnormalized
 /// vector degrades ranking slightly instead of letting its magnitude dominate.
-fn cosine_distance(a : Array[Double], b : Array[Double]) -> Double {
+///
+/// Public because it is the metric the index actually ranks by, and a caller
+/// comparing its own vectors to the index's should not have to re-derive it.
+/// `HnswPoints::dist` computes the same expression over the flat buffer, in the
+/// same order, so the two agree bit for bit.
+pub fn cosine_distance(a : Array[Double], b : Array[Double]) -> Double {
   let n = if a.length() < b.length() { a.length() } else { b.length() }
   let mut dot = 0.0
   let mut na = 0.0
@@ -713,8 +718,9 @@ pub fn Index::set_vector(
     }
   }
   per_field.set(num, vector)
-  // The cached graph no longer describes the data.
+  // The cached graph and point buffer no longer describe the data.
   let _ = self.hnsw.remove(field)
+  let _ = self.points_cache.remove(field)
   true
 }
 
@@ -819,10 +825,15 @@ pub fn Index::knn_exact(
   query : Array[Double],
   k : Int32,
 ) -> Array[(Int32, Double)] {
-  let points = self.live_vectors(field)
+  // The cached flat buffer, not a fresh `live_vectors` array: the distances are
+  // the same arithmetic over the same values, in the same (ascending doc) order,
+  // so the result is identical while the O(n log n) rebuild per query is gone.
+  let points = self.points_of(field)
   let scored : Array[(Int32, Double)] = []
-  for (doc, v) in points {
-    scored.push((doc, cosine_distance(query, v)))
+  for doc in 0..<points.slots {
+    if points.present[doc] {
+      scored.push((doc, points.dist(query, doc)))
+    }
   }
   scored.sort_by(fn(a, b) {
     let cmp = a.1.compare(b.1)
@@ -893,7 +904,17 @@ fn Index::knn_graph_docs(
 ///|
 /// The flat point store for a vector field.
 fn Index::points_of(self : Index, field : String) -> HnswPoints {
-  HnswPoints::from(self.live_vectors(field), self.vector_dim(field))
+  match self.points_cache.get(field) {
+    Some(points) => points
+    None => {
+      let points = HnswPoints::from(
+        self.live_vectors(field),
+        self.vector_dim(field),
+      )
+      self.points_cache.set(field, points)
+      points
+    }
+  }
 }
 
 ///|

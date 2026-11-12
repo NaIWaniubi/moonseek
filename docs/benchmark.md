@@ -37,7 +37,7 @@ only concurrency in the stack is `moonbitlang/async`'s cooperative scheduler, us
 | Quality | `moon run tools/eval --target native --release -- demo/registry.json docs/quality.md` | NDCG@10 / MRR@10 / Recall@20 over 3,698 real packages and 6 ablation configurations |
 | Registry build | `moon run tools/registry --target native --release -- demo/registry.json demo/data/registry.msk` | The snapshot the browser demo loads, plus its build rate |
 | Browser | `demo/index.html` (WasmGC) | Snapshot load, query percentiles, snapshot export/import, latency-vs-scale curve, all in-page |
-| Correctness | `moon test` | 259 tests native / 242 wasm-gc — run this before trusting any number |
+| Correctness | `moon test` | 341 tests native / 290 wasm-gc · 290 js — run this before trusting any number |
 
 The stress corpus is generated in-process by `bench/stress/main.mbt` from a seeded xorshift RNG, a
 5,000-word Zipf vocabulary and 30 real English/Chinese anchor words. The generator is integer-only,
@@ -99,8 +99,8 @@ frequency and print it.
 
 ### Block-max WAND: skipping the postings that cannot win
 
-A bounded query that is a single term — or a conjunction of terms — does not
-have to score every matching posting.
+A bounded query that is a single term, a conjunction, or a disjunction with a wide
+document-frequency spread does not have to score every matching posting.
 
 **Single term.** The doc-sorted posting list is walked in blocks of 16 and, once
 the top-`k` set is full, a block is skipped when the highest score any posting in
@@ -116,9 +116,13 @@ block is skipped when the *sum* of the terms' block maxima cannot reach the
 threshold. Scores are summed in the query's term order, which is the order the
 exact evaluator's nested intersections sum in.
 
-In both cases the skip test is **strict**, so a document that only ties with the
+**Disjunction** (`a OR b`). The union is walked in blocks of 16 and a block is
+skipped when the *sum* of the terms' block maxima cannot reach the threshold.
+This one is not a free win, so it is gated (below).
+
+In all cases the skip test is **strict**, so a document that only ties with the
 k-th best is still scored and can still win the id tiebreak — the result is
-bit-for-bit the full scan, not merely close. Six engine tests assert that
+bit-for-bit the full scan, not merely close. The engine tests assert that
 equality (field-scoped and across fields, with deletions, including a corpus
 with one huge tie group sitting on the cut) and assert that the skipping fires,
 so it cannot silently regress to a no-op. A bounds bug this caught: the block
@@ -126,20 +130,23 @@ bound was computed from factored terms and could land one ulp *below* a
 posting's actual score, which skipped a tie; the shipped bound is inflated by
 one part in 1e12, which can only make a block less likely to be skipped.
 
-20,000 documents, `limit=10`, p50 of 200 samples:
+20,000 documents, `limit=10`, `--release`. The two variants are timed
+**interleaved** (each sample runs both), and both p50 and the **minimum** of 200
+samples are given: on a shared machine the minimum is the least-contended sample
+and the p50 tracks whatever else is running.
 
-| Query | scored | skipped | p50 block-max | p50 exact | Speedup |
+| Query | scored | skipped | block-max p50 (min) | exact p50 (min) | Speedup (p50 / min) |
 |---|---:|---:|---:|---:|---:|
-| `moonbit` (df 4,114) | 1,373 | 3,473 (72%) | **0.65–1.06 ms** | 2.50–2.94 ms | 2.8–3.8× |
-| `search` (df 4,021) | 1,221 | 3,457 (74%) | **0.47–0.83 ms** | 2.30–2.61 ms | 3.1–4.4× |
-| `搜索` (df 4,113) | 1,221 | 3,565 (74%) | **0.40–1.00 ms** | 2.31–2.83 ms | 2.8–5.7× |
-| `search AND engine` | 710 | 1,817 (72%) | **2.85–3.51 ms** | 4.27–5.60 ms | 1.5–1.6× |
-| `moonbit AND search` | 719 | 1,675 (70%) | **2.43–2.84 ms** | 4.58–5.55 ms | 1.9× |
-| `search AND engine AND index` | 256 | 853 (77%) | **4.07–4.25 ms** | 7.24–9.63 ms | 1.7–2.3× |
+| `moonbit` (df 4,114) | 1,373 | 3,473 (72%) | **1.01 (0.35) ms** | 2.11 (0.96) ms | 2.1× / 2.7× |
+| `search` (df 4,021) | 1,221 | 3,457 (74%) | **0.92 (0.30) ms** | 2.00 (0.93) ms | 2.2× / 3.1× |
+| `搜索` (df 4,113) | 1,221 | 3,565 (74%) | **0.93 (0.29) ms** | 1.96 (0.91) ms | 2.1× / 3.1× |
+| `search AND engine` | 710 | 1,817 (72%) | **2.71 (1.87) ms** | 4.27 (2.55) ms | 1.6× / 1.4× |
+| `moonbit AND search` | 719 | 1,675 (70%) | **2.24 (1.25) ms** | 4.07 (2.48) ms | 1.8× / 2.0× |
+| `search AND engine AND index` | 256 | 853 (77%) | **3.89 (2.54) ms** | 7.06 (5.13) ms | 1.8× / 2.0× |
 
-Ranges are across repeated runs on the same machine; the harness is
-single-threaded on a shared machine, so the ratio is steadier than the absolute
-figures.
+The ratios move with machine load; the *skipped* columns are deterministic and
+are the algorithmic claim (72–77% of the postings and 70–77% of the driver
+postings are never scored).
 
 **What is not done: there is no SIMD scoring loop.** MoonBit's core library
 exposes only an experimental, hidden `v128_load` and no arithmetic intrinsics, so
@@ -151,8 +158,32 @@ computed lazily, and the single-field case scores without an intermediate
 buffer. Those, not arithmetic width, were where the remaining time went.
 
 Skip rates are corpus-dependent: high when a term's per-document frequency is
-skewed, low when it is uniform. Multi-term **disjunctions** (`a OR b`) still use
-the exact union; extending the walk to them is the next step.
+skewed, low when it is uniform. That is also why the disjunction is gated.
+
+#### The disjunction is gated, and why
+
+A union has to skip blocks when the terms' summed block maxima cannot reach the
+threshold, which needs two things at once: a **dense** operand, so a term with
+postings in every block sets the threshold high, and a **much rarer** one, so
+most blocks fall below it. With only the first nothing can be skipped; with only
+the second the union is short enough that the plain merge is already cheapest,
+and the walk's per-document bookkeeping — it peeks, scores and advances every
+cursor once per candidate document — is pure loss.
+
+| Union (20k docs) | walk p50 (min) | exact merge p50 (min) | Routed to | Result |
+|---|---:|---:|---|---|
+| dense (df 4,021) + 4 rare (df 285) | **1.99 (1.31) ms** | 2.80 (1.56) ms | walk | **29% faster** |
+| dense + 8 rare | **3.13 (2.09) ms** | 3.16 (1.92) ms | walk | wash |
+| 2 comparably dense | 3.81 (2.80) ms | 3.89 (2.31) ms | merge | wash |
+| 3 comparably dense | 9.33 (6.65) ms | **7.16 (4.65) ms** | merge | 30% slower |
+| 8 rare, no dense operand | 0.50 (0.31) ms | **0.24 (0.17) ms** | merge | 2× slower |
+
+`Index::or_walk_pays` (public) therefore routes a disjunction to the walk only
+when the densest operand holds at least a tenth of the documents *and* some
+operand is at least ten times rarer than it; otherwise the exact merge is used.
+It is a performance choice only — the two paths return identical results, and a
+test pins both sides of the gate. The one clearly positive row above is the
+mixed dense/rare union, where 75% of the postings are skipped.
 
 
 ### Fuzzy lookup: linear scan vs BK-tree

@@ -102,37 +102,75 @@ fn round3(x : Double) -> Double {
 }
 
 ///|
-/// p50 latency in ms of a single-term query over 200 samples, optionally
-/// through the block-max path, warmed first so the first sample is not a
-/// cold-cache outlier.
-fn p50_search(idx : @moonseek.Index, term : String, blockmax : Bool) -> Double {
-  for _ in 0..<10 {
-    let _ = if blockmax {
-      idx.search(term, limit=10) catch {
-        _ => ([] : Array[@moonseek.Hit])
-      }
-    } else {
-      idx.search_exact(term, limit=10) catch {
-        _ => ([] : Array[@moonseek.Hit])
-      }
+/// Latencies, in ms, of two variants of the same query, measured
+/// **interleaved**: every sample times both, so whatever else the machine is
+/// doing drifts across the whole run instead of landing on whichever variant
+/// happened to be measured first. Returns `(a p50, a min, b p50, b min)`.
+///
+/// The minimum is the least-contended sample, and on a busy machine it is the
+/// statistic to quote — p50 mostly tracks the competing load. Both are reported
+/// so the reader can tell a real speed-up from noise.
+fn paired_stats(
+  a : () -> Int32,
+  b : () -> Int32,
+) -> (Double, Double, Double, Double) {
+  let run = fn(f : () -> Int32) -> Double {
+    let t = @bench.monotonic_clock_start()
+    let sink = f()
+    let e = @bench.monotonic_clock_end(t)
+    if sink < 0 {
+      return 0.0
     }
+    us_to_ms(e)
+  }
+  for _ in 0..<10 {
+    let _ = run(a)
+    let _ = run(b)
+  }
+  let a_samples : Array[Double] = []
+  let b_samples : Array[Double] = []
+  for _ in 0..<200 {
+    a_samples.push(run(a))
+    b_samples.push(run(b))
+  }
+  a_samples.sort()
+  b_samples.sort()
+  let med = fn(x : Array[Double]) -> Double { x[x.length() * 50 / 100] }
+  (med(a_samples), a_samples[0], med(b_samples), b_samples[0])
+}
+
+///|
+/// The block-max vs exact comparison for one query string, where the block-max
+/// side is whatever `search` routes to. Returns `(wand p50, wand min, exact p50,
+/// exact min)`.
+fn search_stats(
+  idx : @moonseek.Index,
+  query : String,
+) -> (Double, Double, Double, Double) {
+  let routed = fn() -> Int32 {
+    (idx.search(query, limit=10) catch { _ => ([] : Array[@moonseek.Hit]) }).length()
+  }
+  let exact = fn() -> Int32 {
+    (idx.search_exact(query, limit=10) catch {
+      _ => ([] : Array[@moonseek.Hit])
+    }).length()
+  }
+  paired_stats(routed, exact)
+}
+
+///|
+/// p50 latency in ms of an arbitrary call, warmed first.
+fn p50_ms(f : () -> Int32) -> Double {
+  for _ in 0..<5 {
+    let _ = f()
   }
   let samples : Array[Double] = []
   let mut sink = 0
-  for _ in 0..<200 {
+  for _ in 0..<100 {
     let t = @bench.monotonic_clock_start()
-    let hits = if blockmax {
-      idx.search(term, limit=10) catch {
-        _ => ([] : Array[@moonseek.Hit])
-      }
-    } else {
-      idx.search_exact(term, limit=10) catch {
-        _ => ([] : Array[@moonseek.Hit])
-      }
-    }
+    sink += f()
     let e = @bench.monotonic_clock_end(t)
     samples.push(us_to_ms(e))
-    sink += hits.length()
   }
   samples.sort()
   if sink < 0 {
@@ -300,8 +338,7 @@ fn main {
     } else {
       100.0 * r.skipped.to_double() / total.to_double()
     }
-    let bm = p50_search(idx, term, true)
-    let ex = p50_search(idx, term, false)
+    let (w50, wmin, e50, emin) = search_stats(idx, term)
     println(
       "  " +
       term +
@@ -313,11 +350,15 @@ fn main {
       r.skipped.to_string() +
       " (" +
       round3(pct).to_string() +
-      "%) · p50 block-max " +
-      round3(bm).to_string() +
-      " ms vs exact " +
-      round3(ex).to_string() +
-      " ms",
+      "%) · block-max " +
+      round3(w50).to_string() +
+      " ms p50 / " +
+      round3(wmin).to_string() +
+      " ms min vs exact " +
+      round3(e50).to_string() +
+      " ms p50 / " +
+      round3(emin).to_string() +
+      " ms min",
     )
   }
 
@@ -341,8 +382,7 @@ fn main {
     } else {
       100.0 * r.skipped.to_double() / total.to_double()
     }
-    let bm = p50_search(idx, label, true)
-    let ex = p50_search(idx, label, false)
+    let (w50, wmin, e50, emin) = search_stats(idx, label)
     println(
       "  " +
       label +
@@ -352,13 +392,123 @@ fn main {
       r.skipped.to_string() +
       " (" +
       round3(pct).to_string() +
-      "%) · p50 wand " +
-      round3(bm).to_string() +
-      " ms vs exact " +
-      round3(ex).to_string() +
-      " ms",
+      "%) · wand " +
+      round3(w50).to_string() +
+      " ms p50 / " +
+      round3(wmin).to_string() +
+      " ms min vs exact " +
+      round3(e50).to_string() +
+      " ms p50 / " +
+      round3(emin).to_string() +
+      " ms min",
     )
   }
+
+  // 2d. Disjunctions: the same walk over the union of the terms.
+  println("=== block-max WAND (disjunction, limit=10) ===")
+  let or_cases : Array[(String, String, Array[String])] = [
+    ("search OR engine", "search OR engine", ["search", "engine"]),
+    (
+      "moonbit OR search OR index",
+      "moonbit OR search OR index",
+      ["moonbit", "search", "index"],
+    ),
+    (
+      "search OR 4 rare terms",
+      "search OR w4998x OR w4997x OR w4996x OR w4995x",
+      ["search", "w4998x", "w4997x", "w4996x", "w4995x"],
+    ),
+    (
+      "1 saturated + 8 rare terms",
+      "search OR w4998x OR w4997x OR w4996x OR w4995x OR w4994x OR w4993x OR w4992x OR w4991x",
+      [
+        "search", "w4998x", "w4997x", "w4996x", "w4995x", "w4994x", "w4993x", "w4992x",
+        "w4991x",
+      ],
+    ),
+    (
+      "8 rare terms (no dense operand)",
+      "w4998x OR w4997x OR w4996x OR w4995x OR w4994x OR w4993x OR w4992x OR w4991x",
+      [
+        "w4998x", "w4997x", "w4996x", "w4995x", "w4994x", "w4993x", "w4992x", "w4991x",
+      ],
+    ),
+  ]
+  for (label, query, terms) in or_cases {
+    let pairs : Array[(String, String?)] = []
+    for t in terms {
+      pairs.push((t, None))
+    }
+    let r = idx.or_terms_topk(pairs, 10)
+    let total = r.scored + r.skipped
+    let pct = if total == 0 {
+      0.0
+    } else {
+      100.0 * r.skipped.to_double() / total.to_double()
+    }
+    let walk = fn() -> Int32 { idx.or_terms_topk(pairs, 10).hits.length() }
+    let exact = fn() -> Int32 {
+      (idx.search_exact(query, limit=10) catch {
+        _ => ([] : Array[@moonseek.Hit])
+      }).length()
+    }
+    let (w50, wmin, e50, emin) = paired_stats(walk, exact)
+    let route = if idx.or_walk_pays(pairs) { "walk" } else { "merge" }
+    println(
+      "  " +
+      label +
+      " [" +
+      route +
+      "]: documents scored " +
+      r.scored.to_string() +
+      ", postings skipped " +
+      r.skipped.to_string() +
+      " (" +
+      round3(pct).to_string() +
+      "%) · walk " +
+      round3(w50).to_string() +
+      " ms p50 / " +
+      round3(wmin).to_string() +
+      " ms min vs exact merge " +
+      round3(e50).to_string() +
+      " ms p50 / " +
+      round3(emin).to_string() +
+      " ms min",
+    )
+  }
+
+  // 2e. Vector search on its own 5,000 x 64 index, so its cost does not pollute
+  // the text benchmarks. The point buffer used to be rebuilt — and sorted — for
+  // every kNN query; it is cached now, and `vector_count` still goes through
+  // `live_vectors`, so the two lines below are the before and after.
+  println("=== kNN: the cached point buffer (5,000 vectors x 64 dims) ===")
+  let vidx = @moonseek.Index::new([{ name: "text", weight: 1.0, }])
+  let dim : Int32 = 64
+  let mut vseed : UInt64 = 99UL
+  for d in 0..<5000 {
+    vidx.add({ id: "v\{d}", fields: [("text", "vector document")], })
+    let v : Array[Double] = []
+    for _ in 0..<dim {
+      vseed = vseed * 6364136223846793005UL + 1442695040888963407UL
+      let r = (vseed >> 40).to_int()
+      v.push(r.to_double() / 16777216.0 - 0.5)
+    }
+    let _ = vidx.set_vector("v\{d}", "emb", v)
+  }
+  let qv : Array[Double] = []
+  for i in 0..<dim {
+    qv.push(if i % 2 == 0 { 0.1 } else { -0.1 })
+  }
+  let rebuild = p50_ms(fn() { vidx.vector_count("emb") })
+  let knn_ms = p50_ms(fn() { vidx.knn("emb", qv, 10, ef=64).length() })
+  let exact_ms = p50_ms(fn() { vidx.knn_exact("emb", qv, 10).length() })
+  println(
+    "  point-buffer rebuild (what every query used to pay): " +
+    round3(rebuild).to_string() +
+    " ms",
+  )
+  println("  kNN query, cached points: " + round3(knn_ms).to_string() + " ms")
+  println("  exact kNN, cached points: " + round3(exact_ms).to_string() + " ms")
 
   // 3. Fuzzy: linear scan vs cached BK-tree
   println("=== fuzzy lookup: linear vs cached BK-tree ===")

@@ -117,6 +117,11 @@ pub struct Index {
   /// bound when the scoring context changes. Built lazily, cleared on mutation
   /// like the other caches.
   priv block_stats : @hashmap.HashMap[(String, String), Array[BlockStat]]
+  /// Cached flat vector buffers per field, built lazily and cleared on mutation.
+  /// Every kNN query needs the points laid out for the distance loop; rebuilding
+  /// and sorting them per query was O(n log n) before the search started, which
+  /// for a large field dwarfs the search itself.
+  priv points_cache : @hashmap.HashMap[String, HnswPoints]
   /// Cached BK-trees for fuzzy lookup, keyed by field name ("*" = all fields).
   /// Cleared on add. Building one tree per query was the dominant cost of
   /// fuzzy search on large vocabularies.
@@ -250,6 +255,7 @@ pub fn Index::new(
     scratch_poses: [],
     lengths_dense: @hashmap.HashMap([]),
     block_stats: @hashmap.HashMap([]),
+    points_cache: @hashmap.HashMap([]),
     bk_trees: @hashmap.HashMap([]),
     nums: @hashmap.HashMap([]),
     num_cols: @hashmap.HashMap([]),
@@ -302,6 +308,9 @@ pub fn Index::add(self : Index, doc : Document) -> Unit {
   }
   if !self.block_stats.is_empty() {
     self.block_stats.clear()
+  }
+  if !self.points_cache.is_empty() {
+    self.points_cache.clear()
   }
   if !self.bk_trees.is_empty() {
     self.bk_trees.clear()
@@ -383,6 +392,9 @@ fn Index::delete_by_num(self : Index, num : Int32) -> Unit {
   }
   if !self.block_stats.is_empty() {
     self.block_stats.clear()
+  }
+  if !self.points_cache.is_empty() {
+    self.points_cache.clear()
   }
   self.stored.remove(num)
   // Facet values of a deleted document are dead state: keeping them
