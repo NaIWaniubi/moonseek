@@ -38,7 +38,7 @@ only concurrency in the stack is `moonbitlang/async`'s cooperative scheduler, us
 | Quality | `moon run tools/eval --target native --release -- demo/registry.json docs/quality.md` | NDCG@10 / MRR@10 / Recall@20 over 3,698 real packages and 6 ablation configurations |
 | Registry build | `moon run tools/registry --target native --release -- demo/registry.json demo/data/registry.msk` | The snapshot the browser demo loads, plus its build rate |
 | Browser | `demo/index.html` (WasmGC) | Snapshot load, query percentiles, snapshot export/import, latency-vs-scale curve, all in-page |
-| Correctness | `moon test` | 354 tests native / 298 wasm-gc · 298 js — run this before trusting any number |
+| Correctness | `moon test` | 355 tests native / 299 wasm-gc · 299 js — run this before trusting any number |
 | Durability | `bash tools/test-durability.sh <server.exe> .` | Writes, deletes, vectors and numeric columns survive a process restart; checkpoint truncates the journal |
 
 The stress corpus is generated in-process by `bench/stress/main.mbt` from a seeded xorshift RNG, a

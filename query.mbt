@@ -771,7 +771,10 @@ fn Index::eval_phrase(
         continue
       }
       let phrase_count = if slop == 0 {
-        exact_phrase_count(driver_posting, aligned, terms.length())
+        // Positions are relative to term 0, not to whichever term drives the
+        // document walk: `aligned[0]` is term 0's posting for this document.
+        // Driving on the rarest term is a traversal choice only.
+        exact_phrase_count(aligned[0], aligned, terms.length())
       } else {
         sloppy_phrase_count(aligned, terms.length(), slop)
       }

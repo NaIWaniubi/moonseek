@@ -353,3 +353,48 @@ test "a multi-term prefix equals the exact path" {
     query_exact(idx, "zzz*", 10),
   )
 }
+
+///|
+/// A phrase whose *second* term is the rare one. The document walk drives on
+/// the rarest term, but position offsets are relative to term 0 — walking them
+/// from the driver instead silently changes which documents match. The quality
+/// gate caught exactly that (NDCG 0.9045 -> 0.8538); this pins it.
+test "a phrase driven by its second term still matches term-0 offsets" {
+  let idx = Index::new([{ name: "body", weight: 1.0, }])
+  // "common" is in every document; "rare" is in two. The phrase "common rare"
+  // must match only where they are adjacent, in that order.
+  for d in 0..<200 {
+    let text = if d == 5 {
+      "common rare common common"
+    } else if d == 9 {
+      "common common rare"
+    } else if d == 11 {
+      "rare common common"
+    } else {
+      "common common common common"
+    }
+    idx.add({ id: "d\{d}", fields: [("body", text)], })
+  }
+  for q in ["\"common rare\"", "\"common rare\"~1", "\"rare common\""] {
+    for limit in [1, 5, 10] {
+      assert_eq(
+        idx.search(q, limit~) catch {
+          _ => ([] : Array[Hit])
+        },
+        query_exact(idx, q, limit),
+      )
+    }
+  }
+  // And the exact answer: d5 ("common rare ...") and d9 ("... common rare")
+  // have them adjacent; d11 ("rare common ...") does not.
+  let hits = idx.search("\"common rare\"", limit=10) catch {
+    _ => ([] : Array[Hit])
+  }
+  assert_eq(hits.length(), 2)
+  let ids : Array[String] = []
+  for h in hits {
+    ids.push(h.id)
+  }
+  ids.sort()
+  assert_eq(ids, ["d5", "d9"])
+}

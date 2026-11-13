@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.15.1 (2026-11-13)
+
+### Fixed
+
+* **A phrase driven by its second term matched the wrong documents.** The 0.15.0
+  rewrite walks the *rarest* term's postings, but `exact_phrase_count` was handed
+  the driver's posting and so walked position offsets relative to the driver
+  instead of relative to term 0. For `"common rare"` where `rare` is the rarer
+  term, that changed which documents matched.
+
+  The unit tests did not catch it — their phrases happened to have the first term
+  rarest. The **quality gate** did: NDCG@10 on the 3,698-package corpus fell from
+  0.9045 to 0.8538, and CI's "committed report must match the measurement" step
+  failed. The fix passes `aligned[0]` (term 0's posting for the document) to the
+  position walk; driving on the rarest term remains a traversal choice only. All
+  six ablation configurations match the committed report again.
+
+  A regression test now pins a phrase whose second term is the rare one, with an
+  explicit expected id list, so the traversal choice cannot silently change
+  answers again.
+
 ## 0.15.0 (2026-11-13)
 
 The service now **survives a restart**, and the two query shapes that were doing
@@ -72,7 +93,7 @@ prefix that matches nothing.
   (native).
 * `bench/query`: a harness for the compound query shapes against the single terms
   they are built from, reporting p50/p90/min.
-* Tests: 354 native, 298 wasm-gc, 298 js (was 341 / 290 / 290).
+* Tests: 355 native, 299 wasm-gc, 299 js (was 341 / 290 / 290).
 
 ## 0.14.0 (2026-11-12)
 
