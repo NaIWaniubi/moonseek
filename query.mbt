@@ -521,7 +521,57 @@ fn Index::eval_term(self : Index, term : String, field : String?) -> DocScores {
 }
 
 ///|
+/// The prefix and its field when the query is exactly one prefix node, or None
+/// for anything else. Used to decide whether a prefix is really a single-term
+/// query in disguise.
+fn single_prefix_term(q : Query) -> (String, String?)? {
+  match q {
+    Prefix(prefix, field) => Some((prefix, field))
+    _ => None
+  }
+}
+
+///|
+/// The single dictionary term a prefix expands to, or None when it expands to
+/// none or to several. Counted across *distinct* terms: an unscoped prefix
+/// matches the same term once per field, and that is still one term.
+///
+/// Stops at the second distinct term, so a broad prefix (`w49*`, over a
+/// thousand terms) costs a couple of dictionary probes rather than a full
+/// expansion.
+fn Index::single_prefix_match(
+  self : Index,
+  prefix : String,
+  field : String?,
+) -> String? {
+  let fields = match field {
+    Some(f) => [f]
+    None => self.field_names()
+  }
+  let mut found : String? = None
+  for f in fields {
+    let terms = self.terms_of(f)
+    let mut i = lower_bound(terms, prefix)
+    while i < terms.length() && terms[i].has_prefix(prefix) {
+      let t = terms[i]
+      match found {
+        None => found = Some(t)
+        Some(prev) => if prev != t { return None }
+      }
+      i += 1
+    }
+  }
+  found
+}
+
+///|
 /// Prefix expansion: every dictionary term with this prefix, merged by doc.
+///
+/// The matching terms' posting lists are each doc-sorted, so this is a k-way
+/// merge (k = terms under the prefix, usually a handful) rather than
+/// concatenate-then-sort: the output falls out in ascending doc order as the
+/// lists are consumed, and no intermediate pair array is allocated for the
+/// common single-field case.
 fn Index::eval_prefix(
   self : Index,
   prefix : String,
@@ -531,6 +581,8 @@ fn Index::eval_prefix(
     Some(f) => [f]
     None => self.field_names()
   }
+  let multi = fields.length() > 1
+  let out = DocScores::empty()
   let pairs : Array[(Int32, Double)] = []
   let any_deleted = !self.deleted.is_empty()
   for f in fields {
@@ -539,20 +591,76 @@ fn Index::eval_prefix(
     // O(vocabulary) per prefix query.
     let terms = self.terms_of(f)
     let start = lower_bound(terms, prefix)
+    let ctxs : Array[Bm25Context] = []
+    let lists : Array[Array[Posting]] = []
     let mut i = start
     while i < terms.length() && terms[i].has_prefix(prefix) {
       let ctx = self.bm25_context(f, terms[i])
       if ctx.valid {
-        for posting in self.postings_of(f, terms[i]) {
-          if !any_deleted || !self.deleted.contains(posting.doc) {
-            pairs.push((posting.doc, ctx.score(posting)))
-          }
-        }
+        ctxs.push(ctx)
+        lists.push(self.postings_of(f, terms[i]))
       }
       i += 1
     }
+    if lists.is_empty() {
+      continue
+    }
+    if lists.length() == 1 {
+      let ctx = ctxs[0]
+      for posting in lists[0] {
+        if !any_deleted || !self.deleted.contains(posting.doc) {
+          let score = ctx.score(posting)
+          if multi {
+            pairs.push((posting.doc, score))
+          } else {
+            out.push(posting.doc, score)
+          }
+        }
+      }
+      continue
+    }
+    // k-way merge over a min-heap of (doc, list). A linear scan for the
+    // smallest cursor would be O(k) per document, which is a regression for a
+    // broad prefix: `w49*` covers over a thousand dictionary terms. The heap
+    // makes it O(log k) per posting instead.
+    let heap = DocHeap::new()
+    let curs : Array[Int32] = []
+    for j in 0..<lists.length() {
+      if lists[j].length() > 0 {
+        heap.push(lists[j][0].doc, j)
+      }
+      // Index of the next posting to push for this list; 0 is already queued.
+      curs.push(1)
+    }
+    while !heap.is_empty() {
+      let d = heap.peek_doc()
+      let mut total = 0.0
+      // Every list sitting on this document contributes, then advances.
+      while !heap.is_empty() && heap.peek_doc() == d {
+        let j = heap.pop_list()
+        let consumed = curs[j] - 1
+        total += ctxs[j].score(lists[j][consumed])
+        let next = curs[j]
+        if next < lists[j].length() {
+          heap.push(lists[j][next].doc, j)
+          curs[j] = next + 1
+        }
+      }
+      if any_deleted && self.deleted.contains(d) {
+        continue
+      }
+      if multi {
+        pairs.push((d, total))
+      } else {
+        out.push(d, total)
+      }
+    }
   }
-  DocScores::from_pairs(pairs)
+  if multi {
+    DocScores::from_pairs(pairs)
+  } else {
+    out
+  }
 }
 
 ///|
@@ -574,8 +682,15 @@ fn lower_bound(terms : Array[String], target : String) -> Int32 {
 }
 
 ///|
-/// Phrase match: consecutive analyzed terms in one field. Iterates the first
-/// term's doc-sorted posting list, so the output is ascending by doc.
+/// Phrase match: consecutive analyzed terms in one field.
+///
+/// The rarest term's doc-sorted list drives the walk — only its documents can
+/// match — and the other terms are probed with forward-only cursors instead of
+/// being enumerated. That is what keeps the cost proportional to the phrase's
+/// candidates rather than to the sum of the terms' document frequencies: an
+/// earlier version built a `doc -> Posting` map for *every* term on every
+/// query, which on a saturated term meant thousands of hash inserts before the
+/// first position was compared.
 fn Index::eval_phrase(
   self : Index,
   terms : Array[String],
@@ -599,20 +714,15 @@ fn Index::eval_phrase(
   let any_deleted = !self.deleted.is_empty()
   let pairs : Array[(Int32, Double)] = []
   for f in fields {
-    // Fetch each term's posting list once and index by doc number,
-    // so phrase verification is O(positions) instead of O(docs*positions).
-    let lists : Array[@hashmap.HashMap[Int32, Posting]] = []
+    let lists : Array[Array[Posting]] = []
     let mut missing = false
     for term in terms {
-      let by_doc : @hashmap.HashMap[Int32, Posting] = @hashmap.HashMap([])
-      for p in self.postings_of(f, term) {
-        by_doc.set(p.doc, p)
-      }
-      if by_doc.is_empty() {
+      let postings = self.postings_of(f, term)
+      if postings.is_empty() {
         missing = true
         break
       }
-      lists.push(by_doc)
+      lists.push(postings)
     }
     if missing {
       continue
@@ -621,27 +731,58 @@ fn Index::eval_phrase(
     if !ctx.valid {
       continue
     }
-    for posting in self.postings_of(f, terms[0]) {
-      if any_deleted && self.deleted.contains(posting.doc) {
+    let mut driver = 0
+    for i in 1..<lists.length() {
+      if lists[i].length() < lists[driver].length() {
+        driver = i
+      }
+    }
+    let curs : Array[Int32] = []
+    for _ in 0..<lists.length() {
+      curs.push(0)
+    }
+    // `aligned[k]` is term k's posting for the document currently under the
+    // walk, so the position checks index an array instead of hashing a doc.
+    let aligned : Array[Posting] = lists.map(fn(l) { l[0] })
+    for driver_posting in lists[driver] {
+      let d = driver_posting.doc
+      if any_deleted && self.deleted.contains(d) {
+        continue
+      }
+      let mut present = true
+      for i in 0..<lists.length() {
+        if i == driver {
+          aligned[i] = driver_posting
+          continue
+        }
+        let list = lists[i]
+        let mut j = curs[i]
+        while j < list.length() && list[j].doc < d {
+          j += 1
+        }
+        curs[i] = j
+        if j >= list.length() || list[j].doc != d {
+          present = false
+          break
+        }
+        aligned[i] = list[j]
+      }
+      if !present {
         continue
       }
       let phrase_count = if slop == 0 {
-        exact_phrase_count(posting, lists, terms.length())
+        exact_phrase_count(driver_posting, aligned, terms.length())
       } else {
-        sloppy_phrase_count(posting, lists, terms.length(), slop)
+        sloppy_phrase_count(aligned, terms.length(), slop)
       }
       if phrase_count > 0 {
         // Score the phrase as if it were a term with the phrase frequency.
-        let pseudo : Posting = {
-          doc: posting.doc,
-          freq: phrase_count,
-          positions: [],
-        }
+        let pseudo : Posting = { doc: d, freq: phrase_count, positions: [], }
         let score = ctx.score(pseudo)
         if multi {
-          pairs.push((posting.doc, score))
+          pairs.push((d, score))
         } else {
-          out.push(posting.doc, score)
+          out.push(d, score)
         }
       }
     }
@@ -654,28 +795,22 @@ fn Index::eval_phrase(
 }
 
 ///|
-/// Exact phrase count: for each start position of the first term, every later
-/// term must sit exactly k positions further on. Position sets are probed, so
-/// this is O(occurrences x terms) with a `contains` per step.
+/// Exact phrase count for one document. `aligned[k]` is term k's posting for
+/// that document, so each later term is probed directly. For every start
+/// position of the first term, every later term must sit exactly k positions
+/// further on.
 fn exact_phrase_count(
   first : Posting,
-  lists : Array[@hashmap.HashMap[Int32, Posting]],
+  aligned : Array[Posting],
   n_terms : Int32,
 ) -> Int32 {
   let mut count = 0
   for start_pos in first.positions {
     let mut matched = true
     for k in 1..<n_terms {
-      match lists[k].get(first.doc) {
-        Some(p) =>
-          if !p.positions.contains(start_pos + k) {
-            matched = false
-            break
-          }
-        None => {
-          matched = false
-          break
-        }
+      if !aligned[k].positions.contains(start_pos + k) {
+        matched = false
+        break
       }
     }
     if matched {
@@ -700,18 +835,14 @@ fn exact_phrase_count(
 /// exact case. Each term's pointer only moves forward, so per document the
 /// walk is linear in total occurrences.
 fn sloppy_phrase_count(
-  first : Posting,
-  lists : Array[@hashmap.HashMap[Int32, Posting]],
+  aligned : Array[Posting],
   n_terms : Int32,
   slop : Int32,
 ) -> Int32 {
   // positions[k][i] are the sorted positions of term k in this document.
   let positions : Array[Array[Int32]] = []
   for k in 0..<n_terms {
-    match lists[k].get(first.doc) {
-      Some(p) => positions.push(p.positions)
-      None => return 0
-    }
+    positions.push(aligned[k].positions)
   }
   // Single pass over the first term's positions with a "next position >= x"
   // binary search per later term: for each candidate start this finds the
@@ -785,25 +916,39 @@ fn Index::phrase_count(
   if terms.length() < 2 {
     return 0
   }
-  let lists : Array[@hashmap.HashMap[Int32, Posting]] = []
+  // `explain` asks about one document, so binary-search it in each doc-sorted
+  // list instead of materializing a `doc -> Posting` map per term.
+  let aligned : Array[Posting] = []
   for term in terms {
-    let by_doc : @hashmap.HashMap[Int32, Posting] = @hashmap.HashMap([])
-    for p in self.postings_of(field, term) {
-      by_doc.set(p.doc, p)
+    match posting_at(self.postings_of(field, term), num) {
+      Some(p) => aligned.push(p)
+      None => return 0
     }
-    if by_doc.is_empty() {
-      return 0
-    }
-    lists.push(by_doc)
-  }
-  let posting = match lists[0].get(num) {
-    Some(p) => p
-    None => return 0
   }
   if slop == 0 {
-    exact_phrase_count(posting, lists, terms.length())
+    exact_phrase_count(aligned[0], aligned, terms.length())
   } else {
-    sloppy_phrase_count(posting, lists, terms.length(), slop)
+    sloppy_phrase_count(aligned, terms.length(), slop)
+  }
+}
+
+///|
+/// The posting for `doc` in a doc-sorted list, by binary search.
+fn posting_at(list : Array[Posting], doc : Int32) -> Posting? {
+  let mut lo = 0
+  let mut hi = list.length()
+  while lo < hi {
+    let mid = (lo + hi) / 2
+    if list[mid].doc < doc {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  if lo < list.length() && list[lo].doc == doc {
+    Some(list[lo])
+  } else {
+    None
   }
 }
 
@@ -902,7 +1047,20 @@ pub fn Index::search(
             if or_terms.length() >= 2 && self.or_walk_pays(or_terms) {
               return self.or_terms_topk(or_terms, limit).hits
             }
-          None => ()
+          None =>
+            // A prefix that expands to exactly one dictionary term *is* a
+            // single-term query, so it gets the same block-max treatment
+            // (`seg*` -> `segment`). A prefix matching several terms is a union
+            // and stays on the evaluator, which merges their sorted lists.
+            match single_prefix_term(parsed) {
+              Some((prefix, field)) =>
+                match self.single_prefix_match(prefix, field) {
+                  Some(only) =>
+                    return self.term_topk_blockmax(field, only, limit).hits
+                  None => ()
+                }
+              None => ()
+            }
         }
     }
   }
@@ -944,4 +1102,82 @@ pub fn Index::count(self : Index, query : String) -> Int32 raise QueryError {
   )
   let scored = self.eval_sorted(parsed)
   scored.docs.length()
+}
+
+///|
+/// A binary min-heap of `(doc, list index)`, used to merge k doc-sorted posting
+/// lists. Ordered by document only: two lists holding the same document are
+/// both consumed in the same step, so their relative order does not matter.
+priv struct DocHeap {
+  items : Array[(Int32, Int32)]
+}
+
+///|
+fn DocHeap::new() -> DocHeap {
+  { items: [], }
+}
+
+///|
+fn DocHeap::is_empty(self : DocHeap) -> Bool {
+  self.items.is_empty()
+}
+
+///|
+/// The smallest document currently queued. Call only on a non-empty heap.
+fn DocHeap::peek_doc(self : DocHeap) -> Int32 {
+  self.items[0].0
+}
+
+///|
+fn DocHeap::push(self : DocHeap, doc : Int32, list : Int32) -> Unit {
+  self.items.push((doc, list))
+  let mut i = self.items.length() - 1
+  while i > 0 {
+    let parent = (i - 1) / 2
+    if self.items[parent].0 <= self.items[i].0 {
+      break
+    }
+    let tmp = self.items[parent]
+    self.items[parent] = self.items[i]
+    self.items[i] = tmp
+    i = parent
+  }
+}
+
+///|
+/// Remove the smallest entry and return its list index. Call only on a
+/// non-empty heap.
+fn DocHeap::pop_list(self : DocHeap) -> Int32 {
+  let top = self.items[0]
+  let last = self.items.pop()
+  if self.items.is_empty() {
+    return top.1
+  }
+  match last {
+    Some(entry) => {
+      self.items[0] = entry
+      let n = self.items.length()
+      let mut i = 0
+      while true {
+        let left = 2 * i + 1
+        let right = left + 1
+        let mut smallest = i
+        if left < n && self.items[left].0 < self.items[smallest].0 {
+          smallest = left
+        }
+        if right < n && self.items[right].0 < self.items[smallest].0 {
+          smallest = right
+        }
+        if smallest == i {
+          break
+        }
+        let tmp = self.items[i]
+        self.items[i] = self.items[smallest]
+        self.items[smallest] = tmp
+        i = smallest
+      }
+    }
+    None => ()
+  }
+  top.1
 }

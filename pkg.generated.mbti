@@ -27,6 +27,24 @@ pub fn fuse_rankings(Array[(String, Double)], Array[(String, Double)], limit? : 
 
 pub fn is_missing_number(Double) -> Bool
 
+pub async fn journal_append(String, JournalEntry) -> Unit raise StoreError
+
+pub fn journal_append_entry(Array[Byte], JournalEntry) -> Unit
+
+pub async fn journal_append_many(String, Array[JournalEntry]) -> Unit raise StoreError
+
+pub async fn journal_checkpoint(String, Index) -> Unit raise StoreError
+
+pub fn journal_decode(Bytes) -> Array[JournalEntry] raise CodecError
+
+pub fn journal_encode(Array[JournalEntry]) -> Bytes
+
+pub async fn journal_has_snapshot(String) -> Bool raise StoreError
+
+pub async fn journal_load_snapshot(String) -> Index raise StoreError
+
+pub async fn journal_replay(String) -> Array[JournalEntry] raise StoreError
+
 pub fn levenshtein(String, String) -> Int32
 
 pub fn parse_query(String, analyzer? : Analyzer, fields? : Array[String]) -> Query raise QueryError
@@ -381,6 +399,25 @@ pub fn Index::tokens_in(Self, String) -> Int32
 pub fn Index::vector_count(Self, String) -> Int32
 pub fn Index::vector_dim(Self, String) -> Int32
 pub fn Index::vector_fields(Self) -> Array[String]
+
+pub(all) struct JournalDoc {
+  id : String
+  fields : Array[(String, String)]
+  facets : Array[(String, Array[String])]
+  nums : Array[(String, Double)]
+  vectors : Array[(String, Array[Double])]
+} derive(Eq, @debug.Debug)
+pub fn JournalDoc::equal(Self, Self) -> Bool
+pub fn JournalDoc::not_equal(Self, Self) -> Bool
+pub fn JournalDoc::to_repr(Self) -> @debug.Repr
+
+pub(all) enum JournalEntry {
+  Put(JournalDoc)
+  Remove(String)
+} derive(Eq, @debug.Debug)
+pub fn JournalEntry::equal(Self, Self) -> Bool
+pub fn JournalEntry::not_equal(Self, Self) -> Bool
+pub fn JournalEntry::to_repr(Self) -> @debug.Repr
 
 pub(all) struct Posting {
   doc : Int32

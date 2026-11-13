@@ -302,3 +302,54 @@ test "the disjunction gate needs a dense operand and a much rarer one" {
     query_exact(idx, "common OR filler", 10),
   )
 }
+
+///|
+/// A prefix that expands to exactly one dictionary term is routed through
+/// block-max, like a single-term query. The result must still be the full
+/// evaluation, including the tie group and the deletions — otherwise the fast
+/// path silently changes which documents a prefix returns.
+test "a single-term prefix through block-max equals the exact path" {
+  let idx = wand_corpus(1200)
+  for d in 0..<1200 {
+    if d % 7 == 0 {
+      let _ = idx.delete("d\{d}")
+    }
+  }
+  // "comm" expands to exactly `common`; "fill" to exactly `filler`.
+  for prefix in ["comm", "fill", "t7"] {
+    for limit in [1, 5, 10, 100] {
+      let q = prefix + "*"
+      assert_eq(
+        idx.search(q, limit~) catch {
+          _ => ([] : Array[Hit])
+        },
+        query_exact(idx, q, limit),
+      )
+    }
+  }
+}
+
+///|
+/// A prefix matching several terms is a union and stays on the merge path.
+/// This pins that it still agrees with the evaluator, so the two prefix paths
+/// cannot drift apart.
+test "a multi-term prefix equals the exact path" {
+  let idx = wand_corpus(1200)
+  // "t" expands to the whole t0..t39 tail vocabulary.
+  for limit in [1, 5, 10, 100] {
+    let q = "t*"
+    assert_eq(
+      idx.search(q, limit~) catch {
+        _ => ([] : Array[Hit])
+      },
+      query_exact(idx, q, limit),
+    )
+  }
+  // A prefix that matches nothing returns nothing, not an error.
+  assert_eq(
+    idx.search("zzz*", limit=10) catch {
+      _ => ([] : Array[Hit])
+    },
+    query_exact(idx, "zzz*", 10),
+  )
+}

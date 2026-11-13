@@ -444,7 +444,10 @@ the *coordinator* down along with the shard. Scatter-gather spawns with
    not retried automatically (see 1).
 4. **No write-ahead log on the coordinator.** It holds no state, so a restart
    loses nothing important — but an in-flight bulk load whose shard dies mid-batch
-   is reported, not resumed.
+   is reported, not resumed. The *shards* are durable when started with
+   `--data-dir`: each journals its accepted writes and replays them on restart
+   (`docs/api.md`), so a shard that dies keeps what it acknowledged. What is still
+   missing is resuming the coordinator's batch across that death.
 5. **A rebalance is a foreground operation.** `/_rebalance` moves documents while
    the client waits, and the cluster answers throughout (searches fan out, so a
    document in two places during the move is returned by whichever shard is

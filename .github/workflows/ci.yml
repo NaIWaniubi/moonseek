@@ -161,3 +161,23 @@ jobs:
       - name: Repair a member that missed writes
         run: |
           bash tools/test-repair.sh _build/native/release/build/server/server.exe .
+
+  # A node that acknowledged a write must still have it after a restart. The
+  # server used to load a snapshot at startup and never write one, so a restart
+  # silently dropped everything ingested since then; --data-dir fixes that, and
+  # this job restarts the process to prove it.
+  durability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up MoonBit
+        run: |
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
+          echo "$HOME/.moon/bin" >> $GITHUB_PATH
+      - name: Build the server
+        run: |
+          moon update
+          moon build server --target native --release
+      - name: Writes, deletes, vectors and numbers survive a restart
+        run: |
+          bash tools/test-durability.sh _build/native/release/build/server/server.exe .

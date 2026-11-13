@@ -33,11 +33,13 @@ only concurrency in the stack is `moonbitlang/async`'s cooperative scheduler, us
 | Harness | Command | What it produces |
 |---|---|---|
 | Stress | `moon run bench/stress --target native --release` | 20k-doc build (median of 4), 10 query shapes (p50/p90 of 200 samples), fuzzy linear vs BK-tree, facet filter+aggregate, `explain`, 17.6 MB snapshot roundtrip |
+| Query shapes | `moon run bench/query --target native --release` | Exact/sloppy phrases, prefix expansion and boolean against the single terms they are built from, on the same corpus; p50/p90/min of 200 samples |
 | Micro | `moon bench --release` | 1,000-doc corpus through `@bench.T`: build, term, phrase, snapshot roundtrip |
 | Quality | `moon run tools/eval --target native --release -- demo/registry.json docs/quality.md` | NDCG@10 / MRR@10 / Recall@20 over 3,698 real packages and 6 ablation configurations |
 | Registry build | `moon run tools/registry --target native --release -- demo/registry.json demo/data/registry.msk` | The snapshot the browser demo loads, plus its build rate |
 | Browser | `demo/index.html` (WasmGC) | Snapshot load, query percentiles, snapshot export/import, latency-vs-scale curve, all in-page |
-| Correctness | `moon test` | 341 tests native / 290 wasm-gc · 290 js — run this before trusting any number |
+| Correctness | `moon test` | 354 tests native / 298 wasm-gc · 298 js — run this before trusting any number |
+| Durability | `bash tools/test-durability.sh <server.exe> .` | Writes, deletes, vectors and numeric columns survive a process restart; checkpoint truncates the journal |
 
 The stress corpus is generated in-process by `bench/stress/main.mbt` from a seeded xorshift RNG, a
 5,000-word Zipf vocabulary and 30 real English/Chinese anchor words. The generator is integer-only,
@@ -75,27 +77,72 @@ quote, and it hides the tail a user notices.
 
 | Query shape | df of the queried terms | p50 | p90 |
 |---|---:|---:|---:|
-| Selective term | 285 | **0.06 ms** | 0.08 ms |
+| Selective term | 285 | **0.05 ms** | 0.08 ms |
 | Mid-frequency term | 230 | **0.05 ms** | 0.06 ms |
-| Anchor term | 4,114 | **2.21 ms** | 2.40 ms |
-| Saturated term | 4,021 | **2.14 ms** | 2.41 ms |
-| Chinese bigram | 4,113 | **2.19 ms** | 2.50 ms |
-| Boolean (`search AND engine`) | two saturated | **4.50 ms** | 5.31 ms |
-| Exact phrase (`"database index"`) | positional | **6.25 ms** | 7.29 ms |
-| Sloppy phrase (`"database index"~3`) | positional + span walk | **7.89 ms** | 8.81 ms |
-| Field-scoped (`title:moonbit`) | 732 | **0.13 ms** | 0.15 ms |
-| Prefix (`seg*`) | expansion | **2.13 ms** | 2.33 ms |
+| Anchor term | 4,114 | **0.46 ms** | 0.94 ms |
+| Saturated term | 4,021 | **0.36 ms** | 0.68 ms |
+| Chinese bigram | 4,113 | **0.37 ms** | 0.69 ms |
+| Boolean (`search AND engine`) | two saturated | **3.02 ms** | 3.89 ms |
+| Exact phrase (`"database index"`) | positional | **0.30 ms** | 0.82 ms |
+| Sloppy phrase (`"database index"~3`) | positional + span walk | **1.18 ms** | 2.37 ms |
+| Field-scoped (`title:moonbit`) | 732 | **0.09 ms** | 0.15 ms |
+| Prefix (`seg*`) | one term after expansion | **0.85 ms** | 2.01 ms |
 
 Two things to read here. First, the spread between a selective term and a saturated one is now
-about 40×, not the ~650× of the map-based evaluator: the merge-based evaluator touches each posting
-once and selects top-K by bounded insertion rather than sorting the whole result set. Second, a
-sloppy phrase costs about 1.6 ms more than an exact one on this corpus — the minimal-span walk adds
-a binary search per term per candidate window, which is the expected price for allowing gaps.
+about 8×, not the ~650× of the map-based evaluator: the merge-based evaluator touches each posting
+once and selects top-K by bounded insertion rather than sorting the whole result set. Second, an
+exact phrase is now *cheaper* than the boolean query built from the same terms, which is the point of
+the rewrite below — it used to be the most expensive shape in the table.
 
 The df column matters: a query shape is only meaningful if the term exists. Earlier revisions of
 this harness measured `w4999x` and `title:rust`, neither of which occurs in the generated corpus,
 so those two rows were timing an empty posting list. They now pick terms by their actual document
 frequency and print it.
+
+### Phrases and prefixes: the two shapes that were doing unnecessary work
+
+`bench/query` isolates these against the same corpus (same generator and seed as the stress
+harness), reporting p50, p90 and the minimum of 200 samples.
+
+**Phrases.** `eval_phrase` used to build a `doc -> Posting` hash map for *every* term on *every*
+query. On a saturated term that is thousands of hash inserts before a single position is compared.
+It now walks the **rarest** term's doc-sorted list and probes the others with forward-only cursors,
+so the cost follows the phrase's candidates rather than the sum of the terms' document frequencies.
+`explain`'s phrase count binary-searches the one document it is asked about instead of building maps
+at all.
+
+| Shape | before (p50) | after (p50) | after (min) |
+|---|---:|---:|---:|
+| `"search engine"` (df 4021 + 4102) | 7.07 ms | **0.29 ms** | 0.19 ms |
+| `"search engine index"` (3 saturated) | — | **0.24 ms** | 0.14 ms |
+| `"search engine"~3` (sloppy) | 9.80 ms | **1.04 ms** | 0.44 ms |
+| `"search w4998x"` (dense + rare) | — | **0.04 ms** | 0.03 ms |
+| `"搜索 引擎"` (CJK bigrams) | — | **0.23 ms** | 0.18 ms |
+
+That is roughly **24× on the exact phrase and 9× on the sloppy one**. The dense+rare row is the
+mechanism made visible: the rare term has 285 postings, so the whole phrase costs 0.04 ms — about
+what that term alone costs — instead of walking 4,021 documents.
+
+**Prefixes.** Two changes. A prefix that expands to exactly one dictionary term (`seg*` → `segment`)
+*is* a single-term query, so it now takes the block-max path; the check counts distinct terms across
+fields and stops at the second one, so a broad prefix costs a couple of dictionary probes. A prefix
+matching several terms merges their doc-sorted lists over a **min-heap** rather than concatenating
+and sorting.
+
+| Shape | before (p50) | after (p50) | after (min) |
+|---|---:|---:|---:|
+| `seg*` (one term) | 2.34 ms | **0.44 ms** | 0.38 ms |
+| `w49*` (~1,100 terms) | 9.47 ms | **8.63 ms** | 6.42 ms |
+
+The heap matters for the second row: a first attempt scanned every cursor for the smallest document,
+which is O(k) per document and made a broad prefix *slower* than the sort it replaced. The heap makes
+it O(log k) per posting. Both prefix paths are pinned against the exact evaluator by tests, including
+deletions and a prefix that matches nothing.
+
+*Measurement note:* the "before" column is the previously published release figure for the same
+harness; the "after" column is a later release run on the same machine under different background
+load. The absolute milliseconds therefore carry that noise (the minimum column is the
+least-contended sample), but a 24× gap is far outside it.
 
 ### Block-max WAND: skipping the postings that cannot win
 
@@ -233,6 +280,33 @@ MSK3 is varint postings with delta-encoded positions, sorted terms, stored field
 a CRC-32 over the payload. Both figures include CRC computation and exclude file I/O. Serialization
 is now faster than deserialization: writing is a straight append through `ByteWriter`, while reading
 must rebuild per-term hash maps.
+
+### Server durability: what `--data-dir` costs
+
+The service used to load a snapshot at startup and never write one, so a restart
+dropped everything ingested since. `--data-dir` journals every accepted write
+(CRC-framed, data fsync) before applying it, and checkpoints atomically.
+
+The cost is the fsync, so it depends on how many writes share one:
+
+| Ingest of 2,000 documents | in-memory | durable | overhead |
+|---|---:|---:|---:|
+| One fsync per document (first implementation) | ~1,400 docs/s | ~550 docs/s | **~2.6×** |
+| One fsync per batch (shipped) | 219–249 ms | 250–289 ms | **~1.2–1.3×** |
+
+Server-side `took_ms` from the bulk response, minimum of four runs per mode across
+two sessions, so process startup and HTTP transfer are excluded. Batching is safe
+because every record carries its own CRC frame: a batch torn by a crash replays
+its complete prefix, exactly as a torn single record does. Sharing the fsync
+changes the cost, not the guarantee.
+
+A single-document `POST /index` still pays one fsync, because there is nothing to
+share it with — that is the price of acknowledging a durable write.
+
+Correctness is checked by `tools/test-durability.sh`, which restarts the process
+and asserts that text, facets, numeric columns, vectors and deletions all come
+back, that a checkpoint truncates the journal, and that a server without
+`--data-dir` reports 400 from `/_checkpoint` rather than pretending to persist.
 
 ### Large scale: 200,000 documents
 

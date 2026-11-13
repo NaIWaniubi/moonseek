@@ -1,0 +1,8 @@
+import {
+  "NaIWaniubi/moonseek",
+  "moonbitlang/core/bench",
+}
+
+supported_targets = "+native"
+
+pkgtype(kind: "executable")

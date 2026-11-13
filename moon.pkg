@@ -20,6 +20,8 @@ options(
     "store_test.mbt": [ "native" ],
     "wal_native.mbt": [ "native" ],
     "wal_native_test.mbt": [ "native" ],
+    "journal_native.mbt": [ "native" ],
+    "journal_native_test.mbt": [ "native" ],
     "fixes_native_test.mbt": [ "native" ],
   },
 )

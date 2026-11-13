@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.15.0 (2026-11-13)
+
+The service now **survives a restart**, and the two query shapes that were doing
+unnecessary work got rewritten. Phrases are ~24× faster, a one-term prefix ~5×,
+and durable bulk ingest costs ~1.2–1.3× in-memory instead of nothing-at-all being
+persisted.
+
+### Durable service (`--data-dir`)
+
+The server could load a snapshot with `--index` but never wrote one, so every
+document ingested since startup was lost on restart. `--data-dir DIR` closes
+that:
+
+* `journal.log` — one CRC-framed record per accepted write, appended with a data
+  fsync **before** the in-memory apply, so a crash between the two replays the
+  record instead of losing it. A torn tail replays only the complete prefix.
+* `index.msk` — the checkpoint: temp file → fsync → atomic rename, then the
+  journal is truncated. `POST /_checkpoint` forces one; it also happens
+  automatically every 10,000 records.
+
+The record carries the **whole** accepted write — text fields, facets, numeric
+columns and vectors — because the engine's own `Document` WAL only carries text,
+and replaying that would silently drop the rest and change search results after
+a restart. Replay reuses the same apply function as the live path, so the two
+cannot drift. `--index` and `--data-dir` are mutually exclusive; a coordinator
+never journals because it owns no documents.
+
+A bulk batch shares **one** fsync: each record keeps its own CRC frame, so a torn
+batch still replays its complete prefix. That took durable ingest from ~2.6×
+in-memory (one fsync per document) to ~1.2–1.3× (219–249 ms vs 250–289 ms for
+2,000 documents, server-side `took_ms`, min of four runs). A single-document
+write still pays one fsync — there is nothing to share it with.
+
+`tools/test-durability.sh` restarts the process and asserts that text, facets,
+numbers, vectors and deletions all come back, that the checkpoint truncates the
+journal, and that a server without `--data-dir` returns 400 from `/_checkpoint`
+rather than pretending. It runs in CI as a fifth end-to-end job.
+
+### Phrases: walk the rarest term, not every term
+
+`eval_phrase` built a `doc -> Posting` hash map for *every* term on *every*
+query — thousands of hash inserts on a saturated term before a single position
+was compared. It now walks the rarest term's doc-sorted list and probes the
+others with forward-only cursors, so the cost follows the phrase's candidates
+rather than the sum of the terms' document frequencies. `explain`'s phrase count
+binary-searches the one document it is asked about instead of building maps.
+
+Measured on 20k documents, `--release`, `bench/query`: `"search engine"`
+**7.07 → 0.29 ms** (~24×), `"search engine"~3` **9.80 → 1.04 ms** (~9×), and
+`"search w4998x"` (dense + rare) 0.04 ms — about what the rare term alone costs.
+
+### Prefixes: one term is a term, many terms merge over a heap
+
+A prefix expanding to exactly one dictionary term (`seg*` → `segment`) is a
+single-term query, so it takes the block-max path: **2.34 → 0.44 ms**. The check
+counts distinct terms across fields and stops at the second, so a broad prefix
+costs a couple of dictionary probes. A prefix matching several terms merges their
+doc-sorted lists over a **min-heap**; a first attempt scanned every cursor for the
+smallest document, which is O(k) per document and made `w49*` (~1,100 terms)
+*slower* than the sort it replaced. The heap makes it O(log k) per posting.
+
+Both prefix paths are pinned against the exact evaluator, with deletions and a
+prefix that matches nothing.
+
+### Added
+
+* `JournalDoc` / `JournalEntry`, `journal_encode` / `journal_decode` (portable),
+  `journal_append` / `journal_append_many` / `journal_replay` /
+  `journal_checkpoint` / `journal_has_snapshot` / `journal_load_snapshot`
+  (native).
+* `bench/query`: a harness for the compound query shapes against the single terms
+  they are built from, reporting p50/p90/min.
+* Tests: 354 native, 298 wasm-gc, 298 js (was 341 / 290 / 290).
+
 ## 0.14.0 (2026-11-12)
 
 Block-max WAND now covers **disjunctions** — where it is a measured win on the

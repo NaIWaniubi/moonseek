@@ -8,8 +8,8 @@
 
 [![CI](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml/badge.svg)](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![mooncakes](https://img.shields.io/badge/mooncakes-v0.14.0-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
-[![tests](https://img.shields.io/badge/tests-341%20native%20%C2%B7%20290%20wasm--gc-3fb950.svg)](#testing)
+[![mooncakes](https://img.shields.io/badge/mooncakes-v0.15.0-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
+[![tests](https://img.shields.io/badge/tests-354%20native%20%C2%B7%20298%20wasm--gc-3fb950.svg)](#testing)
 
 ![moonseek demo](docs/demo-screenshot.png)
 
@@ -35,6 +35,7 @@ MoonBit's ecosystem has HTTP servers, crypto and database drivers — but no tan
 - **Portable**: pure MoonBit core (no FFI in the engine); native file store via `moonbitlang/async`; browser export via WasmGC + js-string builtins. **One snapshot format, two backends**: an index built by the native binary loads byte-for-byte into the browser's wasm-gc build
 - **Measured quality, not just latency**: NDCG@10 / MRR@10 / Recall@20 over 3,698 real packages with a 6-way ablation ([docs/quality.md](docs/quality.md))
 - **HTTP service**: a REST search API (`docs/api.md`) with bulk ingest, facets, aggregations, highlighting, `explain`, suggest and vector queries. The console in `console/` drives it
+- **Durable service**: `--data-dir` journals every accepted write (CRC-framed, data fsync) before applying it and checkpoints atomically, so a restart replays text, facets, numbers, vectors and deletions exactly. One fsync per bulk batch keeps durable ingest within ~1.2–1.3× of in-memory; `tools/test-durability.sh` restarts the process to prove it
 - **Distributed cluster**: one binary is a node, a shard or a coordinator. **Consistent hashing** (a fourth shard moves 24% of the corpus, not 75%), **write routing with replication to every group member**, **cross-shard facets, aggregations, sorts and hybrid retrieval that equal a single node**, **globally consistent scoring** (`?dfs=true` reproduced a single node's ranking exactly, 8/8 queries, zero score difference), **`POST /_rebalance` to grow without a reindex** (the plan predicted 762 moves and the executor made 762, ending at exactly the predicted distribution), **`POST /_repair` to bring a member that missed writes back in line**, replica failover, and partial answers that name the shards that failed ([docs/cluster.md](docs/cluster.md))
 - **Vector search**: pure-MoonBit HNSW with **measured recall** against brute force (0.996@ef=32, 0.999@ef=64 on 1,000 random 32-d points), plus hybrid BM25 × kNN fusion by reciprocal rank
 - **Numeric aggregations**: terms, stats, histogram and percentiles over a result set, with numeric doc values alongside facets
@@ -70,6 +71,13 @@ curl -X POST localhost:7700/index/bulk --data-binary @docs.jsonl
 curl "localhost:7700/search?q=parser&facets=license"
 ```
 
+Add `--data-dir ./data` to make it **survive a restart**: every accepted write is
+journaled with a data fsync before it is applied, and `POST /_checkpoint` (or
+every 10,000 records) snapshots atomically and truncates the journal. Text,
+facets, numeric columns, vectors and deletions all come back on replay —
+`tools/test-durability.sh` restarts the process to prove it. Without the flag the
+server is in-memory only and says so (`/_checkpoint` returns 400).
+
 **3. As a cluster** — three shards and a coordinator that owns no data:
 
 ```bash
@@ -94,13 +102,14 @@ without a reindex → repair a diverged member → kill a primary (failover) →
 its replica (honest degradation). It is the thing to screen-record, and
 [docs/demo-video.md](docs/demo-video.md) is the shot list with narration.
 
-Four end-to-end scripts run in CI: `tools/test-cluster.sh` (dfs ranking, placement
+Five end-to-end scripts run in CI: `tools/test-cluster.sh` (dfs ranking, placement
 agreement, the ring's reshuffle, distributed aggregations, sorted queries,
 distributed hybrid retrieval, failover, two coordinators),
 `tools/test-replication.sh` (a replicated write survives the loss of its
 primary), `tools/test-rebalance.sh` (grow 3 shards to 4 without reindexing), and
-`tools/test-repair.sh` (a member that missed writes is brought back). To grow a
-running cluster:
+`tools/test-repair.sh` (a member that missed writes is brought back), and
+`tools/test-durability.sh` (writes, deletes, vectors and numbers survive a
+restart). To grow a running cluster:
 
 ```bash
 ./server.exe --addr 127.0.0.1:7805 --shards "…:7920,…:7921,…:7922,…:7923"   # after adding the new shard
@@ -195,12 +204,12 @@ median of 4 timed runs; queries are p50 of 200 samples, `limit=10`:
 | Index build | 2.73 s -> **7,320 docs/s** (median of 4) |
 | Selective term (df 285) | **0.06 ms** |
 | Field-scoped term (df 732) | 0.13 ms |
-| Saturated term (df 4,021) | 2.14 ms -> **0.47–0.83 ms** with block-max (see below) |
-| Chinese bigram (df 4,113) | 2.19 ms |
-| Boolean query | 4.50 ms |
-| Exact phrase | 6.25 ms |
-| Sloppy phrase `"a b"~3` | 7.89 ms |
-| Prefix query | 2.13 ms |
+| Saturated term (df 4,021) | **0.36 ms** with block-max (see below) |
+| Chinese bigram (df 4,113) | 0.37 ms |
+| Boolean query | 3.02 ms |
+| Exact phrase | 6.25 ms -> **0.29 ms** (rarest-term walk, ~24x) |
+| Sloppy phrase `"a b"~3` | 9.80 ms -> **1.04 ms** (~9x) |
+| Prefix query `seg*` | 2.34 ms -> **0.44 ms** (one term -> block-max) |
 | Facet filter + aggregation (3,055 matches) | 14.0 ms |
 | Fuzzy lookup, 23.8k terms | linear 37-46 ms -> **BK-tree 0.07-2.7 ms** (17-491x) |
 | Snapshot 17.6 MB: serialize / load | 0.68 s / 0.75 s |

@@ -16,7 +16,54 @@ Errors always use the same shape, so a client never has to guess:
 ```
 
 `code` is one of `bad_request` (400), `not_found` (404), `too_many_requests` (429),
-`internal` (500).
+`internal` (500), `unavailable` (503).
+
+---
+
+## Durability: `--data-dir`
+
+By default the server is **in-memory only**: it can load a snapshot with
+`--index`, but nothing it ingests is written back, so a restart starts empty.
+Pass `--data-dir DIR` to make writes durable:
+
+```bash
+moonseek-server --addr 127.0.0.1:7700 --data-dir ./data --schema title:6,body:1
+```
+
+The directory then holds two files:
+
+| File | Contents |
+|---|---|
+| `journal.log` | One CRC-framed record per accepted write, appended with a data fsync **before** the write is applied in memory |
+| `index.msk` | The last checkpoint: a full snapshot, written to a temp file, fsynced, then atomically renamed |
+
+On startup the server loads `index.msk` if present and replays `journal.log` on
+top of it. A record is written *before* the in-memory apply, so a crash between
+the two replays the record instead of losing it; a torn tail replays only the
+complete prefix. Replay reuses the same apply function as the live write path,
+so a restart cannot produce different answers — text fields, facets, numeric
+columns and vectors are all recorded and all come back.
+
+`--index` and `--data-dir` are mutually exclusive. A coordinator never journals:
+it owns no documents, so its shards carry the durability.
+
+### `POST /_checkpoint`
+
+Snapshot the index and truncate the journal. Also happens automatically once
+10,000 records have accumulated, so the journal does not grow without bound.
+
+```json
+{ "ok": true, "docs": 20000, "snapshot_bytes": 17613000,
+  "journal_records_cleared": 10000 }
+```
+
+Returns **400** when the server has no `--data-dir` — it says so rather than
+pretending to have persisted anything. A checkpoint failure returns **503** and
+leaves the journal intact, so the data is still recoverable by replay.
+
+The automatic checkpoint is best-effort: a failed snapshot is reported on stderr
+and the journal is kept, because the records are already durable and the write
+the client is waiting on must not fail because a snapshot can be retried.
 
 ---
 
