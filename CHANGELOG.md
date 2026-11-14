@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.17.3 (2026-11-14)
+
+### Docs: the comparison matrix was four features and fourteen versions out of date
+
+`docs/comparison.md` is linked from the README as the honest map of what this
+engine does and does not have, and it had stopped describing this engine. It was
+titled "moonseek 0.3.0"; its matrix predated vectors, hybrid ranking and the
+cluster; its code-size figure was 4.3k lines (the library is 9,030); it cited a
+217-test suite (355), a 44 KB demo snapshot (1.33 MiB) and a 1.7 s snapshot load
+(0.75 s for the same 17.6 MB image); and it listed "no sharding / distributed
+search ... moonseek explicitly does not" as a weakness — which is now simply
+false.
+
+The matrix is 22 rows against the current feature set, with three new ones — CJK
+tokenization, vector search + hybrid ranking, distributed sharding — and the
+weakness list keeps only the limitations that are still true: distributed mode is
+operator-driven, with no self-repair, no coordinator election and no transactional
+replication.
+
+`src` — a 166-line duplicate of `codec.mbt` left over from an abandoned
+`src/` layout — was deleted. It never compiled (no `.mbt` extension), but it
+was shipped inside the published package and invited edits to the wrong file.
+
 ## 0.17.2 (2026-11-14)
 
 ### Docs: every published number re-measured, and the ones that had drifted corrected

@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml/badge.svg)](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![mooncakes](https://img.shields.io/badge/mooncakes-v0.17.2-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
+[![mooncakes](https://img.shields.io/badge/mooncakes-v0.17.3-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
 [![tests](https://img.shields.io/badge/tests-355%20native%20%C2%B7%20299%20wasm--gc-3fb950.svg)](#testing)
 
 ![moonseek demo](docs/demo-screenshot.png)
