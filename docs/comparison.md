@@ -1,6 +1,6 @@
 # moonseek vs tantivy vs Lucene vs bleve
 
-A feature-by-feature comparison of moonseek 0.17.3 with three established embedded/full-text
+A feature-by-feature comparison of moonseek 0.17.x with three established embedded/full-text
 engines. The goal is a useful map, not a scoreboard: the three mature engines are decades of
 engineering, and several rows below are deliberately unflattering to moonseek.
 
@@ -9,7 +9,7 @@ Legend: ✅ implemented and documented · ⚠️ partial, optional module, or ve
 
 ## Matrix
 
-| Capability | moonseek 0.17.3 (MoonBit) | tantivy (Rust) | Apache Lucene (Java) | bleve (Go) |
+| Capability | moonseek 0.17.x (MoonBit) | tantivy (Rust) | Apache Lucene (Java) | bleve (Go) |
 |---|---|---|---|---|
 | Inverted index | ✅ per-field postings with positions | ✅ | ✅ | ✅ |
 | BM25 ranking | ✅ k1=1.2, b=0.75, per-field weight | ✅ (BM25 by default) | ✅ (BM25Similarity) | ✅ (BM25; TF-IDF also available) |

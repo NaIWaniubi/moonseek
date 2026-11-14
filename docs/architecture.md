@@ -4,7 +4,7 @@
 
 1. **Pure MoonBit core** — the engine (tokenize → index → query → score) uses no FFI, so it compiles unchanged to native, wasm-gc and js.
 2. **Crash safety by construction** — a snapshot is either complete and checksummed or rejected; the file store never overwrites the live snapshot in place.
-3. **Small, auditable surface** — ~2k LOC, one runtime dependency (`moonbitlang/async`, native store only).
+3. **Small, auditable surface** — ~8.5k LOC (library package, tests excluded), one runtime dependency (`moonbitlang/async`, native store only).
 
 ## Pipeline
 

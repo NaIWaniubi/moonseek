@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.17.4 (2026-11-14)
+
+### Docs: the CI count was wrong, and two figures had collapsed to their best case
+
+Three claims that survived every earlier sweep because nobody counted them:
+
+- The proposal said "CI 十七项" (17 checks) in two places. The workflow defines 11
+  jobs, six of which are the ubuntu/windows × native/wasm-gc/js matrix, so the
+  Actions page shows **16** checks — 10 single jobs plus 6 matrix legs. Corrected
+  to 十六项.
+- The README's durable-service bullet quoted group commit as "1.9× at 8 writers,
+  3.4× at 32" — the best end of each re-measured range. It now reads
+  **1.9–2.2×** and **2.7–3.4×**, which is what the benchmark reports.
+- `docs/architecture.md` still called the library "~2k LOC"; it is 8,514 lines
+  excluding tests. The advanced example's header still promised "every 0.3.0
+  capability".
+
+`docs/comparison.md` is now versioned as 0.17.x instead of pinning a patch
+number, so the matrix stops going stale on every release.
+
 ## 0.17.3 (2026-11-14)
 
 ### Docs: the comparison matrix was four features and fourteen versions out of date

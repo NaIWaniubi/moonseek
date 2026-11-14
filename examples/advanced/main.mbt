@@ -1,5 +1,5 @@
 ///|
-/// Advanced example: every 0.3.0 capability in one run.
+/// Advanced example: the advanced capability set in one run.
 /// Faceted search (filter + aggregation + offset pagination), fuzzy search
 /// (BK-tree), did-you-mean suggestions, score explanation, sort orders,
 /// cursor pagination, and server-side highlighting / snippets.
