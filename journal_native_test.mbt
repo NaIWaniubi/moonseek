@@ -56,7 +56,7 @@ async test "journal: checkpoint writes the snapshot and truncates the log" {
   @moonseek.journal_append(dir, Put(jdoc("b"))) catch {
     e => fail(e.to_string())
   }
-  @moonseek.journal_checkpoint(dir, index) catch {
+  let _ = @moonseek.journal_checkpoint(dir, index) catch {
     e => fail(e.to_string())
   }
   // The log is empty and the snapshot is there.
@@ -81,7 +81,7 @@ async test "journal: replay after a checkpoint is idempotent" {
   @moonseek.journal_append(dir, Put(jdoc("a"))) catch {
     e => fail(e.to_string())
   }
-  @moonseek.journal_checkpoint(dir, index) catch {
+  let _ = @moonseek.journal_checkpoint(dir, index) catch {
     e => fail(e.to_string())
   }
   // Simulate a crash *after* the rename but *before* the truncation: the

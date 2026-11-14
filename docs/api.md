@@ -214,6 +214,33 @@ different total from its primary, which is exactly the state failover must not b
 in. Only the primary's ids travel as a `has` query, so the request size is bounded
 by that group's share of the corpus rather than the whole one.
 
+A **primary with zero documents is still authoritative**: if every document its
+group owned has been deleted, a member still holding one is serving a document the
+cluster no longer has, and repair removes it.
+
+A **member that does not answer is reported, not skipped**: it appears in
+`failed_addresses` and `ok` is `false`, because nothing about that member was
+observed. `ok` therefore means "every member was inspected and agrees", not "the
+call returned".
+
+## `GET /_dfs?q=…`
+
+**Coordinator only.** Diagnostics for the two-phase query path: the document
+frequencies and average field lengths the coordinator gathered from every group
+before scoring. This is the data `dfs=true` uses, exposed so a surprising ranking
+can be attributed to the statistics instead of guessed at.
+
+```json
+{ "n": 3000,
+  "df": { "title\u0000parser": 812, "body\u0000parser": 1094 },
+  "avgdl": { "title": 6.4, "body": 41.2 } }
+```
+
+Term keys are `field` + a NUL byte + `term`, the same keys the shard search
+request carries. A query whose terms would be analyzed differently by different
+shards answers `400 bad_request` rather than reporting statistics from a partial
+fan-out.
+
 ## `GET /search`
 
 | param | default | meaning |

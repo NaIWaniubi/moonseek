@@ -181,3 +181,46 @@ jobs:
       - name: Writes, deletes, vectors and numbers survive a restart
         run: |
           bash tools/test-durability.sh _build/native/release/build/server/server.exe .
+      - name: No acknowledged write is lost across concurrent checkpoints
+        run: |
+          bash tools/test-durability-concurrent.sh _build/native/release/build/server/server.exe .
+
+  # `_repair` reads the primary's id list and uses it as the authority. Two
+  # states look identical to that read — a primary with zero documents, and a
+  # primary that did not answer — and confusing them either leaves a replica
+  # serving a deleted document or reports a group as healthy that was never
+  # inspected. This job builds both states on purpose.
+  repair-edge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up MoonBit
+        run: |
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
+          echo "$HOME/.moon/bin" >> $GITHUB_PATH
+      - name: Build the server
+        run: |
+          moon update
+          moon build server --target native --release
+      - name: An empty primary is still authoritative, and a dead member is named
+        run: |
+          bash tools/test-repair-edge.sh _build/native/release/build/server/server.exe .
+
+  # The coordinator pools shard connections, so every idle socket is invalid the
+  # moment a shard restarts. If the first request after that were reported as a
+  # dead shard, the cluster would serve a partial answer for a healthy one.
+  shard-restart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up MoonBit
+        run: |
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
+          echo "$HOME/.moon/bin" >> $GITHUB_PATH
+      - name: Build the server
+        run: |
+          moon update
+          moon build server --target native --release
+      - name: A pooled socket survives its shard restarting
+        run: |
+          bash tools/test-shard-restart.sh _build/native/release/build/server/server.exe .

@@ -33,7 +33,7 @@ pub fn journal_append_entry(Array[Byte], JournalEntry) -> Unit
 
 pub async fn journal_append_many(String, Array[JournalEntry]) -> Unit raise StoreError
 
-pub async fn journal_checkpoint(String, Index) -> Unit raise StoreError
+pub async fn journal_checkpoint(String, Index) -> Int32 raise StoreError
 
 pub fn journal_decode(Bytes) -> Array[JournalEntry] raise CodecError
 

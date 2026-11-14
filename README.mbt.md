@@ -102,14 +102,19 @@ without a reindex → repair a diverged member → kill a primary (failover) →
 its replica (honest degradation). It is the thing to screen-record, and
 [docs/demo-video.md](docs/demo-video.md) is the shot list with narration.
 
-Five end-to-end scripts run in CI: `tools/test-cluster.sh` (dfs ranking, placement
-agreement, the ring's reshuffle, distributed aggregations, sorted queries,
-distributed hybrid retrieval, failover, two coordinators),
-`tools/test-replication.sh` (a replicated write survives the loss of its
-primary), `tools/test-rebalance.sh` (grow 3 shards to 4 without reindexing), and
-`tools/test-repair.sh` (a member that missed writes is brought back), and
-`tools/test-durability.sh` (writes, deletes, vectors and numbers survive a
-restart). To grow a running cluster:
+Eight end-to-end scripts run in CI, each its own job so a failure is
+attributable: `tools/test-cluster.sh` (dfs ranking, placement agreement, the
+ring's reshuffle, distributed aggregations, sorted queries, distributed hybrid
+retrieval, failover, two coordinators), `tools/test-replication.sh` (a replicated
+write survives the loss of its primary), `tools/test-rebalance.sh` (grow 3 shards
+to 4 without reindexing), `tools/test-repair.sh` (a member that missed writes is
+brought back), `tools/test-repair-edge.sh` (an empty primary still removes a
+replica's ghost, and an unreachable member is named rather than skipped),
+`tools/test-shard-restart.sh` (a pooled shard connection survives its shard
+restarting), `tools/test-durability.sh` (writes, deletes, vectors and numbers
+survive a restart), and `tools/test-durability-concurrent.sh` (no acknowledged
+write is lost across 6 concurrent writers and 25 forced checkpoints). To grow a
+running cluster:
 
 ```bash
 ./server.exe --addr 127.0.0.1:7805 --shards "…:7920,…:7921,…:7922,…:7923"   # after adding the new shard
@@ -118,8 +123,18 @@ curl -X POST "localhost:7805/_repair"      # after a member comes back
 ```
 
 `tools/check-cluster.mjs` runs the cluster-vs-single-node comparison and prints
-the identity and latency tables in [docs/cluster.md](docs/cluster.md). Ask a
-coordinator where a document lives with `GET /_placement?id=…`, and what a
+the identity and latency tables in [docs/cluster.md](docs/cluster.md).
+`tools/bench-cluster.mjs` measures what fan-out costs: it starts K shards, one
+single node on the same corpus and one coordinator, and interleaves the samples
+so the machine's drifting load cannot bias one arm.
+
+| 3 shards, 3,000 docs | single node | coordinator | ratio |
+|---|---|---|---|
+| mean query p50 (6 shapes) | — | — | **1.13×** |
+| one forwarded write | — | — | **1.31×** |
+| 2,000 writes, 3 groups × 2 members | 320 docs/s | 254 docs/s | **1.26×**, all fully acknowledged |
+
+Ask a coordinator where a document lives with `GET /_placement?id=…`, and what a
 grow-out would cost with `GET /_plan?shards=4`.
 
 ## Quick start

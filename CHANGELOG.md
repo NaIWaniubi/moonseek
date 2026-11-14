@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.16.0 (2026-11-14)
+
+The cluster got **cheaper and more honest**. Reusing shard connections removed
+most of what a coordinator added: a forward write went from 2.19× a local write to
+1.31×, fan-out queries from 1.62× to 1.13×, and a two-member replicated write
+from 3.10× to 1.26×. Three repair/rebalance paths that reported success without
+having done the work now report what happened.
+
+### Performance: shard connections are pooled
+
+* A coordinator dialled a fresh TCP connection for **every** shard call, so a
+  replicated write paid two connects and a fan-out query paid K. The shard
+  listener now serves several framed requests per connection and the coordinator
+  keeps up to 8 idle sockets per address.
+
+  Measured with `tools/bench-cluster.mjs` (3 shards, 3,000 documents, 60
+  interleaved samples per query): mean coordinator/single latency ratio **1.62× →
+  1.13×**; one-hop forwarded write **2.19× → 1.31×**; 2,000 documents through 3
+  groups of 2 members **3.10× → 1.26×** (83 → 254 docs/s against a single node's
+  320).
+
+* A pooled socket is invalid when its shard restarts, and a dead socket looks
+  exactly like a dead shard. A failed **reused** socket now gets one retry on a
+  fresh connection; a failure on a fresh connection is still reported as the shard
+  not answering. `tools/test-shard-restart.sh` (new CI job) restarts a shard under
+  a warm pool and requires the very next query to be exact.
+
+### Fixed: `_repair` treated "no documents" as "not there"
+
+* **An empty primary skipped its whole group.** `cluster_repair` returned early
+  when the primary reported no ids, so a replica holding a document the cluster
+  had deleted was never cleaned — and would have been served after failover. An
+  empty primary is now authoritative: the ghost is removed (`deferred` counts it).
+* **An unreachable member was silently skipped.** `_repair` answered `ok: true`
+  with no failed address while a replica was down, which reads as "the group is in
+  sync" when nothing about it was inspected. Both an unreachable primary and an
+  unreachable replica are now named in `failed_addresses` with `ok: false`.
+* `group_ids` returns whether the member answered at all, instead of folding
+  "empty" and "unreachable" into the same empty list.
+
+`tools/test-repair-edge.sh` (new CI job) builds both states and asserts on them.
+
+### Fixed: `_rebalance` did not report shards it could not read
+
+`cluster_ids_by_shard` turned a shard that failed its `ids` request into an empty
+id list, which a migration reads as "nothing to move". A rebalance that relocated
+three of four shards could therefore report success. The unreachable addresses are
+now carried into the report's `failed_addresses`, so a partial migration is
+visibly partial.
+
+### Durability
+
+* **A checkpoint serialized the index twice** — once to report a size and once to
+  write it. `journal_checkpoint` now returns the byte count from the snapshot it
+  wrote, halving the serialization work on the one path that touches the whole
+  index. `POST /_checkpoint` also reports `took_ms`.
+* Journal appends and checkpointing are serialized by a write lock. A checkpoint
+  yields between writing the snapshot and truncating the journal, and a record
+  appended in that window is in the snapshot only if the snapshot serialized its
+  apply — while the truncate erases its journal record either way. The lock makes
+  "the journal is empty" mean "the snapshot contains everything".
+  `tools/test-durability-concurrent.sh` (new CI job) runs 6 concurrent writers
+  against 25 forced checkpoints on a 6,000-document index and requires every
+  acknowledged write after a restart. The window could not be provoked on this
+  machine even with the lock removed, so this is recorded as an explicit
+  invariant rather than as a fix for an observed loss.
+
+### Documented
+
+* `GET /_dfs?q=…` was implemented and documented nowhere; it now has an
+  `docs/api.md` section, and the response shape is pinned by a live check.
+* `POST /_repair`'s empty-primary and unreachable-member semantics are in
+  `docs/api.md` and `docs/cluster.md`.
+* `docs/cluster.md` no longer claims one request per connection.
+
 ## 0.15.1 (2026-11-13)
 
 ### Fixed

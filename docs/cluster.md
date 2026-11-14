@@ -134,8 +134,8 @@ reports `ok: 2, failed: 1` and the total drops 2376 → 1609.
 
 ## The shard protocol
 
-One JSON request per TCP connection, length-prefixed with a 4-byte little-endian
-header, one JSON reply, then close.
+Framed JSON requests, length-prefixed with a 4-byte little-endian header, one
+JSON reply each, on a connection the coordinator keeps open and reuses.
 
 | op | request | reply |
 |---|---|---|
@@ -152,7 +152,7 @@ header, one JSON reply, then close.
 | `has` | `{"op":"has","ids":[…]}` | which of those ids the shard is missing |
 | `delete_many` | `{"op":"delete_many","ids":[…]}` | how many were deleted |
 
-Two framing details are load-bearing:
+Three framing details are load-bearing:
 
 * **Length prefix, not newline framing.** Reading until EOF deadlocks against a
   client that sends a request and then waits for the reply — the server waits for
@@ -160,6 +160,48 @@ Two framing details are load-bearing:
 * **UTF-8 on the wire.** `String::to_bytes` in MoonBit is UTF-16LE, so a reply
   decoded with the matching `Bytes::to_string` reads back as one character per two
   bytes. Both sides use `@utf8`.
+* **The connection is reused.** The listener loops until the peer closes, and the
+  coordinator keeps up to 8 idle sockets per shard address. A request and its
+  reply still occupy the socket exclusively, so there is no pipelining and no
+  interleaving; reuse only removes the connect, not the one-at-a-time rule.
+
+A pooled socket is dead the moment its shard restarts, and a dead socket is
+indistinguishable from a dead shard until a new connect is attempted. So a failed
+**reused** socket gets exactly one retry on a fresh connection, while a failure on
+a fresh connection is reported as the shard not answering. `tools/test-shard-restart.sh`
+restarts a shard under a warm pool and requires the very next query to be exact.
+
+## What fan-out costs
+
+`tools/bench-cluster.mjs` starts K shards, one single node holding the same
+corpus, and one coordinator, then interleaves single/coordinator samples so the
+machine's drifting background load cannot bias one arm. 3,000 documents, 3
+shards, 60 interleaved samples per query:
+
+| query | total | single p50 | coordinator p50 | ratio |
+|---|---|---|---|---|
+| `parser` | 2376 | 10.72 ms | 10.99 ms | 1.03× |
+| `compiler AND gc` | 1315 | 10.34 ms | 11.73 ms | 1.13× |
+| `"zero-copy"` | 835 | 6.77 ms | 11.32 ms | 1.67× |
+| `scheduler OR allocator` | 2689 | 15.29 ms | 12.43 ms | 0.81× |
+| `tensor` | 2111 | 10.53 ms | 10.86 ms | 1.03× |
+| `socket cache` | 1401 | 9.60 ms | 10.36 ms | 1.08× |
+
+Mean ratio **1.13×**. The row below 1.0 is not a typo: each shard holds a third
+of the corpus, so a highly selective query does a third of the posting work on
+each of three machines in parallel, and the saved work exceeds the extra hop.
+
+Writes, 2,000 documents one at a time through 3 groups of 2 members:
+
+| path | throughput | vs single node |
+|---|---|---|
+| single node | 320 docs/s | 1.00× |
+| coordinator, 2 members | 254 docs/s | 1.26×, 2000/2000 acknowledged by every member |
+
+Before connection reuse the same benchmark read 1.62× for queries and 3.10× for
+replicated writes; a one-hop forwarded write cost 2.19× a local write even though
+the shard performed the same single fsync, which is what identified the
+connection — not the work — as the cost.
 
 ## Scatter-gather, and the two scoring modes
 
@@ -370,6 +412,26 @@ killing the group's primary afterwards leaves the cluster's answer byte-identica
 
 Unless you run one, nothing repairs anything: a member that missed a write stays
 behind. That is stated in the not-implemented list below.
+
+### Empty is not the same as gone
+
+Repair reads the primary's id list and treats it as the authority, and two states
+look identical to that read while meaning opposite things:
+
+* **A primary with zero documents is still authoritative.** A group whose every
+  document was deleted is a real state, and a member still holding one is serving
+  a document the cluster no longer has. An earlier version skipped the whole
+  group when the primary reported no ids, so that ghost survived every repair and
+  would have been served after failover.
+* **A member that did not answer is a failure, not a no-op.** Nothing about it was
+  observed, so `ok` must be `false` and the address must appear in
+  `failed_addresses`. Reporting `ok` there tells an operator a group is in sync
+  that was never inspected.
+
+`tools/test-repair-edge.sh` builds both states: it deletes a group's last
+document, seeds a ghost directly onto the replica, and requires repair to remove
+it (`deferred: 1`); then it kills the replica and requires the next repair to
+answer `ok: false` naming that address.
 
 ## Several coordinators
 

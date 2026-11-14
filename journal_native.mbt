@@ -104,13 +104,20 @@ pub async fn journal_replay(
 /// replays already-checkpointed records, which is idempotent because a Put
 /// replaces by id and Remove is a tombstone. An empty journal is left alone
 /// rather than recreated, so the next append still writes its header.
+///
+/// Returns the snapshot size in bytes. Serializing the index is the expensive
+/// half of a checkpoint, so the caller gets the size from the write it already
+/// paid for instead of serializing the whole index a second time just to report
+/// a number.
 pub async fn journal_checkpoint(
   dir : String,
   index : Index,
-) -> Unit raise StoreError {
+) -> Int32 raise StoreError {
   let path = dir + JOURNAL_SNAPSHOT
   let tmp = path + ".tmp"
-  @fs.write_file(tmp, index.to_bytes(), sync=Data) catch {
+  let snapshot = index.to_bytes()
+  let bytes = snapshot.length()
+  @fs.write_file(tmp, snapshot, sync=Data) catch {
     e => raise StoreError::IoError(e.to_string())
   }
   @fs.rename(tmp, path) catch {
@@ -125,6 +132,7 @@ pub async fn journal_checkpoint(
   ) catch {
     e => raise StoreError::IoError(e.to_string())
   }
+  bytes
 }
 
 ///|

@@ -408,16 +408,65 @@ struct ShardHits {
 }
 
 ///|
-/// Send one line of JSON to a shard and read one line back. Returns None when
-/// the shard cannot be reached, which the caller turns into failover.
+/// Idle connections kept per shard address.
 ///
-/// One request per connection keeps the protocol trivial to reason about: there
-/// is no pipelining, no framing beyond a newline, and a half-written request
-/// can only affect the connection it was sent on.
-async fn shard_call(addr_text : String, request : String) -> String? {
-  let addr = @socket.Addr::parse(addr_text) catch { _ => return None }
-  let sock = @socket.Tcp::connect(addr) catch { _ => return None }
-  defer sock.close()
+/// A coordinator writes every document to every member of its group and reads
+/// every query from every group, so it dials far more often than it holds
+/// connections open. Measured on this machine, a one-hop forwarded write cost
+/// 2.19× a local write even though the shard did the same single fsync — the
+/// difference was the connection, not the work. Reusing an idle socket removes
+/// it from the hot path without changing the protocol: the exchange is still one
+/// request and one reply, just not on a socket that was created for it.
+///
+/// The cap bounds what an idle cluster holds open; a burst above it simply
+/// connects, which is the old behaviour.
+const SHARD_POOL_PER_ADDR : Int32 = 8
+
+///|
+/// Idle shard sockets, keyed by address. A `Ref` because this is process-wide
+/// cache state, not part of a request's data: it must survive across requests
+/// to be worth anything.
+let shard_pool : @ref.Ref[@hashmap.HashMap[String, Array[@socket.Tcp]]] = @ref.Ref(
+  @hashmap.HashMap([]),
+)
+
+///|
+/// Take an idle socket for `addr_text`, or None when the pool is empty. Pops
+/// under no lock because the async scheduler runs one task at a time between
+/// await points, and this function never awaits: a socket can be handed to at
+/// most one task.
+fn pooled_socket(addr_text : String) -> @socket.Tcp? {
+  match shard_pool.val.get(addr_text) {
+    Some(sockets) => if sockets.length() == 0 { None } else { sockets.pop() }
+    None => None
+  }
+}
+
+///|
+/// Return a healthy socket to the pool, or close it when the pool for this
+/// address is already full.
+fn release_socket(addr_text : String, sock : @socket.Tcp) -> Unit {
+  let map = shard_pool.val
+  match map.get(addr_text) {
+    Some(sockets) =>
+      if sockets.length() >= SHARD_POOL_PER_ADDR {
+        sock.close()
+      } else {
+        sockets.push(sock)
+      }
+    None => {
+      let sockets : Array[@socket.Tcp] = [sock]
+      map.set(addr_text, sockets)
+    }
+  }
+}
+
+///|
+/// One exchange on an existing socket. Returns None on any I/O or framing
+/// failure, and leaves the socket's fate to the caller: a socket that failed
+/// mid-exchange must not be pooled, because the reply it never finished reading
+/// would be delivered to the next caller.
+async fn shard_exchange(sock : @socket.Tcp, request : String) -> String? {
   let payload = @utf8.encode(request)
   // Length-prefixed framing, not newline-terminated. A newline delimiter only
   // works if the reader can tell a complete message from a partial one, and
@@ -434,6 +483,50 @@ async fn shard_call(addr_text : String, request : String) -> String? {
   }
   let body = sock.read_exactly(length) catch { _ => return None }
   Some(@utf8.decode(body) catch { _ => "" })
+}
+
+///|
+/// Send one JSON request to a shard and read one JSON answer.
+///
+/// Reuses an idle connection when one is pooled, and falls back to a fresh
+/// connection otherwise. A pooled socket can be dead — the shard restarted, or
+/// the peer closed an idle connection — which is indistinguishable from an
+/// outage until a new connect is attempted, so a failed *reused* socket gets
+/// exactly one retry on a fresh connection. A failure on a fresh connection is
+/// the answer: it is the same outcome the pre-pooling code produced.
+async fn shard_call(addr_text : String, request : String) -> String? {
+  match pooled_socket(addr_text) {
+    Some(sock) =>
+      match shard_exchange(sock, request) {
+        Some(answer) => {
+          release_socket(addr_text, sock)
+          Some(answer)
+        }
+        None => {
+          // Do not pool it: a half-read reply would corrupt the next caller.
+          sock.close()
+          shard_call_fresh(addr_text, request)
+        }
+      }
+    None => shard_call_fresh(addr_text, request)
+  }
+}
+
+///|
+/// Dial once, exchange once, and pool the socket when the exchange completed.
+async fn shard_call_fresh(addr_text : String, request : String) -> String? {
+  let addr = @socket.Addr::parse(addr_text) catch { _ => return None }
+  let sock = @socket.Tcp::connect(addr) catch { _ => return None }
+  match shard_exchange(sock, request) {
+    Some(answer) => {
+      release_socket(addr_text, sock)
+      Some(answer)
+    }
+    None => {
+      sock.close()
+      None
+    }
+  }
 }
 
 ///|
@@ -1074,12 +1167,20 @@ pub fn doc_id_of(body : String) -> String? {
 }
 
 ///|
-/// Ask every shard group for its own live document ids, keeping the grouping.
+/// Ask every shard group for its own live document ids, keeping the grouping,
+/// and name the groups that did not answer.
 ///
 /// `cluster_all_ids` flattens the ids because the planner only counts them. A
 /// migration needs to know *which shard holds each one*, because a move is from
 /// a concrete source to a concrete destination.
-async fn cluster_ids_by_shard(config : ClusterConfig) -> Array[Array[String]] {
+///
+/// The second return value matters as much as the first: a group that never
+/// answered contributes an empty list, which to a migration looks exactly like a
+/// group with nothing to move. Without the names, a rebalance that relocated
+/// three of four shards reports success and silently leaves a shard in place.
+async fn cluster_ids_by_shard(
+  config : ClusterConfig,
+) -> (Array[Array[String]], Array[String]) {
   let answers : Array[(String?, String)] = Array::make(
     config.shards.length(),
     (None, ""),
@@ -1096,6 +1197,7 @@ async fn cluster_ids_by_shard(config : ClusterConfig) -> Array[Array[String]] {
     }
   })
   let out : Array[Array[String]] = []
+  let unreadable : Array[String] = []
   for i in 0..<config.shards.length() {
     let ids : Array[String] = []
     match answers[i].0 {
@@ -1113,11 +1215,11 @@ async fn cluster_ids_by_shard(config : ClusterConfig) -> Array[Array[String]] {
             }
           _ => ()
         }
-      None => ()
+      None => unreadable.push(answers[i].1)
     }
     out.push(ids)
   }
-  out
+  (out, unreadable)
 }
 
 ///|
@@ -1215,6 +1317,7 @@ async fn cluster_rebalance(
   config : ClusterConfig,
   ids_by_shard : Array[Array[String]],
   from_shards : Int32,
+  unreadable~ : Array[String] = [],
 ) -> MoveReport {
   let to_shards = config.shards.length()
   let ring_from = build_ring(from_shards)
@@ -1223,7 +1326,10 @@ async fn cluster_rebalance(
   let mut replicated = 0
   let mut deferred = 0
   let mut missing_at_source = 0
-  let failed : Array[String] = []
+  // A group whose ids could not be read is a failure of the migration, not an
+  // empty source: its documents stayed where they were, and the caller has to
+  // be able to tell that apart from "there was nothing to move".
+  let failed : Array[String] = unreadable.copy()
   for source in 0..<ids_by_shard.length() {
     let leaving : Array[String] = []
     for id in ids_by_shard[source] {
@@ -1319,6 +1425,15 @@ async fn delete_group(group : ShardGroup, ids : Array[String]) -> WriteAck {
 ///
 /// Only the primary's ids are sent as a `has` query, so the request size is
 /// bounded by the group's own share of the corpus rather than the whole one.
+///
+/// Two states must not be confused, and the function's shape says so:
+///
+/// * an **empty primary is authoritative**. Every document the group owned may
+///   legitimately have been deleted, in which case a replica still holding one
+///   is serving a document the cluster does not have, and repair must remove it.
+/// * an **unreachable member is a failure, not a no-op**. Nothing about that
+///   group was observed, so reporting it as repaired would be the one answer an
+///   operator cannot act on.
 async fn cluster_repair(config : ClusterConfig) -> MoveReport {
   let mut repaired = 0
   let mut replicated = 0
@@ -1329,8 +1444,11 @@ async fn cluster_repair(config : ClusterConfig) -> MoveReport {
     if members.length() < 2 {
       continue
     }
-    let primary_ids = group_ids(group.primary)
-    if primary_ids.is_empty() {
+    let (primary_ids, primary_alive) = group_ids(group.primary)
+    if !primary_alive {
+      // Without the authority there is nothing to align to, and inventing an
+      // empty one would delete live replicas.
+      failed.push(group.primary)
       continue
     }
     let authoritative : Map[String, Unit] = Map([])
@@ -1339,6 +1457,13 @@ async fn cluster_repair(config : ClusterConfig) -> MoveReport {
     }
     for i in 1..<members.length() {
       let replica = members[i]
+      // One read of the member's own ids serves both directions: what it holds
+      // that the primary does not, and the liveness check for this member.
+      let (replica_ids, replica_alive) = group_ids(replica)
+      if !replica_alive {
+        failed.push(replica)
+        continue
+      }
       // What the member lacks...
       let missing = replica_missing(replica, primary_ids)
       if missing.length() > 0 {
@@ -1361,9 +1486,10 @@ async fn cluster_repair(config : ClusterConfig) -> MoveReport {
           }
         }
       }
-      // ...and what it holds that the primary does not.
+      // ...and what it holds that the primary does not. An empty primary makes
+      // every one of the member's ids extra, which is the case the old
+      // `primary_ids.is_empty()` guard used to skip.
       let extra : Array[String] = []
-      let replica_ids = group_ids(replica)
       for id in replica_ids {
         if !authoritative.contains(id) {
           extra.push(id)
@@ -1371,9 +1497,12 @@ async fn cluster_repair(config : ClusterConfig) -> MoveReport {
       }
       if extra.length() > 0 {
         let ack = delete_group({ primary: replica, replicas: [], }, extra)
-        removed = removed + extra.length()
-        for address in ack.failed {
-          failed.push(address)
+        if ack.failed.length() > 0 {
+          for address in ack.failed {
+            failed.push(address)
+          }
+        } else {
+          removed = removed + extra.length()
         }
       }
     }
@@ -1388,27 +1517,34 @@ async fn cluster_repair(config : ClusterConfig) -> MoveReport {
 }
 
 ///|
-/// The ids one shard reports holding, or an empty list when it does not answer.
-async fn group_ids(addr : String) -> Array[String] {
-  let out : Array[String] = []
+/// The ids one shard reports holding, **and whether it answered at all**.
+///
+/// Both come back together because an empty list is a real answer with a real
+/// meaning — this shard holds nothing — while no answer means the shard's state
+/// was never observed. Collapsing the two lets a repair declare a group it could
+/// not reach to be in sync, and skip a group whose primary is legitimately empty.
+async fn group_ids(addr : String) -> (Array[String], Bool) {
+  let empty : Array[String] = []
   match shard_call_text(addr, IDS_REQUEST) {
     Some(text) =>
       match parse_json_or_none(text) {
         Some(Object(fields)) =>
           match fields.get("ids") {
-            Some(Array(items)) =>
+            Some(Array(items)) => {
+              let out : Array[String] = []
               for item in items {
                 if item is String(id) {
                   out.push(id)
                 }
               }
-            _ => ()
+              (out, true)
+            }
+            _ => (empty, false)
           }
-        _ => ()
+        _ => (empty, false)
       }
-    None => ()
+    None => (empty, false)
   }
-  out
 }
 
 ///|

@@ -46,6 +46,17 @@ struct ServerState {
   /// Records appended since the last checkpoint, so the server can checkpoint
   /// on its own instead of growing the journal without bound.
   mut journal_entries : Int32
+  /// Serializes journal appends against checkpointing.
+  ///
+  /// Without it a checkpoint is not atomic with respect to writes, and the
+  /// window is wide: the snapshot is serialized, written and fsynced while
+  /// other handlers keep running. A document appended to the journal inside
+  /// that window is in the snapshot only if the snapshot was taken after the
+  /// apply — and then the truncate that follows erases the record either way,
+  /// so the write is durable nowhere. Holding this lock across
+  /// snapshot-then-truncate makes "the journal is empty" mean "the snapshot
+  /// contains everything".
+  write_lock : @async.Mutex
 }
 
 ///|
@@ -68,6 +79,7 @@ fn ServerState::new(schema : Array[@moonseek.FieldSchema]) -> ServerState {
     vnodes: RING_VNODES,
     durable_dir: None,
     journal_entries: 0,
+    write_lock: @async.Mutex(),
   }
 }
 
@@ -338,31 +350,39 @@ async fn main {
 }
 
 ///|
-/// The shard protocol: one JSON object per connection, one JSON answer back,
-/// then close. Deliberately tiny — the coordinator needs exactly four
-/// operations, and a larger protocol is a larger thing to get wrong.
+/// The shard protocol: framed JSON requests, one answer each, on a connection
+/// that may carry several exchanges.
+///
+/// Deliberately tiny — the coordinator needs exactly four operations, and a
+/// larger protocol is a larger thing to get wrong. The loop exists because the
+/// coordinator pools connections: a listener that answered once and closed
+/// would make every reused socket a failure, so reuse would cost a wasted round
+/// trip instead of saving one. A client that closes after a single request is
+/// still correct: the next read returns EOF and the loop ends.
 async fn run_shard_listener(state : ServerState, addr : @socket.Addr) -> Unit {
   let listener = @socket.TcpServer(addr)
   listener.run_forever(async fn(sock, _peer) {
-    // Length-prefixed frames in both directions. Reading to EOF would deadlock
-    // against a client that sends a request and then waits for the answer.
-    let header = sock.read_exactly(4) catch { _ => return () }
-    let length = unframe_length(header)
-    if length <= 0 {
-      return ()
-    }
-    let body = sock.read_exactly(length) catch { _ => return () }
-    let text = @utf8.decode(body) catch { _ => return () }
-    let answer = shard_handle(state, text.trim().to_owned()) catch {
-      e => {
-        let fields : Map[String, Json] = Map([])
-        fields["error"] = @json.to_json("unavailable")
-        fields["message"] = @json.to_json(e.to_string())
-        Json::object(fields).stringify()
+    for ;; {
+      // Length-prefixed frames in both directions. Reading to EOF would deadlock
+      // against a client that sends a request and then waits for the answer.
+      let header = sock.read_exactly(4) catch { _ => break }
+      let length = unframe_length(header)
+      if length <= 0 {
+        break
       }
-    }
-    sock.write(frame(@utf8.encode(answer))) catch {
-      _ => ()
+      let body = sock.read_exactly(length) catch { _ => break }
+      let text = @utf8.decode(body) catch { _ => break }
+      let answer = shard_handle(state, text.trim().to_owned()) catch {
+        e => {
+          let fields : Map[String, Json] = Map([])
+          fields["error"] = @json.to_json("unavailable")
+          fields["message"] = @json.to_json(e.to_string())
+          Json::object(fields).stringify()
+        }
+      }
+      sock.write(frame(@utf8.encode(answer))) catch {
+        _ => break
+      }
     }
   })
 }
@@ -1541,8 +1561,13 @@ async fn handle(
           pool_per_shard: state.pool_per_shard,
           timeout_ms: 15000,
         }
-        let ids_by_shard = cluster_ids_by_shard(config)
-        let report = cluster_rebalance(config, ids_by_shard, from_shards)
+        let (ids_by_shard, unreadable) = cluster_ids_by_shard(config)
+        let report = cluster_rebalance(
+          config,
+          ids_by_shard,
+          from_shards,
+          unreadable~,
+        )
         respond_json(
           conn,
           200,
@@ -3067,11 +3092,13 @@ async fn journal_put(state : ServerState, doc : @moonseek.JournalDoc) -> Unit {
   match state.durable_dir {
     None => ()
     Some(dir) => {
+      state.write_lock.acquire()
+      defer state.write_lock.release()
       @moonseek.journal_append(dir, Put(doc)) catch {
         e => raise Failure::Failure("journal write failed: " + e.to_string())
       }
       state.journal_entries += 1
-      auto_checkpoint(state)
+      auto_checkpoint_locked(state)
     }
   }
 }
@@ -3082,11 +3109,13 @@ async fn journal_remove(state : ServerState, id : String) -> Unit {
   match state.durable_dir {
     None => ()
     Some(dir) => {
+      state.write_lock.acquire()
+      defer state.write_lock.release()
       @moonseek.journal_append(dir, Remove(id)) catch {
         e => raise Failure::Failure("journal write failed: " + e.to_string())
       }
       state.journal_entries += 1
-      auto_checkpoint(state)
+      auto_checkpoint_locked(state)
     }
   }
 }
@@ -3095,11 +3124,15 @@ async fn journal_remove(state : ServerState, id : String) -> Unit {
 /// Snapshot once the journal passes the threshold. Failures are reported and
 /// swallowed: the records are already durable, so the write the caller waits on
 /// must not become an error because a snapshot can be retried.
-async fn auto_checkpoint(state : ServerState) -> Unit {
+///
+/// Must be called with the write lock held (every call site already has it),
+/// and uses the lock-free kernel: `Mutex` is not reentrant, so calling
+/// `checkpoint` from here would block on itself forever.
+async fn auto_checkpoint_locked(state : ServerState) -> Unit {
   if state.journal_entries < AUTO_CHECKPOINT_EVERY {
     return ()
   }
-  let _ = checkpoint(state) catch {
+  let _ = checkpoint_locked(state) catch {
     e => {
       println("auto-checkpoint failed (journal kept): " + e.to_string())
       ""
@@ -3109,14 +3142,32 @@ async fn auto_checkpoint(state : ServerState) -> Unit {
 
 ///|
 /// Snapshot the index and truncate the journal. Called by `POST /_checkpoint`
-/// and automatically once the journal grows past `CHECKPOINT_EVERY`, so an
+/// and automatically once the journal grows past `AUTO_CHECKPOINT_EVERY`, so an
 /// append-only log does not grow without bound on a long-running node.
 async fn checkpoint(state : ServerState) -> String {
   match state.durable_dir {
     None => raise Failure::Failure("no --data-dir: this node is in-memory only")
+    Some(_) => {
+      state.write_lock.acquire()
+      defer state.write_lock.release()
+      checkpoint_locked(state)
+    }
+  }
+}
+
+///|
+/// The body of a checkpoint, with the write lock already held.
+///
+/// Holding it across snapshot-then-truncate is what makes the durability claim
+/// true: a document appended in that window would be in the snapshot only if
+/// the snapshot serialized the apply, and the truncate erases its journal
+/// record either way, so it would survive in neither.
+async fn checkpoint_locked(state : ServerState) -> String raise Failure {
+  match state.durable_dir {
+    None => raise Failure::Failure("no --data-dir: this node is in-memory only")
     Some(dir) => {
-      let bytes_before = state.index.to_bytes().length()
-      @moonseek.journal_checkpoint(dir, state.index) catch {
+      let started = @env.now()
+      let bytes = @moonseek.journal_checkpoint(dir, state.index) catch {
         e => raise Failure::Failure("checkpoint failed: " + e.to_string())
       }
       let records = state.journal_entries
@@ -3124,8 +3175,12 @@ async fn checkpoint(state : ServerState) -> String {
       let fields : Map[String, Json] = Map([])
       fields["ok"] = @json.to_json(true)
       fields["docs"] = @json.to_json(state.index.doc_count())
-      fields["snapshot_bytes"] = @json.to_json(bytes_before)
+      fields["snapshot_bytes"] = @json.to_json(bytes)
       fields["journal_records_cleared"] = @json.to_json(records)
+      // A checkpoint is a full serialization plus an fsync, so its own cost is
+      // an operational signal: on a large index it is the slowest thing the
+      // server does, and the caller is the one who needs to see it.
+      fields["took_ms"] = @json.to_json((@env.now() - started).to_double())
       Json::object(fields).stringify()
     }
   }
@@ -3166,6 +3221,8 @@ async fn index_bulk_durable(state : ServerState, body : String) -> String {
   match state.durable_dir {
     None => ()
     Some(dir) => {
+      state.write_lock.acquire()
+      defer state.write_lock.release()
       let entries : Array[@moonseek.JournalEntry] = []
       for doc in docs {
         entries.push(Put(doc))
@@ -3174,6 +3231,10 @@ async fn index_bulk_durable(state : ServerState, body : String) -> String {
         e => raise Failure::Failure("journal write failed: " + e.to_string())
       }
       state.journal_entries += entries.length()
+      // Snapshot while still holding the lock: the batch is durable in the
+      // journal at this point, and checkpointing here cannot race a later
+      // append into the truncation window.
+      auto_checkpoint_locked(state)
     }
   }
   for doc in docs {
@@ -3187,7 +3248,6 @@ async fn index_bulk_durable(state : ServerState, body : String) -> String {
       None => indexed += 1
     }
   }
-  auto_checkpoint(state)
   state.indexed_docs += indexed.to_int64()
   let took = (@env.now() - started).to_double()
   let fields : Map[String, Json] = Map([])
