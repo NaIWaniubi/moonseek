@@ -221,7 +221,7 @@ median of 4 timed runs; queries are p50 of 200 samples, `limit=10`:
 | Index build | 2.73 s -> **7,320 docs/s** (median of 4) |
 | Selective term (df 285) | **0.06 ms** |
 | Field-scoped term (df 732) | 0.13 ms |
-| Saturated term (df 4,021) | **0.92 ms** with block-max (exact path 2.11 ms; see below) |
+| Saturated term (df 4,021) | **0.92 ms** with block-max (exact path 2.00 ms; see below) |
 | Chinese bigram (df 4,113) | 0.37 ms |
 | Boolean query | 3.02 ms |
 | Exact phrase | 6.25 ms -> **0.29 ms** (rarest-term walk, ~24x) |

@@ -7,7 +7,7 @@
 `bench/stress` reported a saturated single-term query at 0.36 ms in the README's table
 and at 0.92 ms in the same page's Block-Max WAND paragraph — same query, same corpus,
 two runs. The table row now carries the WAND run's figure and its exact-path baseline
-(2.11 ms), and the table has a note: rows without an arrow are single-run absolutes, and
+(2.00 ms), and the table has a note: rows without an arrow are single-run absolutes, and
 sub-millisecond shapes are the least reproducible ones on a shared machine (the same
 phrase harness has read 0.29–0.94 ms for the same query). `docs/benchmark.md`'s caveat
 now says the same thing with the observed range instead of a flat 20–30%.
