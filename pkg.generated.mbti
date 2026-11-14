@@ -29,6 +29,8 @@ pub fn is_missing_number(Double) -> Bool
 
 pub async fn journal_append(String, JournalEntry) -> Unit raise StoreError
 
+pub async fn journal_append_bytes(String, Array[Byte]) -> Unit raise StoreError
+
 pub fn journal_append_entry(Array[Byte], JournalEntry) -> Unit
 
 pub async fn journal_append_many(String, Array[JournalEntry]) -> Unit raise StoreError
@@ -38,6 +40,8 @@ pub async fn journal_checkpoint(String, Index) -> Int32 raise StoreError
 pub fn journal_decode(Bytes) -> Array[JournalEntry] raise CodecError
 
 pub fn journal_encode(Array[JournalEntry]) -> Bytes
+
+pub fn journal_frame(JournalEntry) -> Bytes
 
 pub async fn journal_has_snapshot(String) -> Bool raise StoreError
 

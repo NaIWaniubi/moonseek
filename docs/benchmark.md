@@ -303,6 +303,31 @@ changes the cost, not the guarantee.
 A single-document `POST /index` still pays one fsync, because there is nothing to
 share it with — that is the price of acknowledging a durable write.
 
+#### Group commit: one fsync per burst, not per request
+
+That "nothing to share it with" was true only because each request waited for its
+own flush. Under real traffic the writes are concurrent, and a burst of them can
+share one fsync if they are collected before it starts. `JournalGen` does that:
+the first writer of a burst becomes the flusher, everyone who arrives while it is
+acquiring the write lock joins the same generation, and the leader writes the
+whole generation with one `write` + one fsync, then releases every waiter.
+
+Same machine, same session, three repetitions per concurrency level, order
+alternated between the two binaries so drift cannot favour one:
+
+| Concurrent writers | Before | Group commit | Speedup |
+|---|---:|---:|---:|
+| 1 | 230 docs/s | 268 docs/s | 1.16× |
+| 8 | 389 docs/s | 745 docs/s | **1.91×** |
+| 32 | 323 docs/s | 1,094 docs/s | **3.38×** |
+
+A single writer gains nothing, which is the point: the win is entirely from
+sharing flushes that would otherwise serialize. Frames stay individually
+magic-prefixed and CRC-checked, so a generation torn by a crash replays its
+complete prefix — batching changes the cost, not the guarantee.
+`tools/test-durability-concurrent.sh` runs 16 concurrent writers against 25
+forced checkpoints and requires every acknowledged write after a restart.
+
 Correctness is checked by `tools/test-durability.sh`, which restarts the process
 and asserts that text, facets, numeric columns, vectors and deletions all come
 back, that a checkpoint truncates the journal, and that a server without

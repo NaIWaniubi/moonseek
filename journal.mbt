@@ -105,6 +105,24 @@ pub fn journal_append_entry(buf : Array[Byte], entry : JournalEntry) -> Unit {
 }
 
 ///|
+/// One entry as a self-contained journal fragment: the magic header followed by
+/// the framed record.
+///
+/// Concatenating fragments yields a valid journal image — `journal_decode`
+/// skips a repeated header — which is what lets several independently arriving
+/// writes share a single `write` and a single fsync instead of each paying for
+/// its own. The fragment is complete on its own, so a batch torn by a crash
+/// still replays its whole prefix.
+pub fn journal_frame(entry : JournalEntry) -> Bytes {
+  let buf : Array[Byte] = []
+  for b in JOURNAL_MAGIC.iter() {
+    buf.push(b)
+  }
+  journal_append_entry(buf, entry)
+  Bytes::from_array(buf[:])
+}
+
+///|
 /// Encode entries as a complete journal image (header + frames).
 pub fn journal_encode(entries : Array[JournalEntry]) -> Bytes {
   let buf : Array[Byte] = []

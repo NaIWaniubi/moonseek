@@ -3087,6 +3087,89 @@ fn apply_journal_doc(
 const AUTO_CHECKPOINT_EVERY : Int32 = 10000
 
 ///|
+/// One journal flush that several concurrent writes are waiting on.
+///
+/// Each accepted write has to be on disk with an fsync before it is applied, and
+/// an fsync costs about 3–4 ms here regardless of how many bytes it covers. One
+/// per request therefore caps ingest at roughly 250–300 documents per second no
+/// matter how many connections arrive. A group commit turns that into one fsync
+/// per *burst*: whoever arrives first flushes everything queued with it, and
+/// releases the rest when the flush returns. The records stay individually
+/// framed, so a batch torn by a crash still replays its complete prefix.
+struct JournalGen {
+  /// Encoded fragments waiting for this flush; appended in place.
+  buf : Array[Byte]
+  /// One semaphore per caller waiting on this flush; released together.
+  waiters : Array[@async.Semaphore]
+  /// The failure this flush hit, so every waiter reports the same thing rather
+  /// than a timeout.
+  mut failed : String?
+}
+
+///|
+/// The generation currently accepting members, or `None` while a flush is in
+/// flight (a new arrival then starts the next generation).
+let journal_gen : @ref.Ref[JournalGen?] = @ref.Ref(None)
+
+///|
+/// Guards `journal_gen` membership. Held only for the few statements that join a
+/// generation, never across I/O.
+let journal_gen_lock : @async.Mutex = @async.Mutex()
+
+///|
+/// Append one write, sharing a single fsync with everything that arrived in the
+/// same burst.
+///
+/// Ordering is what makes this safe to batch: a caller returns only after the
+/// flush that contains its fragment has fsynced, and the flush holds the write
+/// lock so a checkpoint cannot truncate the journal underneath it.
+async fn journal_append_grouped(
+  state : ServerState,
+  dir : String,
+  entry : @moonseek.JournalEntry,
+) -> Unit {
+  let frame = @moonseek.journal_frame(entry)
+  let mine = @async.Semaphore(1, initial_value=0)
+  journal_gen_lock.acquire()
+  let leader = journal_gen.val is None
+  let gen = match journal_gen.val {
+    Some(g) => g
+    None => {
+      let g : JournalGen = { buf: [], waiters: [], failed: None, }
+      journal_gen.val = Some(g)
+      g
+    }
+  }
+  for b in frame {
+    gen.buf.push(b)
+  }
+  gen.waiters.push(mine)
+  journal_gen_lock.release()
+  if leader {
+    // Take the write lock first: acquiring it yields, which is the window in
+    // which other writers join this generation. Then close the generation and
+    // flush exactly what it holds, so a writer that arrives afterwards forms
+    // the next one instead of waiting for a batch it is not part of.
+    state.write_lock.acquire()
+    defer state.write_lock.release()
+    journal_gen_lock.acquire()
+    journal_gen.val = None
+    journal_gen_lock.release()
+    @moonseek.journal_append_bytes(dir, gen.buf) catch {
+      e => gen.failed = Some(e.to_string())
+    }
+    for w in gen.waiters {
+      w.release()
+    }
+  }
+  mine.acquire()
+  match gen.failed {
+    Some(msg) => raise Failure::Failure("journal write failed: " + msg)
+    None => ()
+  }
+}
+
+///|
 /// Journal one accepted write, when the server has a durable directory.
 /// Journaling happens *before* the in-memory apply so a crash between them
 /// replays the record rather than losing it; the record and the apply are
@@ -3099,11 +3182,9 @@ async fn journal_put(state : ServerState, doc : @moonseek.JournalDoc) -> Unit {
   match state.durable_dir {
     None => ()
     Some(dir) => {
+      journal_append_grouped(state, dir, Put(doc))
       state.write_lock.acquire()
       defer state.write_lock.release()
-      @moonseek.journal_append(dir, Put(doc)) catch {
-        e => raise Failure::Failure("journal write failed: " + e.to_string())
-      }
       state.journal_entries += 1
       auto_checkpoint_locked(state)
     }
@@ -3116,11 +3197,9 @@ async fn journal_remove(state : ServerState, id : String) -> Unit {
   match state.durable_dir {
     None => ()
     Some(dir) => {
+      journal_append_grouped(state, dir, Remove(id))
       state.write_lock.acquire()
       defer state.write_lock.release()
-      @moonseek.journal_append(dir, Remove(id)) catch {
-        e => raise Failure::Failure("journal write failed: " + e.to_string())
-      }
       state.journal_entries += 1
       auto_checkpoint_locked(state)
     }

@@ -45,6 +45,31 @@ pub async fn journal_append(
 }
 
 ///|
+/// Append pre-encoded journal fragments in one write with one data fsync.
+///
+/// The caller builds the bytes with `journal_frame`, one fragment per record, so
+/// several requests that arrived at the same time can share the flush. The
+/// framing is unchanged: every fragment carries its own magic, length and CRC,
+/// so a batch torn by a crash replays its complete prefix and nothing more.
+pub async fn journal_append_bytes(
+  dir : String,
+  bytes : Array[Byte],
+) -> Unit raise StoreError {
+  if bytes.length() == 0 {
+    return ()
+  }
+  @fs.write_file(
+    dir + JOURNAL_FILE,
+    Bytes::from_array(bytes[:]),
+    create_mode=OpenOrCreate,
+    append=true,
+    sync=Data,
+  ) catch {
+    e => raise StoreError::IoError(e.to_string())
+  }
+}
+
+///|
 /// Append several records in one write with one data fsync. Each record keeps
 /// its own CRC frame, so a batch torn by a crash still replays its complete
 /// prefix — batching does not weaken the guarantee, it only shares the fsync.

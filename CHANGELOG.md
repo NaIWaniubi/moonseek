@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.17.0 (2026-11-14)
+
+Durable ingest stops paying one fsync per request.
+
+### Performance: group commit for the journal
+
+Every accepted write fsynced its own record before being applied, so a
+single-document `POST /index` was capped at ~230–300 documents per second no
+matter how many connections arrived — an fsync costs the same whether it covers
+one record or fifty.
+
+The journal now commits in generations. The first writer of a burst becomes the
+flusher, everyone who arrives while it is acquiring the write lock joins the same
+generation, and the leader writes the whole generation with one `write` and one
+fsync before releasing every waiter. A writer that arrives after the generation
+is closed forms the next one.
+
+Same machine, same session, three repetitions per level, order alternated:
+
+| Concurrent writers | Before | After | Speedup |
+|---|---:|---:|---:|
+| 1 | 230 docs/s | 268 docs/s | 1.16× |
+| 8 | 389 docs/s | 745 docs/s | **1.91×** |
+| 32 | 323 docs/s | 1,094 docs/s | **3.38×** |
+
+The guarantee is unchanged: every fragment still carries its own magic, length
+and CRC, so a generation torn by a crash replays its complete prefix, and a caller
+returns only after the flush containing its record has fsynced.
+`tools/test-durability-concurrent.sh` now runs 16 concurrent writers against 25
+forced checkpoints on an 800-document burst and requires every acknowledged write
+after a restart.
+
 ## 0.16.1 (2026-11-14)
 
 ### Fixed: a node could not be restarted on Linux

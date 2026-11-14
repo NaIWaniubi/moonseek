@@ -20,8 +20,8 @@ SCH="title:6,keywords:3,desc:1,deps:1"
 ADDR=127.0.0.1:7850
 LOG="${TMPDIR:-/tmp}/moonseek-durability-concurrent-logs"
 DATA="$LOG/data"
-DOCS=200
-WRITERS=6
+DOCS=800
+WRITERS=16
 # Documents already in the index before the race starts. The checkpoint writes
 # the whole index, so a small index makes the snapshot fast enough that the
 # window between serializing it and truncating the journal closes before any
