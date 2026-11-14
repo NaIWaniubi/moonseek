@@ -32,16 +32,38 @@ trap cleanup EXIT
 json() { python3 -c "import sys,json;d=json.load(sys.stdin);print($1)" 2>/dev/null; }
 fail() { echo "FAIL: $*"; exit 1; }
 
+# `/healthz` answers on the HTTP port, which the process binds in a task group
+# alongside the shard listener. On a slow runner the HTTP server can be up while
+# the shard protocol port is not listening yet, and then indexing succeeds (it
+# goes over HTTP) while the coordinator's fan-out has nothing to connect to. Wait
+# for the protocol port, not just for health.
+wait_shard_port() {
+  local i
+  for i in $(seq 1 200); do
+    if (exec 3<>/dev/tcp/127.0.0.1/$SHARD_PORT) 2>/dev/null; then
+      exec 3<&- 2>/dev/null
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "FAIL: shard protocol port $SHARD_PORT never accepted a connection"
+  cat "$LOG/shard.log"
+  return 1
+}
+
 start_shard() {
   "$BIN" --addr "127.0.0.1:$SHARD_HTTP" --shard-port "127.0.0.1:$SHARD_PORT" \
     --schema "$SCH" > "$LOG/shard.log" 2>&1 &
   shard_pid=$!
   pids+=($shard_pid)
   for _ in $(seq 1 80); do
-    curl -sf -m 2 "http://127.0.0.1:$SHARD_HTTP/healthz" > /dev/null 2>&1 && return 0
+    curl -sf -m 2 "http://127.0.0.1:$SHARD_HTTP/healthz" > /dev/null 2>&1 && break
     sleep 0.25
   done
-  echo "FAIL: shard never became ready"; cat "$LOG/shard.log"; return 1
+  curl -sf -m 2 "http://127.0.0.1:$SHARD_HTTP/healthz" > /dev/null 2>&1 || {
+    echo "FAIL: shard never became ready"; cat "$LOG/shard.log"; return 1
+  }
+  wait_shard_port
 }
 
 index_docs() {
@@ -86,7 +108,12 @@ first=$(curl -s -m 20 "http://127.0.0.1:$COORD/search?q=probe&limit=10")
 echo "first answer: $first" | head -c 300; echo
 total=$(echo "$first" | json 'd["total"]')
 shards=$(echo "$first" | json 'str(d["shards"])')
-[ "$total" = "3" ] || fail "first query after restart returned total=$total, expected 3"
+[ "$total" = "3" ] || {
+  echo "shard holds: $(curl -s -m 5 "http://127.0.0.1:$SHARD_HTTP/_stats" | json 'd["docs"]')"
+  echo "--- shard log ---"; cat "$LOG/shard.log"
+  echo "--- coordinator log ---"; cat "$LOG/coord.log"
+  fail "first query after restart returned total=$total, expected 3"
+}
 echo "$shards" | grep -q "'ok': 1" || fail "first query reported a failed shard: $shards"
 echo "ok: a stale pooled socket was retried on a fresh connection"
 
