@@ -224,3 +224,29 @@ jobs:
       - name: A pooled socket survives its shard restarting
         run: |
           bash tools/test-shard-restart.sh _build/native/release/build/server/server.exe .
+
+  # The features above interact, and an interaction bug reads as "the numbers
+  # stopped adding up after four minutes", not as a failed unit test. This job
+  # runs writes, queries, checkpoints and a mid-run shard restart together, then
+  # requires every acknowledged write to be present in every member of its
+  # group. It is the test that caught a checkpoint truncating a journal record
+  # whose apply had not happened yet.
+  soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up MoonBit
+        run: |
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
+          echo "$HOME/.moon/bin" >> $GITHUB_PATH
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build the server
+        run: |
+          moon update
+          moon build server --target native --release
+      - name: Mixed load with a mid-run shard restart loses nothing
+        run: |
+          node tools/soak-cluster.mjs _build/native/release/build/server/server.exe --seconds 40 --writers 8 --readers 4

@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.17.1 (2026-11-14)
+
+### Fixed: a checkpoint could truncate a write that had not been applied yet
+
+The write path journalled a record, released the write lock, and only then
+applied it to the in-memory index. A checkpoint could run in that gap: it
+serialized an index that did not contain the record, then truncated the journal
+that was the record's only copy. The write had already been acknowledged, so it
+was simply gone — on restart it existed in neither the snapshot nor the journal.
+
+The window is small and real. `tools/soak-cluster.mjs` (new) reproduced it as
+one lost document in ~7,500 acknowledged writes, with the group whose primary had
+been restarted mid-run: repair then removed that document from its replica, which
+is what made the loss visible at all.
+
+The journal, the apply and the checkpoint now happen inside one critical
+section. Group commit carries the entries as well as the encoded frames, and the
+leader applies every entry of its generation before releasing its waiters, so a
+checkpoint can never observe a journal record whose apply has not happened. The
+bulk path got the same treatment: its apply moved inside the lock that journals
+it.
+
+Measured against 0.17.0 on the same machine, alternating runs: 0.98× at one
+writer, 1.22× at 8, 1.01× at 32 — the fix costs nothing, because the apply is
+work the leader was going to do anyway.
+
 ## 0.17.0 (2026-11-14)
 
 Durable ingest stops paying one fsync per request.

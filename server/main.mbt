@@ -470,13 +470,12 @@ async fn shard_handle(state : ServerState, request : String) -> String {
       let doc = parse_document(body) catch {
         e => return error_json("bad_request", e.to_string())
       }
-      journal_put(state, doc) catch {
+      let result = commit_entry(state, Put(doc)) catch {
         e => return error_json("unavailable", e.to_string())
       }
-      match apply_journal_doc(state, doc) {
-        Some(msg) => error_json("bad_request", msg)
-        None => {
-          state.indexed_docs += 1
+      match result {
+        Rejected(msg) => error_json("bad_request", msg)
+        _ => {
           let out : Map[String, Json] = Map([])
           out["ok"] = @json.to_json(true)
           out["id"] = @json.to_json(doc.id)
@@ -499,14 +498,13 @@ async fn shard_handle(state : ServerState, request : String) -> String {
     "delete_many" => {
       let mut deleted = 0
       for id in requested_ids(obj) {
-        journal_remove(state, id) catch {
+        let result = commit_entry(state, Remove(id)) catch {
           e => return error_json("unavailable", e.to_string())
         }
-        if state.index.delete(id) {
+        if result is Deleted(true) {
           deleted = deleted + 1
         }
       }
-      state.deleted_docs += deleted.to_int64()
       "{\"ok\":true,\"deleted\":" + deleted.to_string() + "}"
     }
     "delete" => {
@@ -514,13 +512,10 @@ async fn shard_handle(state : ServerState, request : String) -> String {
         Some(String(s)) => s
         _ => return "{\"error\":\"missing id\"}"
       }
-      journal_remove(state, id) catch {
+      let result = commit_entry(state, Remove(id)) catch {
         e => return error_json("unavailable", e.to_string())
       }
-      let deleted = state.index.delete(id)
-      if deleted {
-        state.deleted_docs += 1
-      }
+      let deleted = result is Deleted(true)
       let fields : Map[String, Json] = Map([])
       fields["ok"] = @json.to_json(true)
       fields["deleted"] = @json.to_json(deleted)
@@ -1715,7 +1710,7 @@ async fn handle(
               error_json("bad_request", e.to_string()),
             )
         }
-        journal_put(state, doc) catch {
+        let result = commit_entry(state, Put(doc)) catch {
           e =>
             return respond_json(
               conn,
@@ -1724,22 +1719,21 @@ async fn handle(
               error_json("unavailable", e.to_string()),
             )
         }
-        let text = match apply_journal_doc(state, doc) {
-          Some(msg) =>
+        let text = match result {
+          Rejected(msg) =>
             return respond_json(
               conn,
               400,
               "Bad Request",
               error_json("bad_request", msg),
             )
-          None => {
+          _ => {
             let fields : Map[String, Json] = Map([])
             fields["ok"] = @json.to_json(true)
             fields["id"] = @json.to_json(doc.id)
             Json::object(fields).stringify()
           }
         }
-        state.indexed_docs += 1
         respond_json(conn, 202, "Accepted", text)
         return ()
       }
@@ -1751,7 +1745,7 @@ async fn handle(
           // document stayed searchable.
           return respond_json(conn, 200, "OK", coordinator_delete(state, id))
         }
-        journal_remove(state, id) catch {
+        let result = commit_entry(state, Remove(id)) catch {
           e =>
             return respond_json(
               conn,
@@ -1760,10 +1754,7 @@ async fn handle(
               error_json("unavailable", e.to_string()),
             )
         }
-        let deleted = state.index.delete(id)
-        if deleted {
-          state.deleted_docs += 1
-        }
+        let deleted = result is Deleted(true)
         let fields : Map[String, Json] = Map([])
         fields["deleted"] = @json.to_json(deleted)
         respond_json(conn, 200, "OK", Json::object(fields).stringify())
@@ -3087,18 +3078,39 @@ fn apply_journal_doc(
 const AUTO_CHECKPOINT_EVERY : Int32 = 10000
 
 ///|
-/// One journal flush that several concurrent writes are waiting on.
+/// What one committed entry did to the index.
+enum CommitResult {
+  /// A put that was applied.
+  Written
+  /// A put the index refused (for example a vector of the wrong width).
+  Rejected(String)
+  /// A removal; the flag says whether the id was present.
+  Deleted(Bool)
+}
+
+///|
+/// One journal flush and the applies that must happen with it.
 ///
 /// Each accepted write has to be on disk with an fsync before it is applied, and
 /// an fsync costs about 3–4 ms here regardless of how many bytes it covers. One
 /// per request therefore caps ingest at roughly 250–300 documents per second no
 /// matter how many connections arrive. A group commit turns that into one fsync
 /// per *burst*: whoever arrives first flushes everything queued with it, and
-/// releases the rest when the flush returns. The records stay individually
-/// framed, so a batch torn by a crash still replays its complete prefix.
+/// releases the rest when the flush and the applies return.
+///
+/// The applies belong to the same critical section as the flush. A checkpoint
+/// between "durable in the journal" and "applied in memory" would serialize an
+/// index that lacks the record and then truncate the journal that was its only
+/// copy — the record would survive in neither. So the leader applies every entry
+/// of its generation before releasing anyone, under the same lock the checkpoint
+/// takes.
 struct JournalGen {
   /// Encoded fragments waiting for this flush; appended in place.
   buf : Array[Byte]
+  /// The entries those fragments encode, in the same order.
+  entries : Array[@moonseek.JournalEntry]
+  /// What each entry did, filled in by the leader during the apply.
+  results : Array[CommitResult]
   /// One semaphore per caller waiting on this flush; released together.
   waiters : Array[@async.Semaphore]
   /// The failure this flush hit, so every waiter reports the same thing rather
@@ -3117,17 +3129,39 @@ let journal_gen : @ref.Ref[JournalGen?] = @ref.Ref(None)
 let journal_gen_lock : @async.Mutex = @async.Mutex()
 
 ///|
-/// Append one write, sharing a single fsync with everything that arrived in the
-/// same burst.
-///
-/// Ordering is what makes this safe to batch: a caller returns only after the
-/// flush that contains its fragment has fsynced, and the flush holds the write
-/// lock so a checkpoint cannot truncate the journal underneath it.
-async fn journal_append_grouped(
+/// Apply one committed entry and keep the counters the stats endpoint reports.
+fn apply_entry(
+  state : ServerState,
+  entry : @moonseek.JournalEntry,
+) -> CommitResult {
+  match entry {
+    Put(doc) =>
+      match apply_journal_doc(state, doc) {
+        Some(msg) => Rejected(msg)
+        None => {
+          state.indexed_docs += 1
+          Written
+        }
+      }
+    Remove(id) => {
+      let removed = state.index.delete(id)
+      if removed {
+        state.deleted_docs += 1
+      }
+      Deleted(removed)
+    }
+  }
+}
+
+///|
+/// Commit one write: journal it, apply it, and let a checkpoint follow — all
+/// under the write lock, sharing a single fsync with everything that arrived in
+/// the same burst.
+async fn commit_grouped(
   state : ServerState,
   dir : String,
   entry : @moonseek.JournalEntry,
-) -> Unit {
+) -> CommitResult {
   let frame = @moonseek.journal_frame(entry)
   let mine = @async.Semaphore(1, initial_value=0)
   journal_gen_lock.acquire()
@@ -3135,14 +3169,23 @@ async fn journal_append_grouped(
   let gen = match journal_gen.val {
     Some(g) => g
     None => {
-      let g : JournalGen = { buf: [], waiters: [], failed: None, }
+      let g : JournalGen = {
+        buf: [],
+        entries: [],
+        results: [],
+        waiters: [],
+        failed: None,
+      }
       journal_gen.val = Some(g)
       g
     }
   }
+  let slot = gen.entries.length()
   for b in frame {
     gen.buf.push(b)
   }
+  gen.entries.push(entry)
+  gen.results.push(Written)
   gen.waiters.push(mine)
   journal_gen_lock.release()
   if leader {
@@ -3151,58 +3194,42 @@ async fn journal_append_grouped(
     // flush exactly what it holds, so a writer that arrives afterwards forms
     // the next one instead of waiting for a batch it is not part of.
     state.write_lock.acquire()
-    defer state.write_lock.release()
     journal_gen_lock.acquire()
     journal_gen.val = None
     journal_gen_lock.release()
     @moonseek.journal_append_bytes(dir, gen.buf) catch {
       e => gen.failed = Some(e.to_string())
     }
+    if gen.failed is None {
+      for i in 0..<gen.entries.length() {
+        gen.results[i] = apply_entry(state, gen.entries[i])
+      }
+      state.journal_entries += gen.entries.length()
+      auto_checkpoint_locked(state)
+    }
     for w in gen.waiters {
       w.release()
     }
+    state.write_lock.release()
   }
   mine.acquire()
   match gen.failed {
     Some(msg) => raise Failure::Failure("journal write failed: " + msg)
-    None => ()
+    None => gen.results[slot]
   }
 }
 
 ///|
-/// Journal one accepted write, when the server has a durable directory.
-/// Journaling happens *before* the in-memory apply so a crash between them
-/// replays the record rather than losing it; the record and the apply are
-/// built from the same parsed document, so replay cannot disagree with what
-/// memory held.
-///
-/// A journal failure is returned to the caller as an error: reporting a write
-/// as accepted when it is not on disk would make the durability claim false.
-async fn journal_put(state : ServerState, doc : @moonseek.JournalDoc) -> Unit {
+/// Commit one entry, durable when the server has a `--data-dir` and in memory
+/// otherwise. The journal failure is raised: reporting a write as accepted when
+/// it is not on disk would make the durability claim false.
+async fn commit_entry(
+  state : ServerState,
+  entry : @moonseek.JournalEntry,
+) -> CommitResult {
   match state.durable_dir {
-    None => ()
-    Some(dir) => {
-      journal_append_grouped(state, dir, Put(doc))
-      state.write_lock.acquire()
-      defer state.write_lock.release()
-      state.journal_entries += 1
-      auto_checkpoint_locked(state)
-    }
-  }
-}
-
-///|
-/// Journal a removal before applying it.
-async fn journal_remove(state : ServerState, id : String) -> Unit {
-  match state.durable_dir {
-    None => ()
-    Some(dir) => {
-      journal_append_grouped(state, dir, Remove(id))
-      state.write_lock.acquire()
-      defer state.write_lock.release()
-      state.journal_entries += 1
-      auto_checkpoint_locked(state)
-    }
+    None => apply_entry(state, entry)
+    Some(dir) => commit_grouped(state, dir, entry)
   }
 }
 
@@ -3307,6 +3334,11 @@ async fn index_bulk_durable(state : ServerState, body : String) -> String {
   match state.durable_dir {
     None => ()
     Some(dir) => {
+      // Journal, apply and checkpoint under one lock. The apply has to be in
+      // here: a checkpoint that runs between the append and the apply would
+      // serialize an index without the batch, then truncate the journal that
+      // was its only copy. Holding the lock makes "the journal is empty" mean
+      // "the snapshot contains every applied batch".
       state.write_lock.acquire()
       defer state.write_lock.release()
       let entries : Array[@moonseek.JournalEntry] = []
@@ -3317,21 +3349,32 @@ async fn index_bulk_durable(state : ServerState, body : String) -> String {
         e => raise Failure::Failure("journal write failed: " + e.to_string())
       }
       state.journal_entries += entries.length()
-      // Snapshot while still holding the lock: the batch is durable in the
-      // journal at this point, and checkpointing here cannot race a later
-      // append into the truncation window.
+      for doc in docs {
+        match apply_journal_doc(state, doc) {
+          Some(msg) => {
+            failed += 1
+            if first_error.is_empty() {
+              first_error.push(msg)
+            }
+          }
+          None => indexed += 1
+        }
+      }
       auto_checkpoint_locked(state)
     }
   }
-  for doc in docs {
-    match apply_journal_doc(state, doc) {
-      Some(msg) => {
-        failed += 1
-        if first_error.is_empty() {
-          first_error.push(msg)
+  // In-memory mode: nothing was journaled, so the apply happens here.
+  if state.durable_dir is None {
+    for doc in docs {
+      match apply_journal_doc(state, doc) {
+        Some(msg) => {
+          failed += 1
+          if first_error.is_empty() {
+            first_error.push(msg)
+          }
         }
+        None => indexed += 1
       }
-      None => indexed += 1
     }
   }
   state.indexed_docs += indexed.to_int64()

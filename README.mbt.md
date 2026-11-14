@@ -102,7 +102,7 @@ without a reindex → repair a diverged member → kill a primary (failover) →
 its replica (honest degradation). It is the thing to screen-record, and
 [docs/demo-video.md](docs/demo-video.md) is the shot list with narration.
 
-Eight end-to-end scripts run in CI, each its own job so a failure is
+Nine end-to-end scripts run in CI, each its own job so a failure is
 attributable: `tools/test-cluster.sh` (dfs ranking, placement agreement, the
 ring's reshuffle, distributed aggregations, sorted queries, distributed hybrid
 retrieval, failover, two coordinators), `tools/test-replication.sh` (a replicated
@@ -112,8 +112,10 @@ brought back), `tools/test-repair-edge.sh` (an empty primary still removes a
 replica's ghost, and an unreachable member is named rather than skipped),
 `tools/test-shard-restart.sh` (a pooled shard connection survives its shard
 restarting), `tools/test-durability.sh` (writes, deletes, vectors and numbers
-survive a restart), and `tools/test-durability-concurrent.sh` (no acknowledged
-write is lost across 6 concurrent writers and 25 forced checkpoints). To grow a
+survive a restart), `tools/test-durability-concurrent.sh` (no acknowledged write is lost across
+16 concurrent writers and 25 forced checkpoints), and `tools/soak-cluster.mjs`
+(writes, queries, checkpoints and a mid-run shard restart sustained together,
+then every acknowledged write checked against every member of its group). To grow a
 running cluster:
 
 ```bash
