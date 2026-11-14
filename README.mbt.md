@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml/badge.svg)](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![mooncakes](https://img.shields.io/badge/mooncakes-v0.15.1-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
+[![mooncakes](https://img.shields.io/badge/mooncakes-v0.17.2-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
 [![tests](https://img.shields.io/badge/tests-355%20native%20%C2%B7%20299%20wasm--gc-3fb950.svg)](#testing)
 
 ![moonseek demo](docs/demo-screenshot.png)
@@ -130,11 +130,11 @@ the identity and latency tables in [docs/cluster.md](docs/cluster.md).
 single node on the same corpus and one coordinator, and interleaves the samples
 so the machine's drifting load cannot bias one arm.
 
-| 3 shards, 3,000 docs | single node | coordinator | ratio |
-|---|---|---|---|
-| mean query p50 (6 shapes) | — | — | **1.13×** |
-| one forwarded write | — | — | **1.31×** |
-| 2,000 writes, 3 groups × 2 members | 320 docs/s | 254 docs/s | **1.26×**, all fully acknowledged |
+| 3 shards, 3,000 docs | measured |
+|---|---|
+| mean query p50, 6 shapes | **0.94–1.02×** across four runs — the hop costs nothing measurable |
+| one forwarded write (1 group, 1 member) | **1.06×** |
+| sequential writes, 3 groups × 2 members | **1.46×**, 530 → 364 docs/s, every write acknowledged by all members |
 
 Ask a coordinator where a document lives with `GET /_placement?id=…`, and what a
 grow-out would cost with `GET /_plan?shards=4`.
@@ -194,7 +194,7 @@ cd demo && python -m http.server 8000
 
 The demo does three things, all in the browser:
 
-1. **Searches the real registry.** Every one of the **3,698 packages published on mooncakes.io** (22,837 versions) is indexed — package names, author-written keywords, descriptions, and dependency edges. The index is built by the *native* binary into a 1.37 MB `MSK3` snapshot and loaded by the *wasm-gc* build, which is the strongest evidence that the format is portable. Loading takes ~200 ms; the median query over a 12-query mix is **0.20 ms**.
+1. **Searches the real registry.** Every one of the **3,698 packages published on mooncakes.io** (22,837 versions) is indexed — package names, author-written keywords, descriptions, and dependency edges. The index is built by the *native* binary into a 1,398,936-byte (1.33 MiB) `MSK3` snapshot and loaded by the *wasm-gc* build, which is the strongest evidence that the format is portable. Loading takes ~200 ms; the median query over a 12-query mix is **0.20 ms**.
 2. **Indexes your own files.** Drag in `.txt` / `.md` / `.json` / `.csv` / `.log` files (or paste text) and they are parsed, tokenized and searchable immediately, with the whole index persistable to IndexedDB as one snapshot blob and reloadable without re-parsing.
 3. **Shows its own quality.** A live benchmark measures query-latency percentiles and the latency-vs-index-size curve in your browser, next to the ablation table from `tools/eval`: the same corpus and queries under six scoring configurations, so you can see which mechanism is worth how much NDCG.
 
@@ -247,7 +247,7 @@ full scan, because a block is skipped only on a *strict* inequality (a tie is
 still scored, so it can still win the id tiebreak) and the tests assert the
 equality, including a corpus with a huge tie group on the cut.
 
-Browser (WasmGC, the 3,698-package registry snapshot): 206 KB binary, snapshot load ~200 ms, median
+Browser (WasmGC, the 3,698-package registry snapshot): 241 KiB (246,961-byte) binary, snapshot load ~200 ms, median
 query **0.20 ms**, p90 0.2-0.3 ms, snapshot export ~200-315 ms.
 
 Full methodology, per-shape ranges and an explicit list of what is *not* measured:
@@ -285,9 +285,9 @@ See [docs/architecture.md](docs/architecture.md) for design details and the snap
 ## Testing
 
 ```bash
-moon test                    # 299 tests (native)
-moon test --target wasm-gc
-moon test --target js
+moon test                    # 355 tests (native)
+moon test --target wasm-gc   # 299 tests
+moon test --target js        # 299 tests
 moon bench --release         # benchmarks
 moon coverage analyze        # coverage report
 moon run bench/stress --target native --release   # 20k-doc stress benchmark

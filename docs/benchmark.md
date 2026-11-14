@@ -312,21 +312,25 @@ the first writer of a burst becomes the flusher, everyone who arrives while it i
 acquiring the write lock joins the same generation, and the leader writes the
 whole generation with one `write` + one fsync, then releases every waiter.
 
-Same machine, same session, three repetitions per concurrency level, order
-alternated between the two binaries so drift cannot favour one:
+Same machine, two independent sessions, three alternating rounds per level, order
+alternated between the two binaries so drift cannot favour either:
 
-| Concurrent writers | Before | Group commit | Speedup |
-|---|---:|---:|---:|
-| 1 | 230 docs/s | 268 docs/s | 1.16× |
-| 8 | 389 docs/s | 745 docs/s | **1.91×** |
-| 32 | 323 docs/s | 1,094 docs/s | **3.38×** |
+| Concurrent writers | Speedup over one-fsync-per-request |
+|---|---:|
+| 1 | 0.98–1.07× (no change) |
+| 8 | **1.9–2.2×** |
+| 32 | **2.7–3.4×** |
 
-A single writer gains nothing, which is the point: the win is entirely from
-sharing flushes that would otherwise serialize. Frames stay individually
-magic-prefixed and CRC-checked, so a generation torn by a crash replays its
-complete prefix — batching changes the cost, not the guarantee.
-`tools/test-durability-concurrent.sh` runs 16 concurrent writers against 25
-forced checkpoints and requires every acknowledged write after a restart.
+Absolute rates moved by ~40% between the two sessions on this machine, so only the
+ratios are portable, and they are given as ranges for that reason. The
+single-writer row is the control: it says the machinery costs nothing when there
+is nothing to batch.
+
+Frames stay individually magic-prefixed and CRC-checked, so a generation torn by
+a crash replays its complete prefix — batching changes the cost, not the
+guarantee. `tools/test-durability-concurrent.sh` runs 16 concurrent writers
+against 25 forced checkpoints and requires every acknowledged write after a
+restart.
 
 Correctness is checked by `tools/test-durability.sh`, which restarts the process
 and asserts that text, facets, numeric columns, vectors and deletions all come
@@ -373,7 +377,7 @@ This is the corpus the browser demo ships, built from the live mooncakes registr
 | Raw source | 1.5 MB JSON |
 | Distinct terms | 11,081 |
 | Native build time | **0.34–0.46 s** (8,000–10,700 docs/s) |
-| Snapshot | 1.37 MB (1.82 MB as base64) |
+| Snapshot | 1,398,936 bytes / 1.33 MiB (1.82 MB as base64) |
 | Snapshot load in browser | **190–210 ms** |
 
 Indexing real, messy, third-party metadata is the honest version of "does this work on data you did
@@ -383,12 +387,12 @@ synthetic Zipf vocabulary does not.
 
 ### Browser (WasmGC)
 
-The same 1.37 MB snapshot, loaded into `web/api.mbt` compiled to wasm-gc (**206 KB** binary), in
+The same 1,398,936-byte snapshot, loaded into `web/api.mbt` compiled to wasm-gc (**246,961 bytes**, 241 KiB), in
 Chromium on the machine above:
 
 | Metric | Value |
 |---|---|
-| Binary | 206 KB |
+| Binary | 246,961 bytes (241 KiB) |
 | Snapshot load (`ms_load_b64`) | 190–210 ms |
 | Median query, 12-query mix × 5 rounds | **0.20 ms** |
 | Query p50 / p90 / p99, 15-query mix × 20 rounds | 0.10 / 0.20–0.30 / 2.1–3.5 ms |
@@ -497,8 +501,8 @@ harness prints its own min/max range so a rerun is directly comparable.
 | 34 ms `set_facets`, 14.0 ms faceted query | `bench/stress/main.mbt` | `search_faceted` with one filter and one facet field |
 | 2.18 ms explain | `bench/stress/main.mbt` | 100 `explain` calls timed together |
 | 0.68 s / 0.75 s, 17.6 MB | `bench/stress/main.mbt` | `to_bytes` / `from_bytes` timed separately |
-| 3,698 packages, 11,081 terms, 1.37 MB snapshot | `tools/registry/main.mbt` | registry dump -> `MSK3` |
-| 190–210 ms load, 0.20 ms median query, 206 KB | `demo/index.html` | `performance.now()` around `ms_load_b64` / `ms_search` |
+| 3,698 packages, 11,081 terms, 1,398,936-byte snapshot | `tools/registry/main.mbt` | registry dump -> `MSK3` |
+| 190–210 ms load, 0.20 ms median query, 246,961 bytes | `demo/index.html` | `performance.now()` around `ms_load_b64` / `ms_search` |
 | 85.8 ms / 262 µs / 1.01 ms / 45.3 ms | `bench_test.mbt` | `@bench.T` per test |
 | NDCG 0.408–0.914 | `tools/eval` | `docs/quality.md` |
 | 259 / 242 tests | `moon test` | `Total tests: 259, passed: 259, failed: 0.` |

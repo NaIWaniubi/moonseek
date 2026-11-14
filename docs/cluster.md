@@ -176,32 +176,45 @@ restarts a shard under a warm pool and requires the very next query to be exact.
 `tools/bench-cluster.mjs` starts K shards, one single node holding the same
 corpus, and one coordinator, then interleaves single/coordinator samples so the
 machine's drifting background load cannot bias one arm. 3,000 documents, 3
-shards, 60 interleaved samples per query:
+shards, 60–80 interleaved samples per query.
+
+One run, per query (`--samples 80`):
 
 | query | total | single p50 | coordinator p50 | ratio |
 |---|---|---|---|---|
-| `parser` | 2376 | 10.72 ms | 10.99 ms | 1.03× |
-| `compiler AND gc` | 1315 | 10.34 ms | 11.73 ms | 1.13× |
-| `"zero-copy"` | 835 | 6.77 ms | 11.32 ms | 1.67× |
-| `scheduler OR allocator` | 2689 | 15.29 ms | 12.43 ms | 0.81× |
-| `tensor` | 2111 | 10.53 ms | 10.86 ms | 1.03× |
-| `socket cache` | 1401 | 9.60 ms | 10.36 ms | 1.08× |
+| `parser` | 2376 | 7.15 ms | 6.28 ms | 0.88× |
+| `compiler AND gc` | 1315 | 8.81 ms | 7.60 ms | 0.86× |
+| `"zero-copy"` | 835 | 5.73 ms | 6.71 ms | 1.17× |
+| `scheduler OR allocator` | 2689 | 9.34 ms | 7.47 ms | 0.80× |
+| `tensor` | 2111 | 8.45 ms | 8.34 ms | 0.99× |
+| `socket cache` | 1401 | 7.22 ms | 6.91 ms | 0.96× |
 
-Mean ratio **1.13×**. The row below 1.0 is not a typo: each shard holds a third
-of the corpus, so a highly selective query does a third of the posting work on
-each of three machines in parallel, and the saved work exceeds the extra hop.
+Rows below 1.0 are not typos: each shard holds a third of the corpus, so a query
+does a third of the posting work on each of three processes in parallel, and the
+saved work covers the extra hop. Across four separate runs the mean ratio was
+**0.94×, 0.99×, 1.00× and 1.02×** — the coordinator adds nothing measurable
+beyond the hop, which is the only claim this benchmark is making.
 
-Writes, 2,000 documents one at a time through 3 groups of 2 members:
+Writes, sequential (each acknowledged before the next is sent), 600 documents per
+round, three rounds alternating arms, median:
 
 | path | throughput | vs single node |
 |---|---|---|
-| single node | 320 docs/s | 1.00× |
-| coordinator, 2 members | 254 docs/s | 1.26×, 2000/2000 acknowledged by every member |
+| single node | 530 docs/s | 1.00× |
+| one forwarded write (1 group, 1 member) | ~500 docs/s | **1.06×** |
+| coordinator, 3 groups × 2 members | 364 docs/s | **1.46×**, 1800/1800 acknowledged by every member |
 
-Before connection reuse the same benchmark read 1.62× for queries and 3.10× for
-replicated writes; a one-hop forwarded write cost 2.19× a local write even though
-the shard performed the same single fsync, which is what identified the
-connection — not the work — as the cost.
+The write rows are the ones to read carefully. Sequential writes are fsync-bound,
+so their ratio depends on how expensive a local fsync is at that moment: the same
+binary measured 1.26× on a loaded machine and 1.46–1.57× on a quiet one. Two
+members cost more than the hop alone because the coordinator waits for both, and
+the two fsyncs contend for the same disk. It is a floor for durability, not
+overhead the protocol could remove — a single node has no second copy to write.
+
+This section used to report 1.13× and 1.26× from a single round each. Repeating
+the measurement showed the query figure moves by a few percent between runs and
+the write figure by tens of percent, so both are now reported with their spread;
+`tools/bench-cluster.mjs` does the repeating itself.
 
 ## Scatter-gather, and the two scoring modes
 

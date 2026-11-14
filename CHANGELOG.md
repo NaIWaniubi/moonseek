@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.17.2 (2026-11-14)
+
+### Docs: every published number re-measured, and the ones that had drifted corrected
+
+No library or server code changed — the tests are the same 355 native / 299
+wasm-gc / 299 js and all pass. What changed is what the project *says* about
+itself, which had accumulated the usual rot: a number measured once, on a machine
+that happened to be quiet, copied into three files and never revisited.
+
+* **Cluster fan-out.** The previous tables were one round of 60 samples each.
+  Four more runs showed the query ratio moves by a few percent between runs and
+  the replicated-write ratio by tens of percent, so both are now published as
+  spreads over repeated runs: query **0.94–1.02×** (was 1.13×), one-hop
+  forwarded write **1.06×** (was 1.31×), two-member replicated write
+  **1.46× / 530 → 364 docs/s** (was 1.26× / 254 vs 320 docs/s). `docs/cluster.md`
+  now says why a single round is not a ratio, and `tools/bench-cluster.mjs` does
+  the repeating itself: three alternating rounds per arm after a warmup, median
+  reported.
+* **Group commit.** The single-session figures (1.16× / 1.91× / 3.38×) became
+  two-session ranges: **0.98–1.07×** at one writer, **1.9–2.2×** at 8,
+  **2.7–3.4×** at 32, with the single-writer row kept as the control.
+* **Sizes.** The registry snapshot is **1,398,936 bytes** (1.33 MiB), not
+  "1.37 MB"; the wasm binary is **246,961 bytes** (241 KiB), not "206 KB".
+* **The demo artifact.** `demo/web.wasm` had not been rebuilt since well before
+  vectors and facets landed. It is the current build now, and the demo was
+  re-run against it: ready in 204 ms with 3,698 documents and 11,081 terms, the
+  page self-reports 241 KB, `ms_search("parser")` returns `moonbitlang/parser`
+  first, and the median over its 12-query mix is 0.20 ms.
+* **Test counts and version badges** in both READMEs now match what the toolchain
+  prints, and the proposal was rebuilt with the same corrections.
+
 ## 0.17.1 (2026-11-14)
 
 ### Fixed: a checkpoint could truncate a write that had not been applied yet
@@ -43,13 +74,17 @@ generation, and the leader writes the whole generation with one `write` and one
 fsync before releasing every waiter. A writer that arrives after the generation
 is closed forms the next one.
 
-Same machine, same session, three repetitions per level, order alternated:
+Same machine, two independent sessions, three alternating rounds per level:
 
-| Concurrent writers | Before | After | Speedup |
-|---|---:|---:|---:|
-| 1 | 230 docs/s | 268 docs/s | 1.16× |
-| 8 | 389 docs/s | 745 docs/s | **1.91×** |
-| 32 | 323 docs/s | 1,094 docs/s | **3.38×** |
+| Concurrent writers | Speedup over one-fsync-per-request |
+|---|---:|
+| 1 | 0.98–1.07× (no change) |
+| 8 | **1.9–2.2×** |
+| 32 | **2.7–3.4×** |
+
+Absolute rates moved by ~40% between the two sessions, so the ratios are given as
+ranges; the single-writer row is the control and says the machinery costs nothing
+when there is nothing to batch.
 
 The guarantee is unchanged: every fragment still carries its own magic, length
 and CRC, so a generation torn by a crash replays its complete prefix, and a caller
@@ -74,8 +109,8 @@ option is always on. Both the HTTP server and the shard listener now pass
 
 The cluster got **cheaper and more honest**. Reusing shard connections removed
 most of what a coordinator added: a forward write went from 2.19× a local write to
-1.31×, fan-out queries from 1.62× to 1.13×, and a two-member replicated write
-from 3.10× to 1.26×. Three repair/rebalance paths that reported success without
+1.06×, fan-out queries from 1.62× to about parity, and a two-member replicated
+write from 3.10× to 1.46×. Three repair/rebalance paths that reported success without
 having done the work now report what happened.
 
 ### Performance: shard connections are pooled
@@ -85,11 +120,12 @@ having done the work now report what happened.
   listener now serves several framed requests per connection and the coordinator
   keeps up to 8 idle sockets per address.
 
-  Measured with `tools/bench-cluster.mjs` (3 shards, 3,000 documents, 60
-  interleaved samples per query): mean coordinator/single latency ratio **1.62× →
-  1.13×**; one-hop forwarded write **2.19× → 1.31×**; 2,000 documents through 3
-  groups of 2 members **3.10× → 1.26×** (83 → 254 docs/s against a single node's
-  320).
+  Measured with `tools/bench-cluster.mjs` (3 shards, 3,000 documents): the mean
+  coordinator/single latency ratio went from **1.62×** before pooling to
+  **0.94–1.02×** after; a one-hop forwarded write from **2.19×** to **1.06×**; and
+  a two-member replicated write from **3.10×** to **1.46×** (530 → 364 docs/s).
+  The post-pooling figures are spreads over repeated runs rather than single
+  samples; `docs/cluster.md` explains why that distinction matters for them.
 
 * A pooled socket is invalid when its shard restarts, and a dead socket looks
   exactly like a dead shard. A failed **reused** socket now gets one retry on a
@@ -787,7 +823,7 @@ Measured cost on the 20k corpus: exact phrase 6.25 ms p50, `~3` slop 7.89 ms p50
   `demo/registry.json`: **3,698 packages / 22,837 versions**, with names,
   author keywords, descriptions, dependency edges and facet values.
 - `tools/registry/main.mbt` builds that corpus into a `MSK3` snapshot with the
-  **native** binary (11,081 terms, 1.37 MB, ~8,000–11,000 docs/s).
+  **native** binary (11,081 terms, 1,398,936 bytes, ~8,000–11,000 docs/s).
 - The **wasm-gc** build loads those exact bytes. This exposed a real bug:
   `Bytes` has no stable JS ABI, so `ms_load`/`ms_save` never worked from
   JavaScript. New `ms_load_b64` / `ms_save_b64` (base64) are the working

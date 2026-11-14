@@ -198,16 +198,17 @@ async function main() {
   console.log(`\nmean coordinator/single p50 ratio: ${avgRatio.toFixed(2)}x over ${SHARDS} shards`);
   console.log("(fan-out adds one network hop per shard; a ratio near 1 means the coordinator adds no work of its own)");
 
-  console.log("\n== write cost: replicated coordinator vs single node, %d documents ==", 2000);
-  const N = 2000;
-  const writeDoc = (i) => JSON.stringify({
-    id: `w${i}`,
+  console.log("\n== write cost: replicated coordinator vs single node ==");
+  // Sequential writes, one at a time: the number a client that waits for each
+  // acknowledgement sees. Measured in repeated alternating rounds, because a
+  // single round on a shared machine varies by tens of percent between runs —
+  // reporting one round as "the" ratio is how a benchmark becomes fiction.
+  const REPEATS = 3;
+  const N = 600;
+  const writeDoc = (prefix, i) => JSON.stringify({
+    id: `${prefix}${i}`,
     fields: { title: `write bench ${i}`, keywords: "writebench", desc: `document ${i}`, deps: "" },
   });
-
-  let t0 = performance.now();
-  for (let i = 0; i < N; i++) await post(SINGLE_PORT, "/index", writeDoc(i));
-  const singleMs = performance.now() - t0;
 
   const COORD2 = 7885;
   const REPLICA_HTTP = 7881;
@@ -233,17 +234,50 @@ async function main() {
   );
   await waitReady(COORD2);
 
-  t0 = performance.now();
-  let ackedFull = 0;
-  for (let i = 0; i < N; i++) {
-    const r = await post(COORD2, "/index", writeDoc(i));
-    if (r.ok) ackedFull++;
-  }
-  const replMs = performance.now() - t0;
+  const timeArm = async (port, prefix) => {
+    const t0 = performance.now();
+    let acked = 0;
+    for (let i = 0; i < N; i++) {
+      const r = await post(port, "/index", writeDoc(prefix, i));
+      if (r.ok) acked++;
+    }
+    return { ms: performance.now() - t0, acked };
+  };
 
-  console.log(`single node:            ${fmt(singleMs)} ms for ${N} docs  (${(N / (singleMs / 1000)).toFixed(0)} docs/s)`);
-  console.log(`coordinator, 2 members: ${fmt(replMs)} ms for ${N} docs  (${(N / (replMs / 1000)).toFixed(0)} docs/s)`);
-  console.log(`cost of replication:    ${(replMs / singleMs).toFixed(2)}x, ${ackedFull}/${N} writes acknowledged by every member`);
+  // Warm both arms so the first round is not paying page-cache and connection
+  // setup for the rest.
+  await timeArm(SINGLE_PORT, "ws-");
+  await timeArm(COORD2, "wc-");
+
+  const singleMs = [];
+  const replMs = [];
+  let ackedFull = 0;
+  let totalWrites = 0;
+  for (let rep = 0; rep < REPEATS; rep++) {
+    if (rep % 2 === 0) {
+      singleMs.push((await timeArm(SINGLE_PORT, `s${rep}-`)).ms);
+      const r = await timeArm(COORD2, `c${rep}-`);
+      replMs.push(r.ms);
+      ackedFull += r.acked;
+      totalWrites += N;
+    } else {
+      const r = await timeArm(COORD2, `c${rep}-`);
+      replMs.push(r.ms);
+      ackedFull += r.acked;
+      totalWrites += N;
+      singleMs.push((await timeArm(SINGLE_PORT, `s${rep}-`)).ms);
+    }
+  }
+  const med = (a) => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
+  const sMed = med(singleMs);
+  const rMed = med(replMs);
+  const rate = (ms) => N / (ms / 1000);
+
+  console.log(`rounds (ms)  single: ${singleMs.map((x) => x.toFixed(0)).join(", ")}`);
+  console.log(`rounds (ms)  coord:  ${replMs.map((x) => x.toFixed(0)).join(", ")}`);
+  console.log(`single node:            ${fmt(sMed)} ms median for ${N} docs  (${rate(sMed).toFixed(0)} docs/s)`);
+  console.log(`coordinator, 2 members: ${fmt(rMed)} ms median for ${N} docs  (${rate(rMed).toFixed(0)} docs/s)`);
+  console.log(`cost of replication:    ${(rMed / sMed).toFixed(2)}x median, ${ackedFull}/${totalWrites} writes acknowledged by every member`);
 
   console.log("\n== metadata ==");
   for (let k = 0; k < SHARDS; k++) {
