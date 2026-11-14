@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.16.1 (2026-11-14)
+
+### Fixed: a node could not be restarted on Linux
+
+Both listeners were created without `SO_REUSEADDR`. On Linux, restarting a
+process on the port it just vacated can then fail with
+`Address already in use`, and the node exits before it serves anything —
+which is precisely what a supervisor, a rolling restart or a test does.
+`tools/test-shard-restart.sh` found it on CI while passing on Windows, where the
+option is always on. Both the HTTP server and the shard listener now pass
+`reuse_addr=true`.
+
 ## 0.16.0 (2026-11-14)
 
 The cluster got **cheaper and more honest**. Reusing shard connections removed

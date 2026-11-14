@@ -96,6 +96,9 @@ echo "ok: pool warmed with 3 documents per query"
 
 echo "== restart the shard under the pool =="
 kill "$shard_pid" 2>/dev/null || true
+# Reap it before rebinding. `reuse_addr` makes the bind legal while the old
+# socket lingers, but a process that has not exited yet still holds the port.
+wait "$shard_pid" 2>/dev/null || true
 for _ in $(seq 1 40); do
   curl -sf -m 1 "http://127.0.0.1:$SHARD_HTTP/healthz" > /dev/null 2>&1 || break
   sleep 0.25

@@ -317,7 +317,12 @@ async fn main {
       return ()
     }
   }
-  let server = @http.Server::Server(addr)
+  // `reuse_addr` so a restart does not fail to bind while the previous
+  // process's socket is still in the kernel's table. Without it a node that is
+  // restarted immediately — which is exactly what an operator, a test or a
+  // supervisor does — dies with "Address already in use" on Linux. Windows
+  // ignores the flag because it is always on there.
+  let server = @http.Server::Server(addr, reuse_addr=true)
   println("moonseek-server listening on http://\{addr_text}")
   match assets {
     Some(d) => println("serving console from \{d}")
@@ -360,7 +365,9 @@ async fn main {
 /// trip instead of saving one. A client that closes after a single request is
 /// still correct: the next read returns EOF and the loop ends.
 async fn run_shard_listener(state : ServerState, addr : @socket.Addr) -> Unit {
-  let listener = @socket.TcpServer(addr)
+  // Same `reuse_addr` argument as the HTTP listener: a shard must be able to
+  // come back up on the port it just vacated.
+  let listener = @socket.TcpServer(addr, reuse_addr=true)
   listener.run_forever(async fn(sock, _peer) {
     for ;; {
       // Length-prefixed frames in both directions. Reading to EOF would deadlock
