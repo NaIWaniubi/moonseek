@@ -50,7 +50,9 @@ so the corpus is byte-reproducible.
 ### Index construction
 
 Measured as the **median of 4 timed runs** (a fifth is discarded as warm-up), because a single run
-on a desktop machine swings 20–30% with background load.
+on a desktop machine swings 20–30% with background load, and up to 3× for sub-millisecond
+shapes: the same phrase harness has read 0.29–0.94 ms for `"search engine"` across runs,
+while multi-millisecond queries moved by less than a fifth of that.
 
 | Metric | Value | Source |
 |---|---|---|

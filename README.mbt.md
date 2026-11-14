@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml/badge.svg)](https://github.com/NaIWaniubi/moonseek/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![mooncakes](https://img.shields.io/badge/mooncakes-v0.17.4-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
+[![mooncakes](https://img.shields.io/badge/mooncakes-v0.17.5-6f42c1.svg)](https://mooncakes.io/packages/NaIWaniubi/moonseek)
 [![tests](https://img.shields.io/badge/tests-355%20native%20%C2%B7%20299%20wasm--gc-3fb950.svg)](#testing)
 
 ![moonseek demo](docs/demo-screenshot.png)
@@ -23,7 +23,7 @@ MoonBit's ecosystem has HTTP servers, crypto and database drivers — but no tan
 - **BM25 ranking** with configurable `k1` / `b`
 - **Chinese + English tokenization**: Latin words with stop-word removal; CJK overlapping bigrams (Lucene CJKAnalyzer strategy) — no dictionary needed
 - **Rich query syntax**: `term`, `"exact phrase"`, `"a b"~3` (sloppy phrase: up to 3 tokens between terms), `AND` / `OR` / `NOT`, `field:term`, `prefix*`, parentheses, implicit AND
-- **Fuzzy search**: Levenshtein / Damerau-Levenshtein edit distance with early-exit bounded DP; **BK-tree** for sub-linear lookup (13–1780× faster than linear scan on a 24k-term vocabulary)
+- **Fuzzy search**: Levenshtein / Damerau-Levenshtein edit distance with early-exit bounded DP; **BK-tree** for sub-linear lookup (17–491× faster than a linear scan on a 24k-term vocabulary; the spread is the neighbourhood's density, not the edit distance)
 - **Did-you-mean**: frequency-weighted spelling correction (`suggest`)
 - **Faceted search**: exact-match facet fields, AND/OR filters, per-facet value counts, offset pagination (`search_faceted`)
 - **Ranking control**: configurable sort — score, id, or a numeric field, in either direction, over HTTP as `sort=num:year&order=desc` and in the library as `search_sorted`; cursor pagination (`search_after`); per-term BM25 breakdown (`explain`). A cross-shard numeric sort is exact: the shards ship the key
@@ -221,7 +221,7 @@ median of 4 timed runs; queries are p50 of 200 samples, `limit=10`:
 | Index build | 2.73 s -> **7,320 docs/s** (median of 4) |
 | Selective term (df 285) | **0.06 ms** |
 | Field-scoped term (df 732) | 0.13 ms |
-| Saturated term (df 4,021) | **0.36 ms** with block-max (see below) |
+| Saturated term (df 4,021) | **0.92 ms** with block-max (exact path 2.11 ms; see below) |
 | Chinese bigram (df 4,113) | 0.37 ms |
 | Boolean query | 3.02 ms |
 | Exact phrase | 6.25 ms -> **0.29 ms** (rarest-term walk, ~24x) |
@@ -230,6 +230,11 @@ median of 4 timed runs; queries are p50 of 200 samples, `limit=10`:
 | Facet filter + aggregation (3,055 matches) | 14.0 ms |
 | Fuzzy lookup, 23.8k terms | linear 37-46 ms -> **BK-tree 0.07-2.7 ms** (17-491x) |
 | Snapshot 17.6 MB: serialize / load | 0.68 s / 0.75 s |
+
+Rows without an arrow are single-run absolutes. Sub-millisecond timings are the least
+reproducible ones on a shared machine — the same harness has read 0.29–0.94 ms for the
+two-term phrase — so read the ratios and the skipped-posting percentages as the claims,
+not the last digit.
 
 **Block-max WAND** on a bounded query that is a single term, a conjunction, or a
 disjunction with a wide document-frequency spread: the doc-sorted postings are
